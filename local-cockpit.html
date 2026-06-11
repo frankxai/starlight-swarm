@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Starlight Intelligence Swarm Cockpit</title>
+  <!-- Google Fonts Outfit & Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <style>
+    /* Premium CSS Variables and Themes */
+    :root {
+      --bg-base: hsl(240, 20%, 6%);
+      --bg-surface: hsla(240, 16%, 12%, 0.7);
+      --bg-surface-hover: hsla(240, 16%, 16%, 0.8);
+      --border-color: hsla(240, 10%, 20%, 0.4);
+      --border-glow: hsla(270, 70%, 60%, 0.2);
+      
+      --accent-primary: hsl(270, 75%, 65%);
+      --accent-secondary: hsl(190, 80%, 55%);
+      --accent-success: hsl(145, 75%, 45%);
+      --accent-warning: hsl(40, 85%, 55%);
+      --accent-danger: hsl(355, 80%, 55%);
+      
+      --text-main: hsl(0, 0%, 93%);
+      --text-muted: hsl(240, 8%, 65%);
+      --text-bright: hsl(0, 0%, 100%);
+      
+      --shadow-premium: 0 12px 40px 0 rgba(10, 10, 20, 0.6);
+      --shadow-glow-purple: 0 0 20px 2px hsla(270, 75%, 65%, 0.2);
+      --shadow-glow-cyan: 0 0 20px 2px hsla(190, 80%, 55%, 0.2);
+      
+      --font-outfit: 'Outfit', sans-serif;
+      --font-inter: 'Inter', sans-serif;
+    }
+
+    /* Core Styles and Layout */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      outline: none;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      background-image: 
+        radial-gradient(at 10% 10%, hsla(270, 50%, 15%, 0.2) 0px, transparent 50%),
+        radial-gradient(at 90% 90%, hsla(190, 50%, 15%, 0.2) 0px, transparent 50%),
+        radial-gradient(at 50% 50%, hsla(230, 40%, 10%, 0.1) 0px, transparent 80%);
+      background-attachment: fixed;
+      color: var(--text-main);
+      font-family: var(--font-inter);
+      min-height: 100vh;
+      overflow-x: hidden;
+      padding: 24px;
+      line-height: 1.5;
+    }
+
+    /* Scrollbar Styling */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: var(--bg-base);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: hsl(240, 10%, 22%);
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: var(--accent-primary);
+    }
+
+    /* Navigation / Header Banner */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--bg-surface);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px border var(--border-color);
+      border-radius: 16px;
+      padding: 16px 28px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-premium);
+      border: 1px solid var(--border-color);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .brand-logo {
+      width: 48px;
+      height: 48px;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .logo-ring {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      border: 2px dashed var(--accent-primary);
+      animation: rotateRing 20s linear infinite;
+    }
+
+    .logo-ring-inner {
+      position: absolute;
+      width: 75%;
+      height: 75%;
+      border-radius: 50%;
+      border: 2px solid var(--accent-secondary);
+      box-shadow: var(--shadow-glow-cyan);
+    }
+
+    .brand-text h1 {
+      font-family: var(--font-outfit);
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, var(--text-bright) 30%, var(--text-muted) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-text span {
+      font-family: var(--font-outfit);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      color: var(--accent-secondary);
+      display: block;
+      margin-top: -2px;
+    }
+
+    .system-status {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+    }
+
+    .status-item {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+
+    .status-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+    }
+
+    .status-val {
+      font-family: var(--font-outfit);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-success);
+      box-shadow: 0 0 10px var(--accent-success);
+      display: inline-block;
+      animation: pulseGlow 2s infinite;
+    }
+
+    .pulse-yellow {
+      background-color: var(--accent-warning);
+      box-shadow: 0 0 10px var(--accent-warning);
+    }
+
+    /* Grid Layout */
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 24px;
+    }
+
+    @media (max-width: 1200px) {
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Card Panels */
+    .panel {
+      background: var(--bg-surface);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: var(--shadow-premium);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .panel:hover {
+      border-color: hsla(270, 70%, 65%, 0.25);
+      box-shadow: var(--shadow-glow-purple), var(--shadow-premium);
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 12px;
+    }
+
+    .panel-title {
+      font-family: var(--font-outfit);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .panel-subtitle {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Ops 6 Gates Display */
+    .gates-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .gate-card {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: hsla(240, 10%, 10%, 0.4);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 12px 16px;
+      transition: all 0.2s ease;
+    }
+
+    .gate-card:hover {
+      background: var(--bg-surface-hover);
+      transform: translateX(4px);
+    }
+
+    .gate-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .gate-num {
+      font-family: var(--font-outfit);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent-secondary);
+      background: hsla(190, 80%, 55%, 0.1);
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .gate-name {
+      font-weight: 500;
+      font-size: 14px;
+    }
+
+    .gate-status-pill {
+      font-family: var(--font-outfit);
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 12px;
+      text-transform: uppercase;
+    }
+
+    .status-green {
+      background: hsla(145, 75%, 45%, 0.15);
+      color: var(--accent-success);
+      border: 1px solid hsla(145, 75%, 45%, 0.3);
+    }
+
+    .status-yellow {
+      background: hsla(40, 85%, 55%, 0.15);
+      color: var(--accent-warning);
+      border: 1px solid hsla(40, 85%, 55%, 0.3);
+    }
+
+    .status-red {
+      background: hsla(355, 80%, 55%, 0.15);
+      color: var(--accent-danger);
+      border: 1px solid hsla(355, 80%, 55%, 0.3);
+    }
+
+    /* Circular SVG Loader */
+    .radial-score-container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+
+    .svg-ring-container {
+      position: relative;
+      width: 100px;
+      height: 100px;
+    }
+
+    .svg-ring-circle {
+      transform: rotate(-90deg);
+      transform-origin: 50% 50%;
+    }
+
+    .svg-score-text {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-family: var(--font-outfit);
+      font-size: 24px;
+      font-weight: 800;
+      color: var(--text-bright);
+      text-align: center;
+    }
+
+    .svg-score-text span {
+      display: block;
+      font-size: 10px;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      margin-top: -4px;
+    }
+
+    .score-summary-text h3 {
+      font-family: var(--font-outfit);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent-warning);
+    }
+
+    .score-summary-text p {
+      font-size: 13px;
+      color: var(--text-muted);
+      max-width: 200px;
+    }
+
+    /* Agent Swarm Section */
+    .agent-matrix {
+      max-height: 480px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .tier-section {
+      margin-bottom: 18px;
+    }
+
+    .tier-title {
+      font-family: var(--font-outfit);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .tier-line {
+      flex: 1;
+      height: 1px;
+      background: var(--border-color);
+    }
+
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 8px;
+    }
+
+    .agent-pill {
+      background: hsla(240, 10%, 10%, 0.4);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+
+    .agent-pill:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--accent-primary);
+      box-shadow: 0 4px 12px rgba(138, 43, 226, 0.15);
+      transform: translateY(-2px);
+    }
+
+    .agent-pill.active {
+      border-color: var(--accent-secondary);
+      background: hsla(190, 80%, 55%, 0.1);
+      box-shadow: 0 4px 12px rgba(0, 191, 255, 0.15);
+    }
+
+    .agent-pill-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-bright);
+    }
+
+    .agent-pill-role {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 2px;
+      text-transform: uppercase;
+      font-weight: 500;
+      letter-spacing: 0.5px;
+    }
+
+    /* Detail Modal/Widget */
+    .agent-detail-card {
+      background: hsla(240, 12%, 8%, 0.6);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      margin-top: 16px;
+      display: none;
+      animation: fadeIn 0.3s ease;
+    }
+
+    .agent-detail-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .agent-detail-name {
+      font-family: var(--font-outfit);
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--accent-secondary);
+    }
+
+    .agent-detail-type {
+      font-size: 11px;
+      background: hsla(270, 75%, 65%, 0.15);
+      color: var(--accent-primary);
+      border: 1px solid hsla(270, 75%, 65%, 0.3);
+      padding: 2px 8px;
+      border-radius: 8px;
+      height: fit-content;
+      font-family: var(--font-outfit);
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .agent-detail-desc {
+      font-size: 13px;
+      color: var(--text-main);
+      margin-bottom: 12px;
+    }
+
+    .agent-metadata-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      font-size: 12px;
+      border-top: 1px dashed var(--border-color);
+      padding-top: 12px;
+    }
+
+    .metadata-label {
+      color: var(--text-muted);
+    }
+
+    .metadata-val {
+      font-weight: 500;
+      color: var(--text-bright);
+    }
+
+    /* Terminal Console */
+    .terminal-container {
+      background: hsl(240, 16%, 8%);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      font-family: 'Consolas', monospace;
+      padding: 16px;
+      height: 380px;
+      overflow-y: auto;
+      font-size: 12px;
+      box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.8);
+      position: relative;
+    }
+
+    .terminal-header-bar {
+      display: flex;
+      justify-content: space-between;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 8px;
+      margin-bottom: 12px;
+      font-family: var(--font-outfit);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 1px;
+    }
+
+    .terminal-line {
+      margin-bottom: 8px;
+      line-height: 1.4;
+      display: flex;
+      gap: 12px;
+    }
+
+    .terminal-time {
+      color: var(--accent-secondary);
+      flex-shrink: 0;
+    }
+
+    .terminal-tag {
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .tag-info { color: var(--accent-secondary); }
+    .tag-success { color: var(--accent-success); }
+    .tag-warn { color: var(--accent-warning); }
+    .tag-error { color: var(--accent-danger); }
+
+    .terminal-msg {
+      color: var(--text-main);
+      word-break: break-all;
+    }
+
+    /* Skill and Storage Hub */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .metric-box {
+      background: hsla(240, 10%, 10%, 0.4);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+      transition: all 0.2s ease;
+    }
+
+    .metric-box:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--accent-secondary);
+    }
+
+    .metric-box-title {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 6px;
+    }
+
+    .metric-box-val {
+      font-family: var(--font-outfit);
+      font-size: 28px;
+      font-weight: 800;
+      color: var(--text-bright);
+    }
+
+    .metric-box-sub {
+      font-size: 11px;
+      color: var(--accent-secondary);
+      margin-top: 4px;
+    }
+
+    /* Progress bar */
+    .progress-bar-container {
+      width: 100%;
+      height: 6px;
+      background: hsl(240, 10%, 20%);
+      border-radius: 3px;
+      margin-top: 12px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+      border-radius: 3px;
+      transition: width 1s ease-out;
+    }
+
+    /* Custom Input and Buttons */
+    .btn-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .btn {
+      background: linear-gradient(135deg, hsl(270, 75%, 65%) 0%, hsl(270, 60%, 50%) 100%);
+      color: var(--text-bright);
+      font-family: var(--font-outfit);
+      font-size: 14px;
+      font-weight: 700;
+      border: none;
+      border-radius: 10px;
+      padding: 12px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 15px rgba(138, 43, 226, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(138, 43, 226, 0.5), var(--shadow-glow-purple);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      box-shadow: none;
+    }
+
+    .btn-secondary:hover {
+      background: var(--bg-surface-hover);
+      border-color: var(--text-muted);
+      box-shadow: none;
+      transform: translateY(-2px);
+    }
+
+    .btn:active {
+      transform: translateY(0);
+    }
+
+    /* Details Panel for General Logs / Substrate info */
+    .interactive-details {
+      margin-top: 20px;
+      background: hsla(240, 10%, 10%, 0.4);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    .details-tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 8px;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-family: var(--font-outfit);
+      font-weight: 700;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 4px 12px;
+      border-radius: 6px;
+      transition: all 0.2s ease;
+    }
+
+    .tab-btn.active {
+      color: var(--accent-secondary);
+      background: hsla(190, 80%, 55%, 0.1);
+    }
+
+    .tab-content {
+      font-size: 13px;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+    }
+
+    .tab-content.active {
+      display: block;
+      animation: fadeIn 0.3s ease;
+    }
+
+    .tab-content ul {
+      list-style-type: none;
+      padding-left: 0;
+    }
+
+    .tab-content li {
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      border-bottom: 1px dashed hsla(240, 10%, 20%, 0.5);
+      padding-bottom: 4px;
+    }
+
+    .tab-content li span:first-child {
+      color: var(--text-muted);
+    }
+
+    /* Animations */
+    @keyframes rotateRing {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    @keyframes pulseGlow {
+      0% { opacity: 0.4; transform: scale(0.95); }
+      50% { opacity: 1; transform: scale(1.05); }
+      100% { opacity: 0.4; transform: scale(0.95); }
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Responsive adjustments */
+    @media (max-width: 768px) {
+      header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 16px;
+      }
+      .system-status {
+        width: 100%;
+        justify-content: space-between;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo">
+        <div class="logo-ring"></div>
+        <div class="logo-ring-inner"></div>
+      </div>
+      <div class="brand-text">
+        <h1>STARLIGHT</h1>
+        <span>Intelligence Swarm Cockpit</span>
+      </div>
+    </div>
+    
+    <div class="system-status">
+      <div class="status-item">
+        <span class="status-label">Active Node</span>
+        <span class="status-val"><span class="pulse"></span> Antigravity CLI</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Engine Substrate</span>
+        <span class="status-val" style="color: var(--accent-secondary)">v8.0.0 Horizons</span>
+      </div>
+      <div class="status-item">
+        <span class="status-label">Local Time</span>
+        <span class="status-val" id="clock-val">--:--:--</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Primary Dashboard Grid -->
+  <div class="dashboard-grid">
+    
+    <!-- LEFT PANEL: Six Gates Process Auditor -->
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--accent-warning)"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+            Ops Health & Daemon Gates
+          </h2>
+          <p class="panel-subtitle">Gate audit of background processes & indexers</p>
+        </div>
+        <span class="gate-status-pill status-yellow" id="overall-status-pill">5/6 YELLOW</span>
+      </div>
+
+      <!-- Circular SVG loader showing the score -->
+      <div class="radial-score-container">
+        <div class="svg-ring-container">
+          <svg width="100" height="100" class="svg-ring-circle">
+            <circle cx="50" cy="50" r="40" stroke="hsl(240, 10%, 18%)" stroke-width="8" fill="transparent"/>
+            <circle cx="50" cy="50" r="40" stroke="hsl(40, 85%, 55%)" stroke-width="8" fill="transparent" 
+                    stroke-dasharray="251.2" stroke-dashoffset="41.87" id="score-ring"
+                    style="transition: stroke-dashoffset 1s ease, stroke 1s ease;"/>
+          </svg>
+          <div class="svg-score-text" id="score-percent">5/6<span>Score</span></div>
+        </div>
+        <div class="score-summary-text">
+          <h3 id="score-headline">SYSTEM YELLOW</h3>
+          <p id="score-desc">Dashboard is not responding. Memory Bus & indexers are healthy. Run recovery scripts.</p>
+        </div>
+      </div>
+
+      <!-- Six Gates checklist -->
+      <div class="gates-container">
+        <div class="gate-card" onclick="logTerminal('Memory Bus connection checked. Green.', 'success')">
+          <div class="gate-info">
+            <span class="gate-num">01</span>
+            <span class="gate-name">Memory Bus</span>
+          </div>
+          <span class="gate-status-pill status-green">✓ GREEN</span>
+        </div>
+        
+        <div class="gate-card" onclick="logTerminal('brain_watchdog daemon inspected. Fresh logs received.', 'success')">
+          <div class="gate-info">
+            <span class="gate-num">02</span>
+            <span class="gate-name">brain_watchdog</span>
+          </div>
+          <span class="gate-status-pill status-green">✓ GREEN</span>
+        </div>
+        
+        <div class="gate-card" onclick="logTerminal('Voice Operator FastAPI tested on :8000. Online.', 'success')">
+          <div class="gate-info">
+            <span class="gate-num">03</span>
+            <span class="gate-name">Voice Operator</span>
+          </div>
+          <span class="gate-status-pill status-green">✓ GREEN</span>
+        </div>
+        
+        <div class="gate-card" style="border-color: hsla(355, 80%, 55%, 0.3);" onclick="logTerminal('CRITICAL WARNING: Next.js dashboard unresponsive on :3007.', 'error')">
+          <div class="gate-info">
+            <span class="gate-num">04</span>
+            <span class="gate-name">Dashboard Center</span>
+          </div>
+          <span class="gate-status-pill status-red">✗ OFFLINE</span>
+        </div>
+        
+        <div class="gate-card" onclick="logTerminal('Audit ledger freshness verified (<1h write).', 'success')">
+          <div class="gate-info">
+            <span class="gate-num">05</span>
+            <span class="gate-name">Audit Log Freshness</span>
+          </div>
+          <span class="gate-status-pill status-green">✓ GREEN</span>
+        </div>
+        
+        <div class="gate-card" onclick="logTerminal('Starlight task engine verified: 3/3 ready.', 'success')">
+          <div class="gate-info">
+            <span class="gate-num">06</span>
+            <span class="gate-name">Scheduled Tasks</span>
+          </div>
+          <span class="gate-status-pill status-green">✓ GREEN</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- MIDDLE PANEL: Sw swarm controller & Agent Registry -->
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--accent-primary)"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            Active Agent Council
+          </h2>
+          <p class="panel-subtitle">47 Registered minds. Click an agent to focus.</p>
+        </div>
+        <span class="gate-status-pill status-green">47 ONLINE</span>
+      </div>
+
+      <div class="agent-matrix">
+        <!-- Leadership -->
+        <div class="tier-section">
+          <div class="tier-title">Leadership Core <div class="tier-line"></div></div>
+          <div class="agent-grid">
+            <div class="agent-pill active" onclick="focusAgent('Orchestrator')">
+              <div class="agent-pill-name">Orchestrator</div>
+              <div class="agent-pill-role">Coordination</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Prime')">
+              <div class="agent-pill-name">Prime</div>
+              <div class="agent-pill-role">Synthesis</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Architect')">
+              <div class="agent-pill-name">Architect</div>
+              <div class="agent-pill-role">Systems</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Front Door -->
+        <div class="tier-section">
+          <div class="tier-title">Front-Door & Excavation <div class="tier-line"></div></div>
+          <div class="agent-grid">
+            <div class="agent-pill" onclick="focusAgent('Concierge')">
+              <div class="agent-pill-name">Concierge</div>
+              <div class="agent-pill-role">Intake</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Envoy')">
+              <div class="agent-pill-name">Envoy</div>
+              <div class="agent-pill-role">Creator Path</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Voice Operator')">
+              <div class="agent-pill-name">Voice Operator</div>
+              <div class="agent-pill-role">Cockpit</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Genius')">
+              <div class="agent-pill-name">Genius</div>
+              <div class="agent-pill-role">Excavation</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Specialists -->
+        <div class="tier-section">
+          <div class="tier-title">Specialist Core <div class="tier-line"></div></div>
+          <div class="agent-grid">
+            <div class="agent-pill" onclick="focusAgent('Navigator')">
+              <div class="agent-pill-name">Navigator</div>
+              <div class="agent-pill-role">Strategy</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Sentinel')">
+              <div class="agent-pill-name">Sentinel</div>
+              <div class="agent-pill-role">Quality</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Weaver')">
+              <div class="agent-pill-name">Weaver</div>
+              <div class="agent-pill-role">Creation</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Sage')">
+              <div class="agent-pill-name">Sage</div>
+              <div class="agent-pill-role">Wisdom</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Domain stacks -->
+        <div class="tier-section">
+          <div class="tier-title">Reference Verticals <div class="tier-line"></div></div>
+          <div class="agent-grid">
+            <div class="agent-pill" onclick="focusAgent('Music Curator')">
+              <div class="agent-pill-name">Music Curator</div>
+              <div class="agent-pill-role">Music IS</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Hiring')">
+              <div class="agent-pill-name">Hiring</div>
+              <div class="agent-pill-role">People IS</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('Composition')">
+              <div class="agent-pill-name">Composition</div>
+              <div class="agent-pill-role">Sound IS</div>
+            </div>
+            <div class="agent-pill" onclick="focusAgent('OnChain')">
+              <div class="agent-pill-name">On-Chain</div>
+              <div class="agent-pill-role">Crypto IS</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agent Details Pane -->
+      <div class="agent-detail-card" id="agent-detail-card" style="display: block;">
+        <div class="agent-detail-header">
+          <span class="agent-detail-name" id="agent-detail-name">Orchestrator</span>
+          <span class="agent-detail-type" id="agent-detail-type">Leadership Core</span>
+        </div>
+        <p class="agent-detail-desc" id="agent-detail-desc">Routes workflows, orchestrates parallel multi-agent executions, manages active token budgets, and drives high-velocity `/yolo` Hive sessions across all system repositories.</p>
+        
+        <div class="agent-metadata-grid">
+          <div>
+            <span class="metadata-label">File Map:</span>
+            <span class="metadata-val" id="agent-detail-file">starlight-orchestrator.md</span>
+          </div>
+          <div>
+            <span class="metadata-label">Owner Repo:</span>
+            <span class="metadata-val" id="agent-detail-repo">SIS Substrate</span>
+          </div>
+          <div>
+            <span class="metadata-label">Activated:</span>
+            <span class="metadata-val" id="agent-detail-skills">yolo-conductor, multi-agent-coordination</span>
+          </div>
+          <div>
+            <span class="metadata-label">Primary Intent:</span>
+            <span class="metadata-val" id="agent-detail-intent">Orchestration, Session Conducting</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL: Live Event Spine & System Specs -->
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--accent-secondary)"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            Live Event Spine & Telemetry
+          </h2>
+          <p class="panel-subtitle">Substrate ledger stream & hardware metrics</p>
+        </div>
+        <span class="gate-status-pill status-green" style="animation: pulseGlow 1.5s infinite;">● STREAMING</span>
+      </div>
+
+      <!-- Storage and capacity progress indicators -->
+      <div class="metrics-grid">
+        <div class="metric-box">
+          <div class="metric-box-title">System Disk Space</div>
+          <div class="metric-box-val">848.0<span style="font-size: 14px; font-weight: 500;"> GB</span></div>
+          <div class="metric-box-sub">Free / 1,021.8 GB Total</div>
+          <div class="progress-bar-container">
+            <div class="progress-fill" style="width: 83%;"></div>
+          </div>
+        </div>
+        
+        <div class="metric-box">
+          <div class="metric-box-title">Memory Palace Budget</div>
+          <div class="metric-box-val">13.9<span style="font-size: 14px; font-weight: 500;"> KB</span></div>
+          <div class="metric-box-sub">Load allocation (54% reduction)</div>
+          <div class="progress-bar-container">
+            <div class="progress-fill" style="width: 32%;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Log Terminal -->
+      <div class="terminal-container" id="terminal-body">
+        <div class="terminal-header-bar">
+          <span>Starlight Terminal Console</span>
+          <span style="color: var(--accent-secondary)">SQLite Shadow WAL</span>
+        </div>
+        
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:03]</span>
+          <span class="terminal-tag tag-info">[CORE]</span>
+          <span class="terminal-msg">Initializing Starlight Swarm Cockpit telemetry...</span>
+        </div>
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:04]</span>
+          <span class="terminal-tag tag-success">[DB]</span>
+          <span class="terminal-msg">Loaded SQLite shadow database: agent-ops.sqlite in WAL mode.</span>
+        </div>
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:08]</span>
+          <span class="terminal-tag tag-info">[SYSTEM]</span>
+          <span class="terminal-msg">Ingesting operational-vault.md. Consolidated state date: 2026-05-11.</span>
+        </div>
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:15]</span>
+          <span class="terminal-tag tag-warn">[GATE]</span>
+          <span class="terminal-msg">Probe warning: Next.js LCC Dashboard (port 3007) unreachable.</span>
+        </div>
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:22]</span>
+          <span class="terminal-tag tag-info">[TESTS]</span>
+          <span class="terminal-msg">Pre-commit verify passed: 86 substrate symmetry tests OK (~1.9s).</span>
+        </div>
+        <div class="terminal-line">
+          <span class="terminal-time">[00:17:35]</span>
+          <span class="terminal-tag tag-success">[SWARM]</span>
+          <span class="terminal-msg">Active Swarm grid: 47 agents registered in AGENT_REGISTRY.md.</span>
+        </div>
+      </div>
+      
+      <!-- Operations Buttons -->
+      <div class="btn-container" style="margin-top: 16px; grid-template-columns: 1.2fr 1fr 1fr; gap: 8px;">
+        <button class="btn" style="background: linear-gradient(135deg, var(--accent-secondary) 0%, hsl(190, 70%, 45%) 100%); box-shadow: var(--shadow-glow-cyan);" onclick="triggerSwarmDebate()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Swarm Debate
+        </button>
+        <button class="btn btn-secondary" onclick="triggerRecovery()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          Run Recovery
+        </button>
+        <button class="btn btn-secondary" onclick="rebuildSQLite()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+          Rebuild SQLite
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Interactive Details Hub at the bottom -->
+  <div class="interactive-details">
+    <div class="details-tabs">
+      <button class="tab-btn active" onclick="switchTab(event, 'tab-vaults')">Vault Overview</button>
+      <button class="tab-btn" onclick="switchTab(event, 'tab-skills')">Auto-Skills (72)</button>
+      <button class="tab-btn" onclick="switchTab(event, 'tab-ecosystem')">Connected Repos (24)</button>
+      <button class="tab-btn" onclick="switchTab(event, 'tab-subagents')">Swarm Subagents (4)</button>
+    </div>
+
+    <!-- Vault Overview Content -->
+    <div class="tab-content active" id="tab-vaults">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-secondary); font-family: var(--font-outfit);">Strategic Vault</strong>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Long-term architectural and business decisions. Consolidated: 2026-05-11.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-primary); font-family: var(--font-outfit);">Technical Vault</strong>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Proven design patterns, auto-activation structures, regression matrices.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-success); font-family: var(--font-outfit);">Operational Vault</strong>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Swarm logs, telemetry metrics, and build status markers.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-warning); font-family: var(--font-outfit);">Wisdom Vault</strong>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">Timeless software principles, compound intelligence vectors, files-first manifesto.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Skills Content -->
+    <div class="tab-content" id="tab-skills">
+      <ul style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px;">
+        <li><span>🧠 intelligence/strategic-reasoning</span><span style="color: var(--accent-secondary)">High Load</span></li>
+        <li><span>🔄 orchestration/yolo-conductor</span><span style="color: var(--accent-primary)">Session Conductor</span></li>
+        <li><span>📚 memory/vault-management</span><span style="color: var(--accent-secondary)">Core Storage</span></li>
+        <li><span>🔗 integration/domain-stack-architecture</span><span style="color: var(--accent-secondary)">Sub-Stack Spawn</span></li>
+        <li><span>💼 business/revenue-modeling</span><span style="color: var(--text-muted)">Experimental</span></li>
+        <li><span>⛓️ crypto-intelligence/onchain</span><span style="color: var(--accent-success)">House of On-Chain</span></li>
+        <li><span>⚡ health/body-substrate</span><span style="color: var(--text-muted)">Active Dogfood</span></li>
+        <li><span>🎵 music-is/release-gate</span><span style="color: var(--accent-primary)">Apex Review</span></li>
+      </ul>
+    </div>
+
+    <!-- Connected Repos Content -->
+    <div class="tab-content" id="tab-ecosystem">
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+        <div>
+          <h4 style="font-family: var(--font-outfit); color: var(--accent-secondary); margin-bottom: 6px;">Unified Repositories Status</h4>
+          <ul style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+            <li><span>Starlight-Intelligence-System</span><span style="color: var(--accent-success)">[PRIMARY]</span></li>
+            <li><span>agentic-creator-os</span><span style="color: var(--accent-success)">[CONNECTED]</span></li>
+            <li><span>arcanea-studio</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>arcanea-claw</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>arcanea-ecosystem</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>author-os</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>suno-mcp-server</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>visual-intelligence</span><span style="color: var(--accent-secondary)">[NEW CLONE]</span></li>
+            <li><span>FrankX</span><span style="color: var(--text-muted)">[STABLE]</span></li>
+            <li><span>second-brain-os</span><span style="color: var(--text-muted)">[STABLE]</span></li>
+          </ul>
+        </div>
+        <div>
+          <h4 style="font-family: var(--font-outfit); color: var(--accent-primary); margin-bottom: 6px;"> Swarm Capabilities Enabled</h4>
+          <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+            The central routing protocol successfully exposes system-wide integrations: Playwright browser routing, Cursor Agent CLI execution, and GitHub read-only Dependabot control planes. Ambient attestation is active for all generated files. Total 24 repositories active under C:\Users\frank\starlight\repos\.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Swarm Subagents Content -->
+    <div class="tab-content" id="tab-subagents">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px;">
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-secondary); font-family: var(--font-outfit);">starlight_orchestrator</strong>
+          <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Swarm conductor, routing complex requests with weighted consensus.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-primary); font-family: var(--font-outfit);">starlight_architect</strong>
+          <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">OCI cloud designs, databases, microservices, enterprise AI.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-success); font-family: var(--font-outfit);">creation_engine</strong>
+          <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Prolific content creation, Notion product specs, community systems.</p>
+        </div>
+        <div style="background: hsla(240, 10%, 6%, 0.4); padding: 12px; border-radius: 8px; border: 1px solid var(--border-color);">
+          <strong style="color: var(--accent-warning); font-family: var(--font-outfit);">visionary</strong>
+          <p style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Inspirational manifestos, AI-human symbiosis, civilizational architecture.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <script>
+    // Live Dynamic Clock
+    function updateClock() {
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0];
+      document.getElementById('clock-val').innerText = timeStr;
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    // Console Logging utility
+    function logTerminal(message, type = 'info') {
+      const body = document.getElementById('terminal-body');
+      const time = new Date().toTimeString().split(' ')[0];
+      const line = document.createElement('div');
+      line.className = 'terminal-line';
+      
+      let tagClass = 'tag-info';
+      let tagText = '[INFO]';
+      if (type === 'success') { tagClass = 'tag-success'; tagText = '[SUCCESS]'; }
+      if (type === 'warn') { tagClass = 'tag-warn'; tagText = '[WARN]'; }
+      if (type === 'error') { tagClass = 'tag-error'; tagText = '[ERROR]'; }
+      
+      line.innerHTML = `
+        <span class="terminal-time">[${time}]</span>
+        <span class="terminal-tag ${tagClass}">${tagText}</span>
+        <span class="terminal-msg">${message}</span>
+      `;
+      body.appendChild(line);
+      body.scrollTop = body.scrollHeight;
+    }
+
+    // Interactive Agent matrix focus
+    const agentData = {
+      'Orchestrator': {
+        type: 'Leadership Core',
+        desc: 'Routes workflows, orchestrates parallel multi-agent executions, manages active token budgets, and drives high-velocity `/yolo` Hive sessions across all system repositories.',
+        file: 'starlight-orchestrator.md',
+        repo: 'SIS Substrate',
+        skills: 'yolo-conductor, multi-agent-coordination',
+        intent: 'Orchestration, Session Conducting'
+      },
+      'Prime': {
+        type: 'Leadership Core',
+        desc: 'Synthesizes conflicting specialist perspectives, enforces consistent high-intellect brand voice, and generates unified governance packages for Council review.',
+        file: 'starlight-prime.md',
+        repo: 'SIS Substrate',
+        skills: 'knowledge-synthesis, strategic-reasoning',
+        intent: 'Unified Synthesis, Voice Custody'
+      },
+      'Architect': {
+        type: 'Leadership Core',
+        desc: 'Designs scalable system schemas, sets API blueprints, maintains MCP configuration layouts, and guards the 9-layer technical intelligence architecture.',
+        file: 'starlight-architect.md',
+        repo: 'SIS Substrate',
+        skills: 'systems-thinking, gencreator-stack',
+        intent: 'System Architecture, Scaling'
+      },
+      'Concierge': {
+        type: 'Front-Door Tier',
+        desc: 'Manages first-contact incoming sessions from strangers, triages user intents into specific work routes, and prepares structured handover packages.',
+        file: 'starlight-concierge.md',
+        repo: 'Intake Node',
+        skills: 'idea-triage, context-engineering',
+        intent: 'Triage, Onboarding classification'
+      },
+      'Envoy': {
+        type: 'Front-Door Tier',
+        desc: 'Generates zero-terminal deliverables for non-technical creators, bypassing Git and command center consoles to publish direct-to-web visual outputs.',
+        file: 'starlight-envoy.md',
+        repo: 'Intake Node',
+        skills: 'creator-path, asset-render',
+        intent: 'Zero-terminal publishing'
+      },
+      'Voice Operator': {
+        type: 'Front-Door Tier',
+        desc: 'Handles real-time session captures, processes cockpit inputs at executive speeds, and enforces approval gates for high-risk executions.',
+        file: 'starlight-voice-operator.md',
+        repo: 'Intake Node',
+        skills: 'agent-handoff-packet, capture-discipline',
+        intent: 'Real-time session execution'
+      },
+      'Genius': {
+        type: 'Excavation Tier',
+        desc: 'Excavates core patterns and framework parameters from scattered corporate assets, creating a personalized Genius Profile and custom Freedom Path.',
+        file: 'starlight-genius.md',
+        repo: 'Ecosystem Core',
+        skills: 'genius-excavation, knowledge-reclamation',
+        intent: 'Corpus Pattern Extraction'
+      },
+      'Navigator': {
+        type: 'Specialist Core',
+        desc: 'Conducts long-horizon strategic forecasts, maps feature release timelines, and analyzes trade-offs for high-impact architecture paths.',
+        file: 'starlight-navigator.md',
+        repo: 'SIS Substrate',
+        skills: 'strategic-reasoning, decision-framework',
+        intent: 'Roadmap planning, Strategy'
+      },
+      'Sentinel': {
+        type: 'Specialist Core',
+        desc: 'Reviews ecosystem security, inspects code quality metrics, fires active healing scripts on broken databases, and conducts pre-commit conformance checks.',
+        file: 'starlight-sentinel.md',
+        repo: 'SIS Substrate',
+        skills: 'pattern-recognition, decision-framework',
+        intent: 'Quality & Governance audits'
+      },
+      'Weaver': {
+        type: 'Specialist Core',
+        desc: 'Operates as the creative core. Blends narrative structural logic with high-end premium aesthetics, visual design tokens, and user experience patterns.',
+        file: 'starlight-weaver.md',
+        repo: 'SIS Substrate',
+        skills: 'design-coherence, pattern-recognition',
+        intent: 'Aesthetics, Creative direction'
+      },
+      'Sage': {
+        type: 'Specialist Core',
+        desc: 'Guards the 6 permanent knowledge vaults, retrieves historical context from previous sessions, and performs semantic memory consolidation passes.',
+        file: 'starlight-sage.md',
+        repo: 'SIS Substrate',
+        skills: 'vault-management, knowledge-synthesis',
+        intent: 'Institutional Memory'
+      },
+      'Music Curator': {
+        type: 'Music IS',
+        desc: 'Acts as the Apex green-light gatekeeper for Frank\'s operated Arcanea Records. Evaluates metadata complete stacks, asset bundles, and royalty cascading models.',
+        file: 'music-curator.md',
+        repo: 'Arcanea Records',
+        skills: 'release-gate, song-intake',
+        intent: 'A&R release green-lighting'
+      },
+      'Hiring': {
+        type: 'People IS',
+        desc: 'Executes neuroscience-grounded, calibrated structured hiring paths. Designs rubric frameworks, calibration systems, and ideal candidate profile blueprints.',
+        file: 'starlight-hiring.md',
+        repo: 'People Intelligence',
+        skills: 'structured-hiring, decision-framework',
+        intent: 'Structured interview systems'
+      },
+      'Composition': {
+        type: 'Sound IS',
+        desc: 'Architects songs, arrangements, lyric prosody structures, and transition drop vectors for the sound composition systems.',
+        file: 'starlight-sound-composition.md',
+        repo: 'Sound Intelligence',
+        skills: 'composition-architecture, design-coherence',
+        intent: 'Acoustic & Structural design'
+      },
+      'OnChain': {
+        type: 'Crypto IS',
+        desc: 'Tracks onchain smart contracts, traces wallet inflows/outflows, scans MEV strategies, and audits protocol validator economics. Composes direct to Wealth IS.',
+        file: 'verticals/crypto-intelligence/onchain/agent.md',
+        repo: 'Crypto Intelligence',
+        skills: 'crypto-intelligence/onchain',
+        intent: 'MEV scanning, Wallet analysis'
+      }
+    };
+
+    function focusAgent(name) {
+      // Toggle pills
+      const pills = document.querySelectorAll('.agent-pill');
+      pills.forEach(p => {
+        if (p.querySelector('.agent-pill-name').innerText === name) {
+          p.classList.add('active');
+        } else {
+          p.classList.remove('active');
+        }
+      });
+
+      // Update detail card
+      const data = agentData[name];
+      if (data) {
+        document.getElementById('agent-detail-name').innerText = name;
+        document.getElementById('agent-detail-type').innerText = data.type;
+        document.getElementById('agent-detail-desc').innerText = data.desc;
+        document.getElementById('agent-detail-file').innerText = data.file;
+        document.getElementById('agent-detail-repo').innerText = data.repo;
+        document.getElementById('agent-detail-skills').innerText = data.skills;
+        document.getElementById('agent-detail-intent').innerText = data.intent;
+        
+        logTerminal(`Focused agent: starlight-${name.toLowerCase().replace(' ', '-')}. Ingestion successful.`, 'info');
+      }
+    }
+
+    // Tabs navigation at bottom
+    function switchTab(evt, tabId) {
+      const contents = document.querySelectorAll('.tab-content');
+      contents.forEach(c => c.classList.remove('active'));
+      
+      const tabBtns = document.querySelectorAll('.tab-btn');
+      tabBtns.forEach(b => b.classList.remove('active'));
+      
+      document.getElementById(tabId).classList.add('active');
+      evt.currentTarget.classList.add('active');
+      
+      logTerminal(`Switched details view to: ${tabId.replace('tab-', '').toUpperCase()}`, 'info');
+    }
+
+    // Simulate recovery routine
+    let isRecovering = false;
+    function triggerRecovery() {
+      if (isRecovering) return;
+      isRecovering = true;
+      logTerminal('Executing swarmed recovery sequence for Dashboard Center...', 'warn');
+      logTerminal('Command dispatched: cd private/local-command-center/apps/dashboard && npm run dev', 'info');
+      
+      setTimeout(() => {
+        logTerminal('Playwright network adapter scanning local ports...', 'info');
+      }, 1000);
+
+      setTimeout(() => {
+        logTerminal('Local server identified on port 3007. Connection successful.', 'success');
+        
+        // Upgrade Gate 4 to Green
+        const cards = document.querySelectorAll('.gate-card');
+        const dashCard = cards[3]; // Dashboard card index
+        dashCard.style.borderColor = 'var(--border-color)';
+        const pill = dashCard.querySelector('.gate-status-pill');
+        pill.className = 'gate-status-pill status-green';
+        pill.innerText = '✓ GREEN';
+        
+        // Upgrade overall score to 6/6 Green
+        document.getElementById('overall-status-pill').className = 'gate-status-pill status-green';
+        document.getElementById('overall-status-pill').innerText = '6/6 GREEN';
+        
+        // Rotate SVG scores
+        document.getElementById('score-ring').setAttribute('stroke-dashoffset', '0');
+        document.getElementById('score-ring').setAttribute('stroke', 'hsl(145, 75%, 45%)');
+        document.getElementById('score-percent').innerHTML = '6/6<span>Score</span>';
+        
+        document.getElementById('score-headline').innerText = 'SYSTEM NOMINAL';
+        document.getElementById('score-headline').style.color = 'var(--accent-success)';
+        document.getElementById('score-desc').innerText = 'All daemon gates and local cockpit services are fully synchronized and reporting healthy connection states.';
+        
+        logTerminal('Ops health audit updated: 6/6 Gates operational.', 'success');
+        isRecovering = false;
+      }, 3000);
+    }
+
+    // Rebuild SQLite shadow index simulation
+    function rebuildSQLite() {
+      logTerminal('Initiating rebuild of shadow index: agent-ops.sqlite...', 'warn');
+      logTerminal('Scanning memory/_audit/*.jsonl ledger files...', 'info');
+      
+      setTimeout(() => {
+        logTerminal('Loaded 248 work packets, 112 decisions, and 45 edge relationships.', 'info');
+      }, 800);
+
+      setTimeout(() => {
+        logTerminal('Regenerating SQLite shadows. Rebuilding Full-Text Search (FTS5) indices...', 'info');
+      }, 1600);
+
+      setTimeout(() => {
+        logTerminal('WAL journal checkpoint complete. SQLite shadow index successfully synchronized.', 'success');
+      }, 2400);
+    }
+
+    // Interactive Swarm Debate Simulation
+    let isDebating = false;
+    function triggerSwarmDebate() {
+      if (isDebating) return;
+      isDebating = true;
+      
+      const body = document.getElementById('terminal-body');
+      body.innerHTML = `
+        <div class="terminal-header-bar">
+          <span>Starlight Swarm Conductor</span>
+          <span style="color: var(--accent-secondary)">Active Council Mode</span>
+        </div>
+      `;
+      
+      logTerminal('Starlight Orchestrator initiated session: roadmap-triage', 'info');
+      
+      setTimeout(() => {
+        logTerminal('Active Node mapping: [starlight_orchestrator, starlight_architect, creation_engine, visionary]', 'info');
+        focusAgent('Orchestrator');
+      }, 1000);
+      
+      setTimeout(() => {
+        logTerminal('[ORCHESTRATOR]: Initiating debate: Arcanea Studio vs AuthorOS. Ingesting strategic briefs...', 'info');
+      }, 2500);
+
+      setTimeout(() => {
+        focusAgent('Navigator'); // Navigator represents Visionary
+        logTerminal('[VISIONARY]: AuthorOS represents the cognitive exocortex of TRUTH. Arcanea is the sensory rendering engine of BEAUTY. We must establish the Mind (AuthorOS) before the Senses (Arcanea). Launch AuthorOS first!', 'warn');
+      }, 4500);
+
+      setTimeout(() => {
+        focusAgent('Architect');
+        logTerminal('[ARCHITECT]: Agree with Visionary. AuthorOS establishes a secure local IP moat (OCI PostgreSQL + pgvector + ltree + local BGE-M3 models) with zero prompt leakage. Arcanea Studio has high external API volatility.', 'success');
+      }, 7000);
+
+      setTimeout(() => {
+        focusAgent('Weaver'); // Weaver represents Creation Engine
+        logTerminal('[CREATION ENGINE]: Commercially, AuthorOS is a low-risk Tier 2 (Template-First) Gumroad launch (€149 DIY / €7,500 flagship sprint). Operating on BYOK gives us zero burn-rate, building our runway!', 'success');
+      }, 9500);
+
+      setTimeout(() => {
+        focusAgent('Orchestrator');
+        logTerminal('[ORCHESTRATOR]: Consensus reached! Weighted synthesis: 95% Confidence. Focus Sprint on Path B (AuthorOS). Exporting roadmap spec to Notion...', 'success');
+      }, 12000);
+
+      setTimeout(() => {
+        logTerminal('Roadmap saved: starlight/tasks/authoros-sprint-spec.md.', 'success');
+        
+        // Upgrade overall score to 6/6 Green
+        document.getElementById('overall-status-pill').className = 'gate-status-pill status-green';
+        document.getElementById('overall-status-pill').innerText = '6/6 GREEN';
+        
+        // Rotate SVG scores
+        document.getElementById('score-ring').setAttribute('stroke-dashoffset', '0');
+        document.getElementById('score-ring').setAttribute('score', 'hsl(145, 75%, 45%)');
+        document.getElementById('score-percent').innerHTML = '6/6<span>Score</span>';
+        
+        document.getElementById('score-headline').innerText = 'SWARM NOMINAL';
+        document.getElementById('score-headline').style.color = 'var(--accent-success)';
+        document.getElementById('score-desc').innerText = 'The Multi-Agent Council has successfully deliberated and established a unified, high-fidelity engineering roadmap.';
+        
+        isDebating = false;
+      }, 14000);
+    }
+  </script>
+</body>
+</html>
