@@ -799,6 +799,82 @@
     </div>
   </header>
 
+  <!-- L6 Swarm Runtime: founder → queen → worker tree + escalation legend -->
+  <!-- Static render. Shape mirrors src/swarm/streams.ts (swarmTree()). No action fires. -->
+  <section class="panel" id="swarm-runtime-panel" style="margin-bottom: 24px;">
+    <div class="panel-header">
+      <div>
+        <h2 class="panel-title" style="color: var(--accent-primary)">✦ L6 Swarm Runtime — Queens &amp; Workers</h2>
+        <p class="panel-subtitle">Hybrid queens-per-stream · v0.1 scaffold · dry-run only — no action fires</p>
+      </div>
+      <span class="gate-status-pill status-yellow">SCAFFOLD</span>
+    </div>
+
+    <div id="swarm-founder" style="background: hsla(270,75%,65%,0.06); border:1px solid hsla(270,75%,65%,0.2); border-radius:12px; padding:14px 18px; margin-bottom:16px;"></div>
+
+    <div id="swarm-streams" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px;"></div>
+
+    <h3 style="font-family:var(--font-outfit); font-size:13px; margin:20px 0 10px; color:var(--text-muted); letter-spacing:0.5px;">ESCALATION LADDER — the safety spine</h3>
+    <div id="swarm-ladder" style="display:flex; flex-direction:column; gap:8px;"></div>
+    <p style="font-size:12px; color:var(--text-muted); margin-top:12px;">worker → queen → founder → human. No autonomous money movement, ever.</p>
+  </section>
+
+  <script>
+    // Static snapshot mirroring swarmTree() in src/swarm/streams.ts.
+    var SWARM = {
+      founder: {
+        name: 'starlight-orchestrator',
+        gate: '/starlight-board',
+        thesisSource: 'SIS Wealth IS (/wealth-dpi, /wealth-thesis-review, /wealth-gate-progress)'
+      },
+      streams: [
+        { label: 'Affiliate', queen: 'Affiliate Queen', loop: ['audit','join programs','bind links','measure','re-rank'],
+          workers: [['catalog-auditor','affiliate-audit'],['link-binder','agentic-income'],['disclosure-checker','integrity-guard'],['ranker','agentic-income']] },
+        { label: 'Products', queen: 'Products Queen', loop: ['gap-scan','build','price','launch','retro'],
+          workers: [['product-architect','product-engine'],['packager','product-engine'],['pricer','model-revenue'],['launch-coordinator','factory']] },
+        { label: 'Content', queen: 'Content Queen', loop: ['top-queries','draft','gate','publish','learn'],
+          workers: [['researcher','research'],['writer','article-creator'],['hook-engineer','hook'],['distributor','generate-social']] },
+        { label: 'Payments', queen: 'Payments Queen', loop: ['propose-charge','verify mandate','check cap','settle','audit'],
+          workers: [['mandate-verifier','agentic-payments'],['spend-cap-enforcer','agentic-payments'],['settlement-auditor','agentic-payments'],['fraud-sentinel','agentic-payments']] }
+      ],
+      ladder: [
+        ['autonomous','Worker → Queen','queen review (reversible, no money)','var(--accent-success)'],
+        ['queen-gate','Queen','brand/claims gate · AP2 mandate + spend-cap (verify-only)','var(--accent-secondary)'],
+        ['founder-board','Founder','/starlight-board pressure-test + human approval','var(--accent-warning)'],
+        ['human-gate','Human','irreversible + money = human approval, ALWAYS','var(--accent-danger)']
+      ]
+    };
+    (function renderSwarm() {
+      var esc = function (s) { return String(s).replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); };
+      var f = SWARM.founder;
+      document.getElementById('swarm-founder').innerHTML =
+        '<div style="font-family:var(--font-outfit); font-weight:700; color:var(--accent-primary); font-size:15px;">👑 ' + esc(f.name) + '</div>' +
+        '<div style="font-size:12px; color:var(--text-muted); margin-top:4px;">gate: <code>' + esc(f.gate) + '</code> &middot; owns capital + irreversible actions</div>' +
+        '<div style="font-size:12px; color:var(--text-muted); margin-top:2px;">thesis ← ' + esc(f.thesisSource) + '</div>';
+
+      document.getElementById('swarm-streams').innerHTML = SWARM.streams.map(function (s) {
+        var workers = s.workers.map(function (w) {
+          return '<li style="background:hsla(240,20%,8%,0.6); border-radius:8px; padding:7px 10px; margin-bottom:6px; list-style:none;">' +
+            '<span style="font-weight:600; font-size:13px;">' + esc(w[0]) + '</span> ' +
+            '<span style="font-family:monospace; font-size:11px; color:var(--accent-secondary);">' + esc(w[1]) + '</span></li>';
+        }).join('');
+        return '<div style="background:hsla(240,10%,15%,0.4); border:1px solid hsla(240,10%,20%,0.25); border-radius:12px; padding:16px;">' +
+          '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+          '<span style="font-family:var(--font-outfit); font-weight:700; font-size:14px;">' + esc(s.queen) + '</span>' +
+          '<span style="font-size:11px; color:var(--accent-primary); border:1px solid hsla(270,75%,65%,0.2); padding:2px 8px; border-radius:4px;">' + esc(s.label) + '</span></div>' +
+          '<div style="font-family:monospace; font-size:11px; color:var(--accent-secondary); margin:8px 0 10px;">loop: ' + s.loop.map(esc).join(' → ') + '</div>' +
+          '<ul style="margin:0; padding:0;">' + workers + '</ul></div>';
+      }).join('');
+
+      document.getElementById('swarm-ladder').innerHTML = SWARM.ladder.map(function (l) {
+        return '<div style="display:grid; grid-template-columns:130px 130px 1fr; gap:10px; align-items:baseline; background:hsla(240,10%,15%,0.4); border-left:3px solid ' + l[3] + '; padding:9px 14px; border-radius:10px; font-size:12px;">' +
+          '<span style="font-family:var(--font-outfit); font-weight:700; text-transform:uppercase; font-size:11px; color:' + l[3] + ';">' + esc(l[0]) + '</span>' +
+          '<span>' + esc(l[1]) + '</span>' +
+          '<span style="color:var(--text-muted);">' + esc(l[2]) + '</span></div>';
+      }).join('');
+    })();
+  </script>
+
   <!-- Primary Dashboard Grid -->
   <div class="dashboard-grid">
     
