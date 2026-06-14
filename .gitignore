@@ -29,3 +29,7 @@ yarn-error.log*
 
 # vercel
 .vercel
+
+# payments-mcp runtime artifacts (spend ledger written by the real adapter
+# round-trip during the dry-run — never committed)
+/.payments-data/

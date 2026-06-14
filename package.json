@@ -8,6 +8,7 @@
     "start": "next start -p 3007",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
     "swarm:dry-run": "tsx src/swarm/index.ts"
   },
   "dependencies": {

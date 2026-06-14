@@ -23,6 +23,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Test (escalation spine + queen + payments-mcp adapter)
+        run: npm test
+
       - name: Build (next build)
         run: npm run build
 

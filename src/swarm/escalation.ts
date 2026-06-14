@@ -188,12 +188,14 @@ export function classify(action: Action): Classification {
 
 /**
  * True when a quantified spend exceeds its declared cap.
- * Fail-closed: a missing/non-numeric amount or cap is treated as over-cap so the
- * action is forced up the escalation ladder rather than silently passing.
+ * Fail-closed: a missing, non-numeric, or NaN amount/cap is treated as over-cap
+ * so the action is forced up the escalation ladder rather than silently passing.
+ * NaN is `typeof 'number'` but `NaN > x` is always false, so it would slip past a
+ * naive comparison — Number.isFinite closes that hole. Money never rides on doubt.
  */
 function overCap(action: Action): boolean {
-  if (typeof action.amount !== 'number' || typeof action.cap !== 'number') return true;
-  return action.amount > action.cap;
+  if (!Number.isFinite(action.amount) || !Number.isFinite(action.cap)) return true;
+  return (action.amount as number) > (action.cap as number);
 }
 
 /** Convenience predicate — does this action require a human in the loop? */
