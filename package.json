@@ -6,7 +6,9 @@
     "dev": "next dev -p 3007",
     "build": "next build",
     "start": "next start -p 3007",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "swarm:dry-run": "tsx src/swarm/index.ts"
   },
   "dependencies": {
     "next": "^14.2.3",
@@ -17,6 +19,7 @@
   },
   "devDependencies": {
     "typescript": "^5.4.5",
+    "tsx": "^4.19.2",
     "@types/node": "^20.12.7",
     "@types/react": "^18.2.79",
     "@types/react-dom": "^18.2.25"
