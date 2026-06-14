@@ -113,6 +113,9 @@ export class Queen {
     for (const task of tasks) {
       const worker = task.worker ? this.workers.find((w) => w.name === task.worker) : undefined;
       const chosen = worker ?? this.workers[0];
+      if (!chosen) {
+        throw new Error('No worker available to execute task: ' + task.id);
+      }
       const report = await chosen.run(task, mcp.vault);
       const decision = this.decide(report);
       decisions.push(decision);

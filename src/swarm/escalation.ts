@@ -90,6 +90,16 @@ const ALWAYS_FOUNDER: ActionKind[] = ['new-rail', 'new-vendor'];
  * downgraded by a more permissive later rule.
  */
 export function classify(action: Action): Classification {
+  // Defensive guard: a null/undefined action fails closed to the highest tier.
+  // Never let a missing action slip past the safety spine.
+  if (!action) {
+    return {
+      decision: 'human-gate',
+      reason: 'Invalid or missing action. Defaulting to highest safety tier (fail-closed).',
+      gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
+    };
+  }
+
   const irreversible = action.irreversible || ALWAYS_IRREVERSIBLE.includes(action.kind);
 
   // L7 — irreversible OR money movement → human, always. Highest stop.
@@ -176,9 +186,13 @@ export function classify(action: Action): Classification {
   };
 }
 
-/** True when a quantified spend exceeds its declared cap. */
+/**
+ * True when a quantified spend exceeds its declared cap.
+ * Fail-closed: a missing/non-numeric amount or cap is treated as over-cap so the
+ * action is forced up the escalation ladder rather than silently passing.
+ */
 function overCap(action: Action): boolean {
-  if (typeof action.amount !== 'number' || typeof action.cap !== 'number') return false;
+  if (typeof action.amount !== 'number' || typeof action.cap !== 'number') return true;
   return action.amount > action.cap;
 }
 
