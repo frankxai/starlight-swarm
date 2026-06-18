@@ -9,13 +9,13 @@
 > human holds the last line. The orchestration *contract*, in typed TypeScript —
 > never wired to live funds.
 
-[![Status](https://img.shields.io/badge/status-v0.2_dry--run_only-f59e0b?style=for-the-badge&labelColor=0d1117)](#-status)
-[![Layer](https://img.shields.io/badge/layer-L6_Swarm_Runtime-7fffd4?style=for-the-badge&labelColor=0d1117)](#-where-this-sits-in-the-stack)
-[![Safety](https://img.shields.io/badge/money_movement-none_by_design-c084fc?style=for-the-badge&labelColor=0d1117)](#-status)
+![Status](https://img.shields.io/badge/status-v0.2_dry--run_only-f59e0b?style=for-the-badge&labelColor=0d1117)
+![Layer](https://img.shields.io/badge/layer-L6_Swarm_Runtime-7fffd4?style=for-the-badge&labelColor=0d1117)
+![Safety](https://img.shields.io/badge/money_movement-none_by_design-c084fc?style=for-the-badge&labelColor=0d1117)
 [![Built on SIP](https://img.shields.io/badge/Built_on-SIP-78a6ff?style=for-the-badge&labelColor=0d1117)](https://github.com/frankxai/Starlight-Intelligence-System)
 [![License: MIT](https://img.shields.io/badge/license-MIT-white?style=for-the-badge&labelColor=0d1117)](https://opensource.org/licenses/MIT)
 
-[**⚡ Run the dry-run**](#-run-the-dry-run) · [**🧬 The model**](#-the-model-hybrid-queens-per-stream) · [**🪜 Escalation spine**](#-the-escalation-spine) · [**🗺️ Where it sits**](#-where-this-sits-in-the-stack)
+[**⚡ Run the dry-run**](#run-the-dry-run) · [**🧬 The model**](#the-model) · [**🪜 Escalation spine**](#escalation-spine) · [**🗺️ Where it sits**](#where-it-sits)
 
 </div>
 
@@ -51,6 +51,8 @@ This hardens the model; it does **not** make the swarm autonomously act.
 
 ---
 
+<a id="the-model"></a>
+
 ## 🧬 The model: hybrid queens-per-stream
 
 Topology: **queen-led per stream, mesh within a stream.** Queens never command across
@@ -78,6 +80,8 @@ flowchart TD
 ```
 
 ---
+
+<a id="escalation-spine"></a>
 
 ## 🪜 The escalation spine
 
@@ -119,6 +123,8 @@ local-cockpit.html           static operator console (now includes the swarm tre
 
 ---
 
+<a id="run-the-dry-run"></a>
+
 ## ⚡ Run the dry-run
 
 ```bash
@@ -146,6 +152,8 @@ If the server isn't built, the adapter degrades to the fail-closed dry-run.
 
 ---
 
+<a id="where-it-sits"></a>
+
 ## 🗺️ Where this sits in the stack
 
 ```
@@ -159,9 +167,9 @@ L1 CAPABILITY
 L0 SUBSTRATE        Starlight-Intelligence-System
 ```
 
-> Layer model + contract: [`agentic-ops-hub/ECOSYSTEM.md`](../agentic-ops-hub/ECOSYSTEM.md)
-> · Agent stack + escalation contract: [`agentic-ops-hub/docs/AGENT-STACK.md`](../agentic-ops-hub/docs/AGENT-STACK.md)
-> · Protection layers: [`agentic-ops-hub/PROTECTION-LAYERS.md`](../agentic-ops-hub/PROTECTION-LAYERS.md)
+> Layer model + contract: [`agentic-ops-hub/ECOSYSTEM.md`](https://github.com/frankxai/agentic-ops-hub/blob/main/ECOSYSTEM.md)
+> · Agent stack + escalation contract: [`agentic-ops-hub/docs/AGENT-STACK.md`](https://github.com/frankxai/agentic-ops-hub/blob/main/docs/AGENT-STACK.md)
+> · Protection layers: [`agentic-ops-hub/PROTECTION-LAYERS.md`](https://github.com/frankxai/agentic-ops-hub/blob/main/PROTECTION-LAYERS.md)
 
 ---
 
