@@ -1,12 +1,19 @@
 <!-- GITHUB_VISUALS_START -->
 <p align="center">
-  <img src="assets/github/header.svg" alt="Starlight Swarm - Queen-worker runtime for governed income streams" width="100%">
+  <img src="assets/github/header.svg" alt="Starlight Swarm - Queen-worker runtime for governed income streams." width="100%">
 </p>
 
 <details open>
 <summary><strong>How this repo works</strong></summary>
 <p align="center">
   <img src="assets/github/how-it-works.svg" alt="Starlight Swarm operating map" width="100%">
+</p>
+</details>
+
+<details>
+<summary><strong>Build, deploy, verify path</strong></summary>
+<p align="center">
+  <img src="assets/github/build-deploy-verify.svg" alt="Starlight Swarm build deploy verify path" width="100%">
 </p>
 </details>
 
