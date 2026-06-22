@@ -33,3 +33,16 @@ yarn-error.log*
 # payments-mcp runtime artifacts (spend ledger written by the real adapter
 # round-trip during the dry-run — never committed)
 /.payments-data/
+
+# Starlight/ACOS temporary files
+.agent/
+*.log
+.system_generated/
+.next-backup/
+temp-*.json
+link-checker-report.json
+link-checker-report.txt
+
+# Starlight/ACOS temporary files
+.starlight/
+.gemini/
