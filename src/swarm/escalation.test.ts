@@ -14,7 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classify, requiresHuman } from './escalation';
+import { classify, requiresHuman, requiresPaymentGovernance } from './escalation';
 import type { Action, ActionKind, StreamId } from './escalation';
 
 /** Build an action with reversible / no-money defaults (mirrors index.ts helper). */
@@ -63,6 +63,13 @@ test('in-cap payment → queen-gate (verify + cap + audit gates)', () => {
   ]);
 });
 
+test('payment kind routes through payment gates even if movesMoney is false', () => {
+  const c = classify(action('payments', { kind: 'payment', movesMoney: false, amount: 40, cap: 100 }));
+  assert.equal(c.decision, 'queen-gate');
+  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
+  assert.equal(requiresPaymentGovernance(action('payments', { kind: 'payment', movesMoney: false })), true);
+});
+
 test('over-cap payment → founder-board (never auto-approve)', () => {
   const c = classify(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 }));
   assert.equal(c.decision, 'founder-board');
@@ -80,6 +87,8 @@ test('movesMoney without explicit payment kind still routes through payment gate
 test('move-funds → human-gate (irreversible money movement, always)', () => {
   const c = classify(action('payments', { kind: 'move-funds', movesMoney: true, irreversible: true }));
   assert.equal(c.decision, 'human-gate');
+  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
+  assert.ok(c.gates.includes('payments-mcp.check_spend_cap'));
   assert.ok(c.gates.includes('human.approval'));
 });
 
@@ -87,6 +96,8 @@ test('move-funds is human-gate even without the explicit flags (kind alone is en
   // move-funds is in ALWAYS_IRREVERSIBLE — the kind alone forces the highest tier.
   const c = classify(action('payments', { kind: 'move-funds' }));
   assert.equal(c.decision, 'human-gate');
+  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
+  assert.equal(requiresPaymentGovernance(action('payments', { kind: 'move-funds' })), true);
 });
 
 test('each ALWAYS_IRREVERSIBLE kind → human-gate', () => {
@@ -113,11 +124,18 @@ test('new-vendor → founder-board', () => {
 test('generic spend above cap → founder-board', () => {
   const c = classify(action('products', { kind: 'spend', amount: 9000, cap: 100 }));
   assert.equal(c.decision, 'founder-board');
+  assert.ok(c.gates.includes('payments-mcp.check_spend_cap'));
 });
 
-test('generic spend within cap → autonomous (reversible, no money)', () => {
+test('generic spend within cap → queen-gate behind Payments MCP', () => {
   const c = classify(action('products', { kind: 'spend', amount: 10, cap: 100 }));
-  assert.equal(c.decision, 'autonomous');
+  assert.equal(c.decision, 'queen-gate');
+  assert.deepEqual(c.gates, [
+    'payments-mcp.verify_mandate',
+    'payments-mcp.check_spend_cap',
+    'payments-mcp.record_audit_entry',
+  ]);
+  assert.equal(requiresPaymentGovernance(action('products', { kind: 'spend', movesMoney: false })), true);
 });
 
 test('cross-stream action → founder-board (queens never command across streams)', () => {
@@ -164,8 +182,8 @@ test('FAIL-CLOSED: payment with NaN cap → over-cap → founder-board', () => {
   assert.equal(c.decision, 'founder-board', 'a NaN cap must be treated as over-cap');
 });
 
-test('requiresHuman is true only for human-gate decisions', () => {
+test('requiresHuman follows the human.approval gate, including founder-board approvals', () => {
   assert.equal(requiresHuman(action('payments', { kind: 'move-funds' })), true);
   assert.equal(requiresHuman(action('content', { kind: 'draft' })), false);
-  assert.equal(requiresHuman(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 })), false);
+  assert.equal(requiresHuman(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 })), true);
 });

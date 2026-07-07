@@ -87,12 +87,12 @@ export default function Home() {
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
       </Head>
 
-      <header>
+      <header className="command-shell">
         <div className="brand">
-          <div className="brand-logo">✦</div>
+          <div className="brand-logo">SIS</div>
           <div>
             <h1>STARLIGHT SWARM COCKPIT</h1>
-            <p className="subtitle">Substrate: SIS-Horizons | Operator Console</p>
+            <p className="subtitle">Operational glass console · repo fleet · daemon substrate</p>
           </div>
         </div>
         <div className="header-status">
@@ -100,6 +100,30 @@ export default function Home() {
           <span>SYSTEM STATE: {daemonState.some((d) => d.status === 'Offline') ? 'DEGRADED (YELLOW)' : 'NOMINAL (GREEN)'}</span>
         </div>
       </header>
+
+      <section className="hero-grid">
+        <div className="hero-copy">
+          <div className="eyebrow">Live operational surface</div>
+          <h2>One cockpit for swarm health, recovery, and repo truth.</h2>
+          <p>
+            This is not a landing page. It is the operator view: daemons, repository registry,
+            recovery actions, and event spine in one inspectable surface.
+          </p>
+        </div>
+        <div className="signal-panel">
+          {[
+            ['Core daemons', `${daemonState.filter((d) => d.status === 'Active').length}/${daemonState.length}`],
+            ['Repo records', repos.length ? String(repos.length) : 'loading'],
+            ['Recovery', recovering ? 'running' : 'ready'],
+            ['Audit', loadingAudit ? 'refreshing' : 'stable'],
+          ].map(([label, value]) => (
+            <div key={label} className="metric-tile">
+              <span>{label}</span>
+              <strong>{value}</strong>
+            </div>
+          ))}
+        </div>
+      </section>
 
       <main className="dashboard-grid">
         {/* Daemons Panel */}
@@ -206,8 +230,9 @@ export default function Home() {
         body {
           background-color: var(--bg-base);
           background-image: 
-            radial-gradient(at 10% 10%, hsla(270, 50%, 15%, 0.2) 0px, transparent 50%),
-            radial-gradient(at 90% 90%, hsla(190, 50%, 15%, 0.2) 0px, transparent 50%);
+            radial-gradient(at 12% 8%, hsla(190, 70%, 18%, 0.22) 0px, transparent 38%),
+            radial-gradient(at 85% 4%, hsla(270, 65%, 16%, 0.18) 0px, transparent 34%),
+            linear-gradient(180deg, hsla(240, 20%, 6%, 0), hsla(240, 20%, 3%, 0.72));
           color: var(--text-main);
           font-family: var(--font-inter);
           min-height: 100vh;
@@ -224,12 +249,13 @@ export default function Home() {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          background: var(--bg-surface);
-          backdrop-filter: blur(16px);
-          border: 1px solid var(--border-color);
-          border-radius: 16px;
+          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.07), transparent 32%), var(--bg-surface);
+          backdrop-filter: blur(22px) saturate(145%);
+          border: 1px solid hsla(0, 0%, 100%, 0.08);
+          border-radius: 22px;
           padding: 16px 28px;
           margin-bottom: 24px;
+          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.08), 0 28px 90px hsla(240, 35%, 2%, 0.42);
         }
 
         .brand {
@@ -239,10 +265,18 @@ export default function Home() {
         }
 
         .brand-logo {
-          font-size: 32px;
+          display: grid;
+          place-items: center;
+          width: 48px;
+          height: 48px;
+          border-radius: 16px;
+          border: 1px solid hsla(190, 80%, 55%, 0.32);
+          background: hsla(190, 80%, 55%, 0.09);
+          font-size: 12px;
+          font-weight: 800;
           font-family: var(--font-outfit);
-          color: var(--accent-primary);
-          text-shadow: 0 0 10px hsla(270, 75%, 65%, 0.5);
+          color: var(--accent-secondary);
+          text-shadow: 0 0 14px hsla(190, 80%, 55%, 0.5);
         }
 
         h1 {
@@ -264,6 +298,82 @@ export default function Home() {
           font-family: var(--font-outfit);
           font-size: 13px;
           font-weight: 600;
+        }
+
+        .hero-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+          gap: 24px;
+          margin-bottom: 24px;
+        }
+
+        .hero-copy, .signal-panel {
+          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.06), transparent 34%), var(--bg-surface);
+          border: 1px solid hsla(0, 0%, 100%, 0.08);
+          border-radius: 22px;
+          backdrop-filter: blur(22px) saturate(145%);
+          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.07), 0 28px 90px hsla(240, 35%, 2%, 0.30);
+        }
+
+        .hero-copy {
+          padding: 32px;
+        }
+
+        .eyebrow {
+          color: var(--accent-secondary);
+          font-family: var(--font-outfit);
+          font-size: 11px;
+          font-weight: 800;
+          letter-spacing: 0.22em;
+          text-transform: uppercase;
+        }
+
+        .hero-copy h2 {
+          font-size: clamp(32px, 4vw, 58px);
+          line-height: 0.98;
+          letter-spacing: -0.035em;
+          margin: 12px 0 0;
+        }
+
+        .hero-copy p {
+          max-width: 680px;
+          color: var(--text-muted);
+          font-size: 16px;
+          line-height: 1.7;
+          margin: 18px 0 0;
+        }
+
+        .signal-panel {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          padding: 18px;
+        }
+
+        .metric-tile {
+          min-height: 118px;
+          border: 1px solid hsla(0, 0%, 100%, 0.07);
+          border-radius: 18px;
+          background: hsla(240, 14%, 10%, 0.56);
+          padding: 18px;
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+        }
+
+        .metric-tile span {
+          color: var(--text-muted);
+          font-family: var(--font-outfit);
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+        }
+
+        .metric-tile strong {
+          font-family: var(--font-outfit);
+          font-size: 30px;
+          color: var(--text-main);
         }
 
         .pulse-dot {
@@ -288,13 +398,14 @@ export default function Home() {
         }
 
         .card {
-          background: var(--bg-surface);
-          backdrop-filter: blur(16px);
-          border: 1px solid var(--border-color);
-          border-radius: 16px;
+          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.045), transparent 34%), var(--bg-surface);
+          backdrop-filter: blur(20px) saturate(140%);
+          border: 1px solid hsla(0, 0%, 100%, 0.075);
+          border-radius: 22px;
           padding: 24px;
           display: flex;
           flex-direction: column;
+          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.06), 0 22px 70px hsla(240, 35%, 2%, 0.25);
         }
 
         .card-header-row {
@@ -443,6 +554,27 @@ export default function Home() {
           display: flex;
           flex-direction: column-reverse;
           gap: 6px;
+        }
+
+        @media (max-width: 900px) {
+          header,
+          .hero-grid {
+            grid-template-columns: 1fr;
+          }
+
+          header {
+            align-items: flex-start;
+            flex-direction: column;
+            gap: 16px;
+          }
+
+          .dashboard-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .console-card {
+            grid-column: span 1;
+          }
         }
 
         .log-line {

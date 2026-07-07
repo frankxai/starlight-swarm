@@ -1,0 +1,63 @@
+{
+  "schema": "https://starlightintelligence.org/schemas/starlight-pack.v1.json",
+  "packId": "starlight-swarm-operator-pack",
+  "sku": "STL-SWARM-OPERATOR-V0",
+  "name": "Starlight Swarm Operator Pack",
+  "version": "0.1.0",
+  "summary": "A governed queen-and-worker swarm runtime for agent operators, with fail-closed payment governance, portable substrate skills, and proof-first install docs.",
+  "buyer": "Agent operators, AI system builders, orchestrator teams, and advanced creators who need a bounded multi-agent income/runtime pattern.",
+  "tier": "paid-license",
+  "licenseModel": "software-access-license",
+  "sourceRepo": "frankxai/starlight-swarm",
+  "sourceCommit": "generated-at-pack-time",
+  "packageHash": "generated-at-pack-time",
+  "manifestUri": "ipfs://pending",
+  "licenseTermsUri": "ipfs://pending",
+  "includedAssets": [
+    "runtime/src/swarm",
+    "docs/README.md",
+    "docs/SWARM-ARCHITECTURE.md",
+    "skills/swarm-queen-coordination/SKILL.md",
+    "skills/payments-mandate/SKILL.md",
+    "skills/agentic-income/SKILL.md",
+    "skills/affiliate-audit/SKILL.md",
+    "proof/HEALTH.md"
+  ],
+  "privateDataExcluded": [
+    ".git",
+    ".next",
+    "node_modules",
+    ".agent-harness.json",
+    ".env",
+    ".env.local",
+    "private memory",
+    "credentials",
+    "local machine paths"
+  ],
+  "chainMirrors": {
+    "evm": {
+      "standard": "ERC-1155 + ERC-2981",
+      "polygonAmoy": {
+        "contract": "pending",
+        "tokenId": "pending"
+      },
+      "sepolia": {
+        "contract": "pending",
+        "tokenId": "pending"
+      }
+    },
+    "solana": {
+      "standard": "Metaplex Core",
+      "devnet": {
+        "asset": "pending",
+        "collection": "pending"
+      }
+    }
+  },
+  "supportBoundary": "Includes package install guidance, runtime dry-run proof, and operator doctrine. Does not include private Starlight memory, credentials, production payment keys, guaranteed income, or investment rights.",
+  "upgradePath": [
+    "Operator Pack v0.2 with marketplace entitlement resolver",
+    "Certified Operator Agent identity layer",
+    "Enterprise swarm governance and support"
+  ]
+}

@@ -60,7 +60,7 @@ No autonomous money movement, ever. Payments go through the Payments MCP
 ```text
 src/swarm/
   streams.ts       4 income streams + queens + workers as typed config
-  queen.ts         Queen class - owns workers, runs a loop step, act-vs-escalate
+  queen.ts         Queen class - owns workers, runs a loop step, gate-ready-vs-escalate
   worker.ts        Worker interface - one job, append-only memory, never self-gates
   escalation.ts    classify(action) -> autonomous | queen-gate | founder-board | human-gate
   integrations.ts  MCP integration: SIS sis_* stubs + payments-MCP adapter

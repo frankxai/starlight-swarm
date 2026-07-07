@@ -82,6 +82,9 @@ const ALWAYS_IRREVERSIBLE: ActionKind[] = ['delete', 'rename-url', 'rotate-key',
 /** Actions that always reach the founder/board even below any cap. */
 const ALWAYS_FOUNDER: ActionKind[] = ['new-rail', 'new-vendor'];
 
+/** Actions that must pass Payments MCP governance even if `movesMoney` is mislabeled. */
+const PAYMENT_GOVERNED: ActionKind[] = ['payment', 'spend', 'move-funds'];
+
 /**
  * classify() — the single source of truth for "who decides".
  *
@@ -104,22 +107,32 @@ export function classify(action: Action): Classification {
 
   // L7 — irreversible OR money movement → human, always. Highest stop.
   if (irreversible || action.kind === 'move-funds') {
+    const gates = requiresPaymentGovernance(action)
+      ? [
+          'payments-mcp.verify_mandate',
+          'payments-mcp.check_spend_cap',
+          'founder.review',
+          'starlight-board.pressure-test',
+          'human.approval',
+        ]
+      : ['founder.review', 'starlight-board.pressure-test', 'human.approval'];
+
     return {
       decision: 'human-gate',
       reason:
         'Irreversible or fund-moving action (FrankX hard-stop). Agents prepare; humans commit. ' +
         'No autonomous money movement, ever.',
-      gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
+      gates,
     };
   }
 
-  // Any payment / settlement → Payments MCP governance (verify-only, fail-closed).
-  if (action.kind === 'payment' || action.movesMoney) {
+  // Any payment / spend / settlement → Payments MCP governance (verify-only, fail-closed).
+  if (requiresPaymentGovernance(action)) {
     // Over-cap payment escalates past the queen to the founder.
     if (overCap(action)) {
       return {
         decision: 'founder-board',
-        reason: 'Payment exceeds spend-cap. Over-cap spend escalates to founder + board, never auto-approve.',
+        reason: 'Payment-governed action exceeds spend-cap. Over-cap spend escalates to founder + board, never auto-approve.',
         gates: [
           'payments-mcp.verify_mandate',
           'payments-mcp.check_spend_cap', // returns over-cap → escalate
@@ -132,7 +145,7 @@ export function classify(action: Action): Classification {
     return {
       decision: 'queen-gate',
       reason:
-        'Payment within cap. Payments Queen authorizes behind AP2 mandate verify + spend-cap + audit (fail-closed).',
+        'Payment-governed action within cap. Payments Queen authorizes behind AP2 mandate verify + spend-cap + audit (fail-closed).',
       gates: [
         'payments-mcp.verify_mandate',
         'payments-mcp.check_spend_cap',
@@ -146,15 +159,6 @@ export function classify(action: Action): Classification {
     return {
       decision: 'founder-board',
       reason: 'New payment rail or vendor contract. Structural change — founder owns it, board pressure-tests it.',
-      gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
-    };
-  }
-
-  // Generic spend above cap → founder + board + human.
-  if (action.kind === 'spend' && overCap(action)) {
-    return {
-      decision: 'founder-board',
-      reason: 'Capital spend above cap. Founder + board + human approval required.',
       gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
     };
   }
@@ -200,5 +204,11 @@ function overCap(action: Action): boolean {
 
 /** Convenience predicate — does this action require a human in the loop? */
 export function requiresHuman(action: Action): boolean {
-  return classify(action).decision === 'human-gate';
+  return classify(action).gates.includes('human.approval');
+}
+
+/** True when an action must be checked by the verify-only Payments MCP gate. */
+export function requiresPaymentGovernance(action: Action): boolean {
+  if (!action) return false;
+  return PAYMENT_GOVERNED.includes(action.kind) || action.movesMoney;
 }
