@@ -1,0 +1,1962 @@
+diff --git a/.agent-harness.json b/.agent-harness.json
+new file mode 100644
+index 0000000..10549c5
+--- /dev/null
++++ b/.agent-harness.json
+@@ -0,0 +1,45 @@
++﻿{
++    "name":  "starlight-swarm",
++    "classification":  "agent-substrate",
++    "owner":  "FrankX AI",
++    "updated":  "2026-06-19",
++    "remote":  "https://github.com/frankxai/starlight-swarm.git",
++    "health":  {
++                   "primaryCheck":  "npm run build",
++                   "manualChecks":  [
++                                        "Review AGENTS.md before edits",
++                                        "Preserve user work and dirty files",
++                                        "Scan public outputs for secrets and private memory"
++                                    ]
++               },
++    "agentGuidance":  {
++                          "readAgentsMd":  true,
++                          "avoidPrivateMemory":  true,
++                          "preserveExistingConventions":  true,
++                          "designTasteKernel":  {
++                                                    "enabled":  true,
++                                                    "root":  "C:\\Users\\frank\\starlight\\repos",
++                                                    "files":  [
++                                                                  "C:\\Users\\frank\\starlight\\repos\\DESIGN_TASTE.md",
++                                                                  "C:\\Users\\frank\\starlight\\repos\\WEB_EXPERIENCE_STANDARD.md",
++                                                                  "C:\\Users\\frank\\starlight\\repos\\MOTION_TASTE_RUBRIC.md",
++                                                                  "C:\\Users\\frank\\starlight\\repos\\MULTI_AGENT_DESIGN_COUNCIL.md",
++                                                                  "C:\\Users\\frank\\starlight\\repos\\VISUAL_QA_GATE.md"
++                                                              ],
++                                                    "appliesTo":  [
++                                                                      "site",
++                                                                      "app",
++                                                                      "landing-page",
++                                                                      "dashboard",
++                                                                      "visual-identity",
++                                                                      "brand",
++                                                                      "motion",
++                                                                      "media",
++                                                                      "social",
++                                                                      "frontend"
++                                                                  ],
++                                                    "motionPlugin":  "motion-design-studio",
++                                                    "visualVerificationRequired":  true
++                                                }
++                      }
++}
+diff --git a/AGENTS.md b/AGENTS.md
+index f6256f2..1c3ba45 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,4 +1,4 @@
+-## Agent Orchestrator (ao) Session
++﻿## Agent Orchestrator (ao) Session
+ 
+ You are running inside an Agent Orchestrator managed workspace.
+ Session metadata is updated automatically via shell wrappers.
+@@ -8,3 +8,16 @@ If automatic updates fail, you can manually update metadata:
+ ~/.ao/bin/ao-metadata-helper.sh  # sourced automatically
+ # Then call: update_ao_metadata <key> <value>
+ ```
++
++## Design Taste Kernel
++
++For any site, app, landing page, dashboard, visual identity, brand, motion, media, social, or frontend task, apply the shared Design Taste Kernel before handoff:
++
++- C:\Users\frank\starlight\repos\DESIGN_TASTE.md
++- C:\Users\frank\starlight\repos\WEB_EXPERIENCE_STANDARD.md
++- C:\Users\frank\starlight\repos\MOTION_TASTE_RUBRIC.md
++- C:\Users\frank\starlight\repos\MULTI_AGENT_DESIGN_COUNCIL.md
++- C:\Users\frank\starlight\repos\VISUAL_QA_GATE.md
++
++When motion, scroll, generated media, GIF/video, or premium polish matters, route through the Motion Design Studio plugin/skills and verify the result visually.
++
+diff --git a/README.md b/README.md
+index 90ee266..18dc693 100644
+--- a/README.md
++++ b/README.md
+@@ -60,7 +60,7 @@ No autonomous money movement, ever. Payments go through the Payments MCP
+ ```text
+ src/swarm/
+   streams.ts       4 income streams + queens + workers as typed config
+-  queen.ts         Queen class - owns workers, runs a loop step, act-vs-escalate
++  queen.ts         Queen class - owns workers, runs a loop step, gate-ready-vs-escalate
+   worker.ts        Worker interface - one job, append-only memory, never self-gates
+   escalation.ts    classify(action) -> autonomous | queen-gate | founder-board | human-gate
+   integrations.ts  MCP integration: SIS sis_* stubs + payments-MCP adapter
+diff --git a/docs/OPERATOR-PACK.md b/docs/OPERATOR-PACK.md
+new file mode 100644
+index 0000000..1ae2551
+--- /dev/null
++++ b/docs/OPERATOR-PACK.md
+@@ -0,0 +1,28 @@
++# Starlight Swarm Operator Pack
++
++The operator pack is the public, sellable subset of `starlight-swarm`.
++
++It includes:
++
++- the typed `src/swarm` runtime and tests;
++- the swarm architecture docs;
++- four portable substrate skills: `swarm-queen-coordination`, `payments-mandate`, `agentic-income`, and `affiliate-audit`;
++- source attribution, license terms, install notes, proof notes, a generated manifest, and a package hash.
++
++It excludes:
++
++- `.git`, `.next`, `node_modules`, `.agent-harness.json`, `.env` files, private memory, credentials, local-only paths, and internal strategy.
++
++Build it with:
++
++```bash
++npm run pack:operator
++```
++
++The exporter writes to:
++
++```text
++../_generated/operator-packs/starlight-swarm-operator-pack/
++```
++
++The generated archive is a local release candidate. Uploading metadata to IPFS/Arweave, minting access tokens, and activating marketplace downloads happen in the marketplace/on-chain release wave.
+diff --git a/docs/swarm-red-team-eval-2026-06-23.md b/docs/swarm-red-team-eval-2026-06-23.md
+new file mode 100644
+index 0000000..4550d56
+--- /dev/null
++++ b/docs/swarm-red-team-eval-2026-06-23.md
+@@ -0,0 +1,410 @@
++# Starlight Swarm Red-Team Eval - 2026-06-23
++
++## Target
++
++Target artifact: `starlight-swarm` L6 swarm runtime, with adjacent SIS Proving
++Ground eval surface.
++
++Eval objective:
++
++- Re-test the current local swarm runtime.
++- Red-team payment safety, eval sufficiency, cockpit/recovery posture, and
++  architecture foundation.
++- Compare the Starlight approach against current orchestration alternatives.
++
++Working-tree caveat:
++
++- `starlight-swarm` was dirty before this eval and was tested as-is.
++- Branch state: `main...origin/main [behind 5]`.
++- SIS was also dirty before this eval. Existing changes were treated as external
++  work and were not reverted.
++
++## Executive Verdict
++
++Verdict: REVISE BEFORE STRONG CLAIMS.
++
++The system is materially better than the June 18 run on the main payment
++governance path. The earlier weakness, where `verify_mandate` and
++`check_spend_cap` were observed but not enforced, has been largely patched.
++
++It is not yet better than mature orchestration frameworks as a runtime. It is
++better only in one narrow, valuable dimension: domain-specific governance
++language around founder/human gates, no autonomous money movement, and
++fail-closed payment thinking.
++
++The best next foundation is: keep the Starlight governance taxonomy, but run it
++on a proven durable workflow, queue, tracing, and policy substrate.
++
++## Evidence Run
++
++Commands run in `C:\Users\frank\starlight\repos\starlight-swarm`:
++
++```powershell
++npm run swarm:dry-run
++npm run typecheck
++npm test
++npm run build
++```
++
++Results:
++
++- `npm run swarm:dry-run`: passed. No action fired. No money moved.
++- Dry-run is stricter than before: in-cap dry-run payment now becomes
++  `human-gate` because mandate verification is not live.
++- `npm run typecheck`: passed.
++- `npm test`: passed, 45 tests, 0 failures.
++- `npm run build`: passed. Next.js built `/`, `/swarm`, `/api/audit`, and
++  `/api/recover`.
++
++Cockpit smoke:
++
++- Built app started locally on `http://localhost:3007`, then was shut down.
++- `/swarm`: loaded.
++- `/api/audit`: `ok=true`, 6 registry entries.
++- `/api/recover`: `status=nominal`.
++
++SIS eval/test commands:
++
++```powershell
++npm run eval:retrieval
++node tools/run-v01-evals.mjs
++npm run test:substrate
++npm run test:operational
++```
++
++Results:
++
++- `npm run eval:retrieval`: passed. 1 test, 0 failures. 10-query corpus,
++  recall@1/3/5 all 100%.
++- `node tools/run-v01-evals.mjs`: passed. 34 pass, 0 fail, 7 todo.
++- `npm run test:operational`: passed.
++- `npm run test:substrate`: failed at `v80-platform-prompts`.
++
++Substrate failure:
++
++- `CLAUDE.md` and `AGENTS.md` claim skills=83 while canonical count is 84.
++- Platform adapter prompts also claim skills=83 while canonical count is 84.
++- This is a real foundation drift, not a runtime swarm failure.
++
++## What Is Better Now
++
++The main payment-governance path is stronger.
++
++Current `Queen.enforcePaymentGovernance()` blocks in-cap payments when:
++
++- Payments MCP is missing.
++- Mandate verification fails.
++- Spend cap check fails.
++- Audit write fails.
++- Payments MCP throws.
++
++The suite now includes tests for those cases, growing swarm tests from 41 to 45.
++This is a meaningful improvement over the June 18 state.
++
++The dry-run behavior is also more honest. With only the dry-run payment adapter,
++even an in-cap payment is human-gated because the mandate is not validly signed.
++
++## Pre-Patch Red-Team Findings
++
++The findings in this section describe the state observed before the blue-team
++closure at the end of this report.
++
++### High: Payment-like actions can bypass MCP enforcement by false labeling
++
++Reproduction:
++
++```powershell
++npx tsx -e "import { classify } from './src/swarm/escalation.ts'; const cases = [{name:'payment-kind-without-movesMoney', action:{stream:'payments', kind:'payment', movesMoney:false, irreversible:false, crossStream:false, amount:40, cap:100}}, {name:'spend-kind-without-movesMoney', action:{stream:'payments', kind:'spend', movesMoney:false, irreversible:false, crossStream:false, amount:40, cap:100}}]; for (const c of cases) console.log(c.name + ': ' + JSON.stringify(classify(c.action as any)));"
++```
++
++Observed:
++
++- `kind: payment`, `movesMoney: false` classified as `queen-gate`.
++- `kind: spend`, `movesMoney: false` classified as `autonomous`.
++
++Queen-path reproduction:
++
++```powershell
++npx tsx -e "...mislabeled payment task..."
++```
++
++Observed:
++
++```json
++{
++  "decision": {
++    "classification": {
++      "decision": "queen-gate"
++    },
++    "verdict": "act"
++  },
++  "calls": []
++}
++```
++
++Meaning:
++
++- `classify()` treats `kind === 'payment' || movesMoney` as payment governance.
++- `Queen.enforcePaymentGovernance()` only triggers on `report.proposed.movesMoney`.
++- Therefore a `kind: payment` action can receive payment gates in classification
++  while making zero Payments MCP calls if `movesMoney` is false.
++
++Fix direction:
++
++- Define one canonical `isPaymentLike(action)` predicate and use it in both
++  `classify()` and `Queen.enforcePaymentGovernance()`.
++- Treat `payment`, `spend`, `settlement`, and any amount/cap-bearing payment-stream
++  proposal as payment-like unless explicitly marked read-only.
++
++### High: `spend` semantics are unsafe
++
++`ActionKind` says `spend` means capital spend. Yet in-cap `spend` with
++`movesMoney: false` can be autonomous. This is too easy to misuse.
++
++Fix direction:
++
++- Make `spend` founder-board by default.
++- Require a separate `budget-research` or `pricing-analysis` kind for reversible,
++  non-money planning.
++
++### Medium: `act` is the wrong word for gated payment decisions
++
++For `queen-gate`, `Queen.decide()` returns `verdict: act`. That is safe while the
++runtime is dry-run only, but dangerous vocabulary if any live executor is added.
++
++Fix direction:
++
++- Rename `act` to `approved_for_next_gate`, `gate_passed`, or `ready_for_review`.
++- Never use the same enum value for "draft/reversible action" and "payment passed
++  verification".
++
++### Medium: `require_human_approval()` is a soft placeholder
++
++The adapter records an escalation audit note and returns pending. That is safe as
++a fail-closed local signal, but it is not a real human approval workflow.
++
++Fix direction:
++
++- Rename to `record_human_approval_required()` until it is actually wired.
++- Add an approval ticket/receipt interface before any live rail.
++
++### Medium: `requiresHuman()` can mislead future callers
++
++`requiresHuman()` returns true only for `human-gate`. Over-cap payments return
++`founder-board` but include `human.approval` in gates.
++
++Fix direction:
++
++- Add `requiresHumanApproval(decision)` based on gates, not decision tier alone.
++- Keep `decision` tier and required approvals as separate concepts.
++
++### Medium: No durable queue or recovery foundation
++
++`Queen.stepLoop()` is a synchronous dry-run heartbeat over passed-in tasks. There
++is no persisted job state, idempotency key, lease, retry policy, dead-letter
++queue, or worker recovery path.
++
++Fix direction:
++
++- Use Temporal for durable long-running orchestration.
++- Or use BullMQ/Redis for a lighter bounded Node queue.
++- Keep the Queen as a coordinator/policy layer, not the queue substrate.
++
++### Medium: Traceability is not production-grade
++
++Once SO, Queen, AO, SIS, workers, and MCP servers become separate processes,
++console logs will not prove causality.
++
++Fix direction:
++
++- Add `swarm.run_id`, `task_id`, `decision_id`, and `audit_id`.
++- Use OpenTelemetry spans for route, plan, enqueue, worker, MCP call, policy,
++  audit write, and human gate.
++
++### Medium: Eval evidence is too narrow for broad quality claims
++
++The evals support the narrow claim:
++
++> The dry-run safety spine is unit-tested and currently fails closed around
++> payment governance.
++
++They do not yet support:
++
++> This is a high-quality production multi-agent system.
++
++Missing proof:
++
++- Dedicated `starlight-swarm` Proving Ground lane.
++- Repeated adversarial payment fixtures.
++- Multi-turn recovery runs.
++- Real MCP adapter smoke against built `payment-intelligence-system`.
++- Queue throughput/latency/cost tests.
++- Worker-output quality rubrics.
++- Cross-stream conflict scenarios.
++- Human approval receipt lifecycle.
++- PII/private-memory leakage tests.
++
++## External Comparison
++
++Current official sources checked on 2026-06-23:
++
++- LangGraph: `https://docs.langchain.com/oss/python/langgraph/overview`
++- LangGraph persistence: `https://docs.langchain.com/oss/python/langgraph/persistence`
++- Microsoft Agent Framework: `https://learn.microsoft.com/en-us/agent-framework/overview/`
++- Microsoft Agent Framework orchestrations: `https://learn.microsoft.com/en-us/agent-framework/workflows/orchestrations/`
++- OpenAI Agents SDK tracing: `https://openai.github.io/openai-agents-python/tracing/`
++- OpenAI Agents SDK guardrails: `https://openai.github.io/openai-agents-python/guardrails/`
++- OpenAI Agents SDK handoffs: `https://openai.github.io/openai-agents-python/handoffs/`
++- CrewAI docs: `https://docs.crewai.com/`
++- Temporal durable execution: `https://temporal.io/blog/what-is-durable-execution`
++- AutoGen repo: `https://github.com/microsoft/autogen`
++
++Comparison:
++
++- LangGraph is ahead as a low-level orchestration runtime: durable execution,
++  persistence, human-in-the-loop, streaming, and tracing/eval ecosystem via
++  LangSmith.
++- Microsoft Agent Framework is ahead for enterprise workflow foundations:
++  graph workflows, type-safe routing, checkpointing, human-in-the-loop support,
++  and built-in orchestration patterns.
++- CrewAI is ahead for packaged multi-agent developer experience: crews, flows,
++  guardrails, memory, knowledge, observability, human-in-the-loop triggers, and
++  long-running flow concepts.
++- OpenAI Agents SDK is ahead for handoffs, guardrails, sessions, and built-in
++  tracing around LLM/tool/handoff events.
++- Temporal is ahead as a reliability foundation: crash-proof, long-running,
++  durable execution with automatic state preservation.
++- AutoGen should not be the default new foundation; official GitHub now says it
++  is in maintenance mode and points new users to Microsoft Agent Framework.
++
++Where Starlight is better:
++
++- Domain-specific governance language is sharper than generic frameworks:
++  founder/human gates, no autonomous money movement, stream containment,
++  fail-closed payment intent, and red/blue eval posture.
++- The Starlight model is stronger as a doctrine/eval/policy overlay than as a
++  runtime.
++
++Where Starlight is not better:
++
++- Durable execution.
++- Queueing.
++- State recovery.
++- Production observability.
++- Typed workflow graph/runtime.
++- Human approval lifecycle.
++- Proven policy engine.
++- Eval sample size and repeatability.
++
++## Recommended Foundation
++
++Use Starlight as the governance and eval layer, not the base runtime.
++
++Recommended stack:
++
++1. Temporal for durable Queen/AO workflows.
++2. OpenTelemetry for traces across SO, Queen, AO, workers, MCP, SIS, and audits.
++3. A policy layer, preferably OPA/Rego or an equivalent versioned decision table,
++   for non-waivable gate logic.
++4. SIS Proving Ground with a new `starlight-swarm` lane.
++5. Existing `starlight-swarm` TypeScript classifier as a reference adapter and
++   fast local test harness.
++
++Lighter alternative:
++
++- If Temporal is too heavy for the next step, use BullMQ/Redis first for queues,
++  retries, leases, priorities, repeatable jobs, and dead-letter handling. Still
++  add trace IDs and policy tests.
++
++## Next Gate
++
++Before calling this "best-in-class":
++
++1. Patch payment-like predicate consistency.
++2. Make `spend` non-autonomous by default.
++3. Rename `act` so gated payment readiness cannot be confused with execution.
++4. Add first-class `starlight-swarm` Proving Ground lane.
++5. Add trace IDs and a minimal decision/audit receipt schema.
++6. Choose durable foundation: Temporal for serious production, BullMQ for near-term
++   local queue hardening.
++
++Next exact engineering packet:
++
++```markdown
++Objective:
++Close payment semantic bypasses and harden gate vocabulary.
++
++Allowed files:
++- src/swarm/escalation.ts
++- src/swarm/queen.ts
++- src/swarm/escalation.test.ts
++- src/swarm/queen.test.ts
++- docs/SWARM-ARCHITECTURE.md
++
++Acceptance:
++- `kind: payment` always triggers Payment MCP governance, even if `movesMoney` is false.
++- `kind: spend` is never autonomous unless represented by a separate read-only planning kind.
++- `requiresHumanApproval()` checks gates or explicit approval requirement, not only decision tier.
++- Payment readiness does not use `verdict: act`.
++- `npm run swarm:dry-run`
++- `npm run typecheck`
++- `npm test`
++```
++
++## Blue-Team Closure - 2026-06-23
++
++Blue-team objective:
++
++- Close the payment semantic bypasses found above.
++- Make payment/spend governance use one shared predicate.
++- Replace ambiguous `verdict: act` wording with a non-execution verdict.
++- Add regression coverage so false labels cannot silently downgrade payment
++  governance.
++
++Changes made:
++
++- Added `requiresPaymentGovernance(action)` in `src/swarm/escalation.ts`.
++- Treated `payment`, `spend`, and any `movesMoney` action as
++  payment-governed.
++- Changed in-cap `spend` from autonomous to `queen-gate` behind Payments MCP
++  verify, cap, and audit gates.
++- Changed `requiresHuman(action)` to follow the presence of
++  `human.approval`, so over-cap founder-board payments are no longer reported
++  as "no human required".
++- Updated `Queen.stepLoop()` to enforce payment governance through the same
++  predicate used by classification, including mislabeled `payment` actions and
++  non-payments queens proposing capital spend.
++- Added Payments MCP gates to `move-funds` classification output even though it
++  already remains a human hard-stop.
++- Renamed the Queen verdict from `act` to `gate-ready` to avoid implying live
++  execution.
++
++Regression coverage added:
++
++- `kind: payment` with `movesMoney: false` still receives payment gates.
++- `kind: spend` with `movesMoney: false` still receives payment gates.
++- Queen loop calls `verify_mandate`, `check_spend_cap`, and
++  `record_audit_entry` for mislabeled in-cap payment/spend proposals.
++- A non-payments queen proposing capital spend without a Payments MCP handle
++  fails closed to `human-gate`.
++- Over-cap payments now satisfy `requiresHuman(action)`.
++- `move-funds` now remains `human-gate` while also advertising
++  `payments-mcp.verify_mandate` and `payments-mcp.check_spend_cap` gates.
++
++Verification after blue-team patch:
++
++```text
++npm run typecheck  -> passed
++npm test           -> passed, 49 tests, 0 failures
++npm run swarm:dry-run -> passed, no action fired, no money moved
++npm run build      -> passed
++```
++
++Remaining foundation gaps:
++
++- Human approval is still a pending/audit signal, not a live approval workflow.
++- There is still no durable queue, lease, retry, dead-letter queue, or persisted
++  job state.
++- There is still no first-class `starlight-swarm` SIS Proving Ground lane.
++- The stronger runtime foundation recommendation remains: Temporal or
++  BullMQ/Redis, OpenTelemetry traces, and a versioned policy layer.
+diff --git a/package.json b/package.json
+index 03fcf39..e3c4191 100644
+--- a/package.json
++++ b/package.json
+@@ -9,7 +9,8 @@
+     "lint": "next lint",
+     "typecheck": "tsc --noEmit",
+     "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
+-    "swarm:dry-run": "tsx src/swarm/index.ts"
++    "swarm:dry-run": "tsx src/swarm/index.ts",
++    "pack:operator": "node scripts/export-operator-pack.mjs"
+   },
+   "dependencies": {
+     "next": "^14.2.3",
+diff --git a/packs/starlight-swarm-operator-pack/LICENSE-TERMS.md b/packs/starlight-swarm-operator-pack/LICENSE-TERMS.md
+new file mode 100644
+index 0000000..a35e75c
+--- /dev/null
++++ b/packs/starlight-swarm-operator-pack/LICENSE-TERMS.md
+@@ -0,0 +1,26 @@
++# Starlight Swarm Operator Pack License Terms
++
++Version: 0.1.0
++
++This package is sold as a software access license for operator tooling, installable skills, and runtime doctrine. It is not an investment contract, revenue participation instrument, security, passive-income promise, or fund-management product.
++
++## Buyer Rights
++
++- Install and use the packaged runtime and skills for internal agent orchestration.
++- Adapt the package for the buyer's own private workflows.
++- Verify the package against the included manifest, source commit, and package hash.
++
++## Restrictions
++
++- Do not resell the package as a competing marketplace item without a separate reseller agreement.
++- Do not claim token ownership grants revenue share, equity, voting rights, or guaranteed income.
++- Do not remove attribution, safety gates, or fail-closed payment language.
++- Do not wire the payment-governance adapters to live funds without independent review and explicit human approval.
++
++## Safety Boundary
++
++Agents may draft, verify, package, and gate. Humans approve capital, irreversible actions, production deployments, mainnet releases, and live fund movement.
++
++## No Private Context
++
++This pack intentionally excludes private Starlight memory, credentials, local machine configuration, unreleased client work, and internal strategy not needed to operate the public runtime.
+diff --git a/packs/starlight-swarm-operator-pack/starlight-pack.template.json b/packs/starlight-swarm-operator-pack/starlight-pack.template.json
+new file mode 100644
+index 0000000..0fdbe89
+--- /dev/null
++++ b/packs/starlight-swarm-operator-pack/starlight-pack.template.json
+@@ -0,0 +1,63 @@
++{
++  "schema": "https://starlightintelligence.org/schemas/starlight-pack.v1.json",
++  "packId": "starlight-swarm-operator-pack",
++  "sku": "STL-SWARM-OPERATOR-V0",
++  "name": "Starlight Swarm Operator Pack",
++  "version": "0.1.0",
++  "summary": "A governed queen-and-worker swarm runtime for agent operators, with fail-closed payment governance, portable substrate skills, and proof-first install docs.",
++  "buyer": "Agent operators, AI system builders, orchestrator teams, and advanced creators who need a bounded multi-agent income/runtime pattern.",
++  "tier": "paid-license",
++  "licenseModel": "software-access-license",
++  "sourceRepo": "frankxai/starlight-swarm",
++  "sourceCommit": "generated-at-pack-time",
++  "packageHash": "generated-at-pack-time",
++  "manifestUri": "ipfs://pending",
++  "licenseTermsUri": "ipfs://pending",
++  "includedAssets": [
++    "runtime/src/swarm",
++    "docs/README.md",
++    "docs/SWARM-ARCHITECTURE.md",
++    "skills/swarm-queen-coordination/SKILL.md",
++    "skills/payments-mandate/SKILL.md",
++    "skills/agentic-income/SKILL.md",
++    "skills/affiliate-audit/SKILL.md",
++    "proof/HEALTH.md"
++  ],
++  "privateDataExcluded": [
++    ".git",
++    ".next",
++    "node_modules",
++    ".agent-harness.json",
++    ".env",
++    ".env.local",
++    "private memory",
++    "credentials",
++    "local machine paths"
++  ],
++  "chainMirrors": {
++    "evm": {
++      "standard": "ERC-1155 + ERC-2981",
++      "polygonAmoy": {
++        "contract": "pending",
++        "tokenId": "pending"
++      },
++      "sepolia": {
++        "contract": "pending",
++        "tokenId": "pending"
++      }
++    },
++    "solana": {
++      "standard": "Metaplex Core",
++      "devnet": {
++        "asset": "pending",
++        "collection": "pending"
++      }
++    }
++  },
++  "supportBoundary": "Includes package install guidance, runtime dry-run proof, and operator doctrine. Does not include private Starlight memory, credentials, production payment keys, guaranteed income, or investment rights.",
++  "upgradePath": [
++    "Operator Pack v0.2 with marketplace entitlement resolver",
++    "Certified Operator Agent identity layer",
++    "Enterprise swarm governance and support"
++  ]
++}
+diff --git a/scripts/export-operator-pack.mjs b/scripts/export-operator-pack.mjs
+new file mode 100644
+index 0000000..1fa49cd
+--- /dev/null
++++ b/scripts/export-operator-pack.mjs
+@@ -0,0 +1,426 @@
++import { createHash } from 'node:crypto';
++import { spawnSync } from 'node:child_process';
++import { existsSync } from 'node:fs';
++import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const estateRoot = path.resolve(repoRoot, '..');
++const packId = 'starlight-swarm-operator-pack';
++const version = '0.1.0';
++const outRoot = path.resolve(estateRoot, '_generated', 'operator-packs', packId);
++const packageDirName = `${packId}-v${version}`;
++const packageDir = path.join(outRoot, packageDirName);
++const templatePath = path.join(repoRoot, 'packs', packId, 'starlight-pack.template.json');
++const termsPath = path.join(repoRoot, 'packs', packId, 'LICENSE-TERMS.md');
++
++const redactions = [
++  [/C:\\Users\\frank\\starlight\\repos/gi, '<STARLIGHT_REPOS>'],
++  [/C:\\Users\\frank/gi, '<USER_HOME>'],
++  [/C:\/Users\/frank\/starlight\/repos/gi, '<STARLIGHT_REPOS>'],
++  [/C:\/Users\/frank/gi, '<USER_HOME>'],
++];
++
++const secretPatterns = [
++  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
++  /AKIA[0-9A-Z]{16}/,
++  /\bghp_[A-Za-z0-9_]{20,}\b/,
++  /\bsk-[A-Za-z0-9_-]{20,}\b/,
++  /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/,
++  /C:\\Users\\frank/i,
++  /C:\/Users\/frank/i,
++];
++
++const blockedPathSegments = new Set([
++  '.git',
++  '.next',
++  'node_modules',
++  '.agent-harness.json',
++  '.env',
++  '.env.local',
++  'private',
++]);
++
++const textExtensions = new Set(['.md', '.json', '.ts', '.tsx', '.js', '.mjs', '.txt']);
++
++async function main() {
++  const generatedAt = new Date().toISOString();
++  assertSafeOutputPath();
++  await rm(outRoot, { recursive: true, force: true });
++  await mkdir(packageDir, { recursive: true });
++
++  const sourceCommit = git(['rev-parse', 'HEAD']) || 'unknown';
++  const sourceBranch = git(['branch', '--show-current']) || 'unknown';
++  const sourceStatus = git(['status', '--short']);
++  const sourceDirty = sourceStatus.trim().length > 0;
++  const sourceStatusHash = createHash('sha256').update(sourceStatus).digest('hex');
++
++  await copyDirectory(path.join(repoRoot, 'src', 'swarm'), path.join(packageDir, 'runtime', 'src', 'swarm'));
++  await copyText(path.join(repoRoot, 'README.md'), path.join(packageDir, 'docs', 'README.md'));
++  await copyText(path.join(repoRoot, 'docs', 'SWARM-ARCHITECTURE.md'), path.join(packageDir, 'docs', 'SWARM-ARCHITECTURE.md'));
++  await copyText(path.join(repoRoot, 'docs', 'OPERATOR-PACK.md'), path.join(packageDir, 'docs', 'OPERATOR-PACK.md'));
++  await copyText(termsPath, path.join(packageDir, 'LICENSE-TERMS.md'));
++
++  await copySkill('swarm-queen-coordination');
++  await copySkill('payments-mandate');
++  await copySkill('agentic-income');
++  await copySkill('affiliate-audit');
++
++  await writeRuntimePackage(sourceCommit);
++  await writeAttribution(sourceCommit, sourceBranch, sourceDirty, sourceStatusHash);
++  await writeInstallNotes();
++  await writeProof(sourceCommit, sourceBranch, sourceDirty, sourceStatusHash);
++
++  await verifyPackageContent(packageDir);
++  const files = await listFiles(packageDir);
++  const inventory = await buildInventory(files);
++  const packageHash = hashInventory(inventory);
++  const manifest = await buildManifest(sourceCommit, packageHash);
++  manifest.sourceDirty = sourceDirty;
++  manifest.sourceStatusHash = sourceStatusHash;
++  manifest.releaseStatus = sourceDirty ? 'release-candidate-dirty-source' : 'release-candidate-clean-source';
++  manifest.packageHashScope = 'payload-files-excluding-starlight-pack.json';
++  manifest.includedAssets = manifest.includedAssets.concat([
++    'SOURCE_ATTRIBUTION.md',
++    'INSTALL.md',
++    'LICENSE-TERMS.md',
++    'runtime/package.json',
++    'runtime/tsconfig.json',
++    'runtime/README.md',
++    'starlight-pack.json',
++  ]);
++  manifest.fileInventory = inventory;
++
++  const manifestPath = path.join(packageDir, 'starlight-pack.json');
++  await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
++  const manifestHash = createHash('sha256').update(await readFile(manifestPath)).digest('hex');
++  const archivePath = await writeArchive();
++
++  const summary = {
++    packId,
++    version,
++    packageDir,
++    archivePath,
++    packageHash,
++    packageHashScope: manifest.packageHashScope,
++    manifestHash,
++    manifestHashAlgorithm: 'sha256-file-v1',
++    sourceCommit,
++    sourceDirty,
++    sourceStatusHash,
++    generatedAt,
++    payloadFileCount: inventory.length,
++    packageFileCount: inventory.length + 1,
++  };
++  await writeFile(path.join(outRoot, 'summary.json'), JSON.stringify(summary, null, 2) + '\n');
++  console.log(JSON.stringify(summary, null, 2));
++}
++
++function assertSafeOutputPath() {
++  const generatedRoot = path.resolve(estateRoot, '_generated');
++  const relative = path.relative(generatedRoot, outRoot);
++  if (relative.startsWith('..') || path.isAbsolute(relative)) {
++    throw new Error(`Refusing to write outside generated root: ${outRoot}`);
++  }
++}
++
++async function copyDirectory(from, to) {
++  await cp(from, to, {
++    recursive: true,
++    filter: (src) => !isBlockedPath(src),
++  });
++  await sanitizeTextFiles(to);
++}
++
++async function copyText(from, to) {
++  const raw = await readFile(from, 'utf8');
++  await mkdir(path.dirname(to), { recursive: true });
++  await writeFile(to, sanitize(raw));
++}
++
++async function copySkill(skillName) {
++  const from = path.resolve(estateRoot, 'starlight-agent-skills', 'skills', skillName, 'SKILL.md');
++  const to = path.join(packageDir, 'skills', skillName, 'SKILL.md');
++  await copyText(from, to);
++}
++
++async function writeRuntimePackage(sourceCommit) {
++  const pkg = {
++    name: '@starlight/swarm-operator-runtime',
++    version,
++    private: false,
++    description: 'Packaged Starlight Swarm dry-run runtime and fail-closed escalation model.',
++    type: 'module',
++    sourceCommit,
++    scripts: {
++      typecheck: 'tsc --noEmit',
++      test: 'tsc --noEmit && node --test --import tsx src/swarm/*.test.ts',
++      'swarm:dry-run': 'tsx src/swarm/index.ts',
++    },
++    dependencies: {
++      '@modelcontextprotocol/sdk': 'latest',
++      zod: 'latest',
++    },
++    devDependencies: {
++      '@types/node': '^20.12.7',
++      tsx: '^4.19.2',
++      typescript: '^5.4.5',
++    },
++  };
++  await writeFile(path.join(packageDir, 'runtime', 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
++  await copyText(path.join(repoRoot, 'tsconfig.json'), path.join(packageDir, 'runtime', 'tsconfig.json'));
++  await writeFile(
++    path.join(packageDir, 'runtime', 'README.md'),
++    [
++      '# Starlight Swarm Operator Runtime',
++      '',
++      'This is the packaged dry-run runtime extracted from `starlight-swarm`.',
++      '',
++      'Run:',
++      '',
++      '```bash',
++      'npm install',
++      'npm test',
++      'npm run swarm:dry-run',
++      '```',
++      '',
++      'No live action fires and no money moves from this runtime.',
++      '',
++    ].join('\n'),
++  );
++}
++
++async function writeAttribution(sourceCommit, sourceBranch, sourceDirty, sourceStatusHash) {
++  const lines = [
++    '# Source Attribution',
++    '',
++    `Pack: ${packId} v${version}`,
++    `Source repo: frankxai/starlight-swarm`,
++    `Source branch: ${sourceBranch}`,
++    `Source commit: ${sourceCommit}`,
++    `Source dirty at pack time: ${sourceDirty ? 'yes' : 'no'}`,
++    `Source status hash: ${sourceStatusHash}`,
++    '',
++    'Included source paths:',
++    '',
++    '- `starlight-swarm/src/swarm/**`',
++    '- `starlight-swarm/README.md`',
++    '- `starlight-swarm/docs/SWARM-ARCHITECTURE.md`',
++    '- `starlight-swarm/docs/OPERATOR-PACK.md`',
++    '- `starlight-agent-skills/skills/swarm-queen-coordination/SKILL.md`',
++    '- `starlight-agent-skills/skills/payments-mandate/SKILL.md`',
++    '- `starlight-agent-skills/skills/agentic-income/SKILL.md`',
++    '- `starlight-agent-skills/skills/affiliate-audit/SKILL.md`',
++    '',
++    'Excluded by design: private memory, credentials, repo-local agent harness metadata, build artifacts, dependency folders, and local machine paths.',
++    '',
++    sourceDirty
++      ? 'Release note: this is a release candidate from a dirty worktree. Promote only after the included file inventory is accepted or the source tree is committed and repackaged.'
++      : 'Release note: the source worktree was clean at pack time.',
++    '',
++  ];
++  await writeFile(path.join(packageDir, 'SOURCE_ATTRIBUTION.md'), lines.join('\n'));
++}
++
++async function writeInstallNotes() {
++  const lines = [
++    '# Install',
++    '',
++    'This package has two install surfaces.',
++    '',
++    '## Runtime dry-run',
++    '',
++    '```bash',
++    'cd runtime',
++    'npm install',
++    'npm test',
++    'npm run swarm:dry-run',
++    '```',
++    '',
++    '## Agent skills',
++    '',
++    'Copy the selected `skills/*/SKILL.md` files into the target agent skill directory supported by your harness. Preserve `SOURCE_ATTRIBUTION.md` beside the install notes when redistributing internally.',
++    '',
++    '## Payment boundary',
++    '',
++    'The packaged runtime exposes verification interfaces only. Do not connect it to live payment rails until the payment governance package, contracts, and marketplace entitlement resolver have all passed review.',
++    '',
++  ];
++  await writeFile(path.join(packageDir, 'INSTALL.md'), lines.join('\n'));
++}
++
++async function writeProof(sourceCommit, sourceBranch, sourceDirty, sourceStatusHash) {
++  const lines = [
++    '# Health Proof',
++    '',
++    `Pack generated from branch: ${sourceBranch}`,
++    `Pack generated from commit: ${sourceCommit}`,
++    `Source dirty at pack time: ${sourceDirty ? 'yes' : 'no'}`,
++    `Source status hash: ${sourceStatusHash}`,
++    '',
++    'Required release checks:',
++    '',
++    '- `npm test` in `starlight-swarm`',
++    '- `npm run build` in `starlight-swarm`',
++    '- `npm run swarm:dry-run` in `starlight-swarm`',
++    '- `npm run pack:operator` in `starlight-swarm`',
++    '',
++    'The pack is only a release candidate until these commands are run and recorded by the release operator.',
++    sourceDirty
++      ? 'Dirty-source release candidates must not be promoted to paid/mainnet distribution until provenance is reviewed.'
++      : 'Clean-source release candidates may proceed to the next release gate after review.',
++    '',
++  ];
++  await mkdir(path.join(packageDir, 'proof'), { recursive: true });
++  await writeFile(path.join(packageDir, 'proof', 'HEALTH.md'), lines.join('\n'));
++}
++
++async function buildManifest(sourceCommit, packageHash) {
++  const raw = await readFile(templatePath, 'utf8');
++  const manifest = JSON.parse(raw);
++  manifest.sourceCommit = sourceCommit;
++  manifest.packageHash = packageHash;
++  manifest.packageHashAlgorithm = 'sha256-manifest-v1';
++  manifest.licenseTermsUri = 'local://LICENSE-TERMS.md';
++  manifest.manifestUri = 'local://starlight-pack.json';
++  return manifest;
++}
++
++async function sanitizeTextFiles(dir) {
++  for (const file of await listFiles(dir)) {
++    if (textExtensions.has(path.extname(file).toLowerCase())) {
++      const raw = await readFile(file, 'utf8');
++      const clean = sanitize(raw);
++      if (clean !== raw) await writeFile(file, clean);
++    }
++  }
++}
++
++function sanitize(value) {
++  return redactions.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value);
++}
++
++function isBlockedPath(filePath) {
++  const segments = filePath.split(path.sep);
++  return segments.some((segment) => blockedPathSegments.has(segment));
++}
++
++async function verifyPackageContent(dir) {
++  const files = await listFiles(dir);
++  for (const file of files) {
++    if (isBlockedPath(file)) {
++      throw new Error(`Blocked path entered package: ${path.relative(dir, file)}`);
++    }
++    const ext = path.extname(file).toLowerCase();
++    if (!textExtensions.has(ext)) continue;
++    const text = await readFile(file, 'utf8');
++    for (const pattern of secretPatterns) {
++      if (pattern.test(text)) {
++        throw new Error(`Secret/local-path pattern found in ${path.relative(dir, file)}: ${pattern}`);
++      }
++    }
++  }
++}
++
++async function listFiles(dir) {
++  const entries = await readdir(dir, { withFileTypes: true });
++  const files = [];
++  for (const entry of entries) {
++    const full = path.join(dir, entry.name);
++    if (entry.isDirectory()) {
++      files.push(...(await listFiles(full)));
++    } else if (entry.isFile()) {
++      files.push(full);
++    }
++  }
++  return files.sort((a, b) => path.relative(dir, a).localeCompare(path.relative(dir, b)));
++}
++
++async function buildInventory(files) {
++  const inventory = [];
++  for (const file of files) {
++    const buf = await readFile(file);
++    inventory.push({
++      path: path.relative(packageDir, file).replaceAll(path.sep, '/'),
++      bytes: (await stat(file)).size,
++      sha256: createHash('sha256').update(buf).digest('hex'),
++    });
++  }
++  return inventory;
++}
++
++function hashInventory(inventory) {
++  const h = createHash('sha256');
++  for (const item of inventory) {
++    h.update(item.path);
++    h.update('\0');
++    h.update(item.sha256);
++    h.update('\0');
++    h.update(String(item.bytes));
++    h.update('\n');
++  }
++  return h.digest('hex');
++}
++
++async function writeArchive() {
++  const archivePath = path.join(outRoot, `${packageDirName}.zip`);
++  if (existsSync(archivePath)) await rm(archivePath, { force: true });
++  const tar = spawnSync('tar', ['-a', '-cf', archivePath, '-C', outRoot, packageDirName], {
++    cwd: outRoot,
++    encoding: 'utf8',
++  });
++  if (tar.status === 0 && existsSync(archivePath)) {
++    return archivePath;
++  }
++
++  const ps = spawnSync(
++    'powershell',
++    [
++      '-NoProfile',
++      '-Command',
++      [
++        '$ErrorActionPreference = "Stop"',
++        `$source = ${JSON.stringify(path.join(outRoot, packageDirName))}`,
++        `$destination = ${JSON.stringify(archivePath)}`,
++        'if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Force }',
++        'Compress-Archive -LiteralPath $source -DestinationPath $destination -Force',
++      ].join('; '),
++    ],
++    { cwd: outRoot, encoding: 'utf8' },
++  );
++
++  if (ps.status !== 0 || !existsSync(archivePath)) {
++    const note = [
++      'Archive creation skipped because both `tar -a` and PowerShell Compress-Archive failed.',
++      '',
++      'tar stdout:',
++      tar.stdout || '<empty>',
++      '',
++      'tar stderr:',
++      tar.stderr || '<empty>',
++      '',
++      'Compress-Archive stdout:',
++      ps.stdout || '<empty>',
++      '',
++      'Compress-Archive stderr:',
++      ps.stderr || '<empty>',
++      '',
++    ].join('\n');
++    await writeFile(path.join(outRoot, 'ARCHIVE-NOT-CREATED.txt'), note);
++    return null;
++  }
++  return archivePath;
++}
++
++function git(args) {
++  const result = spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
++  if (result.status !== 0) return '';
++  return result.stdout.trim();
++}
++
++main().catch((err) => {
++  console.error(err);
++  process.exit(1);
++});
+diff --git a/src/pages/index.tsx b/src/pages/index.tsx
+index 6779441..d548c4a 100644
+--- a/src/pages/index.tsx
++++ b/src/pages/index.tsx
+@@ -87,12 +87,12 @@ export default function Home() {
+         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+       </Head>
+ 
+-      <header>
++      <header className="command-shell">
+         <div className="brand">
+-          <div className="brand-logo">✦</div>
++          <div className="brand-logo">SIS</div>
+           <div>
+             <h1>STARLIGHT SWARM COCKPIT</h1>
+-            <p className="subtitle">Substrate: SIS-Horizons | Operator Console</p>
++            <p className="subtitle">Operational glass console · repo fleet · daemon substrate</p>
+           </div>
+         </div>
+         <div className="header-status">
+@@ -101,6 +101,30 @@ export default function Home() {
+         </div>
+       </header>
+ 
++      <section className="hero-grid">
++        <div className="hero-copy">
++          <div className="eyebrow">Live operational surface</div>
++          <h2>One cockpit for swarm health, recovery, and repo truth.</h2>
++          <p>
++            This is not a landing page. It is the operator view: daemons, repository registry,
++            recovery actions, and event spine in one inspectable surface.
++          </p>
++        </div>
++        <div className="signal-panel">
++          {[
++            ['Core daemons', `${daemonState.filter((d) => d.status === 'Active').length}/${daemonState.length}`],
++            ['Repo records', repos.length ? String(repos.length) : 'loading'],
++            ['Recovery', recovering ? 'running' : 'ready'],
++            ['Audit', loadingAudit ? 'refreshing' : 'stable'],
++          ].map(([label, value]) => (
++            <div key={label} className="metric-tile">
++              <span>{label}</span>
++              <strong>{value}</strong>
++            </div>
++          ))}
++        </div>
++      </section>
++
+       <main className="dashboard-grid">
+         {/* Daemons Panel */}
+         <section className="card daemons-card">
+@@ -206,8 +230,9 @@ export default function Home() {
+         body {
+           background-color: var(--bg-base);
+           background-image: 
+-            radial-gradient(at 10% 10%, hsla(270, 50%, 15%, 0.2) 0px, transparent 50%),
+-            radial-gradient(at 90% 90%, hsla(190, 50%, 15%, 0.2) 0px, transparent 50%);
++            radial-gradient(at 12% 8%, hsla(190, 70%, 18%, 0.22) 0px, transparent 38%),
++            radial-gradient(at 85% 4%, hsla(270, 65%, 16%, 0.18) 0px, transparent 34%),
++            linear-gradient(180deg, hsla(240, 20%, 6%, 0), hsla(240, 20%, 3%, 0.72));
+           color: var(--text-main);
+           font-family: var(--font-inter);
+           min-height: 100vh;
+@@ -224,12 +249,13 @@ export default function Home() {
+           display: flex;
+           justify-content: space-between;
+           align-items: center;
+-          background: var(--bg-surface);
+-          backdrop-filter: blur(16px);
+-          border: 1px solid var(--border-color);
+-          border-radius: 16px;
++          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.07), transparent 32%), var(--bg-surface);
++          backdrop-filter: blur(22px) saturate(145%);
++          border: 1px solid hsla(0, 0%, 100%, 0.08);
++          border-radius: 22px;
+           padding: 16px 28px;
+           margin-bottom: 24px;
++          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.08), 0 28px 90px hsla(240, 35%, 2%, 0.42);
+         }
+ 
+         .brand {
+@@ -239,10 +265,18 @@ export default function Home() {
+         }
+ 
+         .brand-logo {
+-          font-size: 32px;
++          display: grid;
++          place-items: center;
++          width: 48px;
++          height: 48px;
++          border-radius: 16px;
++          border: 1px solid hsla(190, 80%, 55%, 0.32);
++          background: hsla(190, 80%, 55%, 0.09);
++          font-size: 12px;
++          font-weight: 800;
+           font-family: var(--font-outfit);
+-          color: var(--accent-primary);
+-          text-shadow: 0 0 10px hsla(270, 75%, 65%, 0.5);
++          color: var(--accent-secondary);
++          text-shadow: 0 0 14px hsla(190, 80%, 55%, 0.5);
+         }
+ 
+         h1 {
+@@ -266,6 +300,82 @@ export default function Home() {
+           font-weight: 600;
+         }
+ 
++        .hero-grid {
++          display: grid;
++          grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
++          gap: 24px;
++          margin-bottom: 24px;
++        }
++
++        .hero-copy, .signal-panel {
++          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.06), transparent 34%), var(--bg-surface);
++          border: 1px solid hsla(0, 0%, 100%, 0.08);
++          border-radius: 22px;
++          backdrop-filter: blur(22px) saturate(145%);
++          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.07), 0 28px 90px hsla(240, 35%, 2%, 0.30);
++        }
++
++        .hero-copy {
++          padding: 32px;
++        }
++
++        .eyebrow {
++          color: var(--accent-secondary);
++          font-family: var(--font-outfit);
++          font-size: 11px;
++          font-weight: 800;
++          letter-spacing: 0.22em;
++          text-transform: uppercase;
++        }
++
++        .hero-copy h2 {
++          font-size: clamp(32px, 4vw, 58px);
++          line-height: 0.98;
++          letter-spacing: -0.035em;
++          margin: 12px 0 0;
++        }
++
++        .hero-copy p {
++          max-width: 680px;
++          color: var(--text-muted);
++          font-size: 16px;
++          line-height: 1.7;
++          margin: 18px 0 0;
++        }
++
++        .signal-panel {
++          display: grid;
++          grid-template-columns: repeat(2, minmax(0, 1fr));
++          gap: 12px;
++          padding: 18px;
++        }
++
++        .metric-tile {
++          min-height: 118px;
++          border: 1px solid hsla(0, 0%, 100%, 0.07);
++          border-radius: 18px;
++          background: hsla(240, 14%, 10%, 0.56);
++          padding: 18px;
++          display: flex;
++          flex-direction: column;
++          justify-content: space-between;
++        }
++
++        .metric-tile span {
++          color: var(--text-muted);
++          font-family: var(--font-outfit);
++          font-size: 11px;
++          font-weight: 700;
++          letter-spacing: 0.14em;
++          text-transform: uppercase;
++        }
++
++        .metric-tile strong {
++          font-family: var(--font-outfit);
++          font-size: 30px;
++          color: var(--text-main);
++        }
++
+         .pulse-dot {
+           width: 8px;
+           height: 8px;
+@@ -288,13 +398,14 @@ export default function Home() {
+         }
+ 
+         .card {
+-          background: var(--bg-surface);
+-          backdrop-filter: blur(16px);
+-          border: 1px solid var(--border-color);
+-          border-radius: 16px;
++          background: linear-gradient(135deg, hsla(0, 0%, 100%, 0.045), transparent 34%), var(--bg-surface);
++          backdrop-filter: blur(20px) saturate(140%);
++          border: 1px solid hsla(0, 0%, 100%, 0.075);
++          border-radius: 22px;
+           padding: 24px;
+           display: flex;
+           flex-direction: column;
++          box-shadow: inset 0 1px 0 hsla(0, 0%, 100%, 0.06), 0 22px 70px hsla(240, 35%, 2%, 0.25);
+         }
+ 
+         .card-header-row {
+@@ -445,6 +556,27 @@ export default function Home() {
+           gap: 6px;
+         }
+ 
++        @media (max-width: 900px) {
++          header,
++          .hero-grid {
++            grid-template-columns: 1fr;
++          }
++
++          header {
++            align-items: flex-start;
++            flex-direction: column;
++            gap: 16px;
++          }
++
++          .dashboard-grid {
++            grid-template-columns: 1fr;
++          }
++
++          .console-card {
++            grid-column: span 1;
++          }
++        }
++
+         .log-line {
+           opacity: 0.85;
+         }
+diff --git a/src/swarm/escalation.test.ts b/src/swarm/escalation.test.ts
+index b42af25..dfdd10b 100644
+--- a/src/swarm/escalation.test.ts
++++ b/src/swarm/escalation.test.ts
+@@ -14,7 +14,7 @@
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+ 
+-import { classify, requiresHuman } from './escalation';
++import { classify, requiresHuman, requiresPaymentGovernance } from './escalation';
+ import type { Action, ActionKind, StreamId } from './escalation';
+ 
+ /** Build an action with reversible / no-money defaults (mirrors index.ts helper). */
+@@ -63,6 +63,13 @@ test('in-cap payment → queen-gate (verify + cap + audit gates)', () => {
+   ]);
+ });
+ 
++test('payment kind routes through payment gates even if movesMoney is false', () => {
++  const c = classify(action('payments', { kind: 'payment', movesMoney: false, amount: 40, cap: 100 }));
++  assert.equal(c.decision, 'queen-gate');
++  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
++  assert.equal(requiresPaymentGovernance(action('payments', { kind: 'payment', movesMoney: false })), true);
++});
++
+ test('over-cap payment → founder-board (never auto-approve)', () => {
+   const c = classify(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 }));
+   assert.equal(c.decision, 'founder-board');
+@@ -80,6 +87,8 @@ test('movesMoney without explicit payment kind still routes through payment gate
+ test('move-funds → human-gate (irreversible money movement, always)', () => {
+   const c = classify(action('payments', { kind: 'move-funds', movesMoney: true, irreversible: true }));
+   assert.equal(c.decision, 'human-gate');
++  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
++  assert.ok(c.gates.includes('payments-mcp.check_spend_cap'));
+   assert.ok(c.gates.includes('human.approval'));
+ });
+ 
+@@ -87,6 +96,8 @@ test('move-funds is human-gate even without the explicit flags (kind alone is en
+   // move-funds is in ALWAYS_IRREVERSIBLE — the kind alone forces the highest tier.
+   const c = classify(action('payments', { kind: 'move-funds' }));
+   assert.equal(c.decision, 'human-gate');
++  assert.ok(c.gates.includes('payments-mcp.verify_mandate'));
++  assert.equal(requiresPaymentGovernance(action('payments', { kind: 'move-funds' })), true);
+ });
+ 
+ test('each ALWAYS_IRREVERSIBLE kind → human-gate', () => {
+@@ -113,11 +124,18 @@ test('new-vendor → founder-board', () => {
+ test('generic spend above cap → founder-board', () => {
+   const c = classify(action('products', { kind: 'spend', amount: 9000, cap: 100 }));
+   assert.equal(c.decision, 'founder-board');
++  assert.ok(c.gates.includes('payments-mcp.check_spend_cap'));
+ });
+ 
+-test('generic spend within cap → autonomous (reversible, no money)', () => {
++test('generic spend within cap → queen-gate behind Payments MCP', () => {
+   const c = classify(action('products', { kind: 'spend', amount: 10, cap: 100 }));
+-  assert.equal(c.decision, 'autonomous');
++  assert.equal(c.decision, 'queen-gate');
++  assert.deepEqual(c.gates, [
++    'payments-mcp.verify_mandate',
++    'payments-mcp.check_spend_cap',
++    'payments-mcp.record_audit_entry',
++  ]);
++  assert.equal(requiresPaymentGovernance(action('products', { kind: 'spend', movesMoney: false })), true);
+ });
+ 
+ test('cross-stream action → founder-board (queens never command across streams)', () => {
+@@ -164,8 +182,8 @@ test('FAIL-CLOSED: payment with NaN cap → over-cap → founder-board', () => {
+   assert.equal(c.decision, 'founder-board', 'a NaN cap must be treated as over-cap');
+ });
+ 
+-test('requiresHuman is true only for human-gate decisions', () => {
++test('requiresHuman follows the human.approval gate, including founder-board approvals', () => {
+   assert.equal(requiresHuman(action('payments', { kind: 'move-funds' })), true);
+   assert.equal(requiresHuman(action('content', { kind: 'draft' })), false);
+-  assert.equal(requiresHuman(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 })), false);
++  assert.equal(requiresHuman(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 })), true);
+ });
+diff --git a/src/swarm/escalation.ts b/src/swarm/escalation.ts
+index d514955..099ab6b 100644
+--- a/src/swarm/escalation.ts
++++ b/src/swarm/escalation.ts
+@@ -82,6 +82,9 @@ const ALWAYS_IRREVERSIBLE: ActionKind[] = ['delete', 'rename-url', 'rotate-key',
+ /** Actions that always reach the founder/board even below any cap. */
+ const ALWAYS_FOUNDER: ActionKind[] = ['new-rail', 'new-vendor'];
+ 
++/** Actions that must pass Payments MCP governance even if `movesMoney` is mislabeled. */
++const PAYMENT_GOVERNED: ActionKind[] = ['payment', 'spend', 'move-funds'];
++
+ /**
+  * classify() — the single source of truth for "who decides".
+  *
+@@ -104,22 +107,32 @@ export function classify(action: Action): Classification {
+ 
+   // L7 — irreversible OR money movement → human, always. Highest stop.
+   if (irreversible || action.kind === 'move-funds') {
++    const gates = requiresPaymentGovernance(action)
++      ? [
++          'payments-mcp.verify_mandate',
++          'payments-mcp.check_spend_cap',
++          'founder.review',
++          'starlight-board.pressure-test',
++          'human.approval',
++        ]
++      : ['founder.review', 'starlight-board.pressure-test', 'human.approval'];
++
+     return {
+       decision: 'human-gate',
+       reason:
+         'Irreversible or fund-moving action (FrankX hard-stop). Agents prepare; humans commit. ' +
+         'No autonomous money movement, ever.',
+-      gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
++      gates,
+     };
+   }
+ 
+-  // Any payment / settlement → Payments MCP governance (verify-only, fail-closed).
+-  if (action.kind === 'payment' || action.movesMoney) {
++  // Any payment / spend / settlement → Payments MCP governance (verify-only, fail-closed).
++  if (requiresPaymentGovernance(action)) {
+     // Over-cap payment escalates past the queen to the founder.
+     if (overCap(action)) {
+       return {
+         decision: 'founder-board',
+-        reason: 'Payment exceeds spend-cap. Over-cap spend escalates to founder + board, never auto-approve.',
++        reason: 'Payment-governed action exceeds spend-cap. Over-cap spend escalates to founder + board, never auto-approve.',
+         gates: [
+           'payments-mcp.verify_mandate',
+           'payments-mcp.check_spend_cap', // returns over-cap → escalate
+@@ -132,7 +145,7 @@ export function classify(action: Action): Classification {
+     return {
+       decision: 'queen-gate',
+       reason:
+-        'Payment within cap. Payments Queen authorizes behind AP2 mandate verify + spend-cap + audit (fail-closed).',
++        'Payment-governed action within cap. Payments Queen authorizes behind AP2 mandate verify + spend-cap + audit (fail-closed).',
+       gates: [
+         'payments-mcp.verify_mandate',
+         'payments-mcp.check_spend_cap',
+@@ -150,15 +163,6 @@ export function classify(action: Action): Classification {
+     };
+   }
+ 
+-  // Generic spend above cap → founder + board + human.
+-  if (action.kind === 'spend' && overCap(action)) {
+-    return {
+-      decision: 'founder-board',
+-      reason: 'Capital spend above cap. Founder + board + human approval required.',
+-      gates: ['founder.review', 'starlight-board.pressure-test', 'human.approval'],
+-    };
+-  }
+-
+   // Crossing a stream boundary forces escalation to the founder (queens never
+   // command across streams — they coordinate through the founder).
+   if (action.crossStream) {
+@@ -200,5 +204,11 @@ function overCap(action: Action): boolean {
+ 
+ /** Convenience predicate — does this action require a human in the loop? */
+ export function requiresHuman(action: Action): boolean {
+-  return classify(action).decision === 'human-gate';
++  return classify(action).gates.includes('human.approval');
++}
++
++/** True when an action must be checked by the verify-only Payments MCP gate. */
++export function requiresPaymentGovernance(action: Action): boolean {
++  if (!action) return false;
++  return PAYMENT_GOVERNED.includes(action.kind) || action.movesMoney;
+ }
+diff --git a/src/swarm/queen.test.ts b/src/swarm/queen.test.ts
+index 16a6476..0b2741b 100644
+--- a/src/swarm/queen.test.ts
++++ b/src/swarm/queen.test.ts
+@@ -1,12 +1,12 @@
+ /**
+- * queen.test.ts — unit tests for the Queen tier (act-vs-escalate gate + loop).
++ * queen.test.ts — unit tests for the Queen tier (gate-ready-vs-escalate gate + loop).
+  *
+  * Run:  node --test --import tsx src/swarm/queen.test.ts
+  *
+  * Two load-bearing properties:
+  *   1. the worker-guard throws when no worker is available (never silently no-op),
+  *   2. stepLoop routes an over-cap payment to ESCALATION (verdict 'escalate'),
+- *      never to execution — and the over-cap path NEVER returns an 'act' verdict.
++ *      never to execution — and the over-cap path NEVER returns a 'gate-ready' verdict.
+  */
+ 
+ import { test } from 'node:test';
+@@ -16,7 +16,7 @@ import { Queen } from './queen';
+ import type { StreamSpec } from './streams';
+ import type { Task } from './worker';
+ import type { Action, StreamId } from './escalation';
+-import type { SisVaultMcp } from './integrations';
++import type { PaymentsMcp, SisVaultMcp } from './integrations';
+ 
+ /** A vault double that records appends without any real side effect. */
+ function fakeVault(appends: string[] = []): SisVaultMcp {
+@@ -34,6 +34,28 @@ function fakeVault(appends: string[] = []): SisVaultMcp {
+   };
+ }
+ 
++function fakePayments(overrides: Partial<PaymentsMcp> = {}, calls: string[] = []): PaymentsMcp {
++  return {
++    async verify_mandate() {
++      calls.push('verify_mandate');
++      return { valid: true, reason: 'test mandate valid' };
++    },
++    async check_spend_cap() {
++      calls.push('check_spend_cap');
++      return { withinCap: true, cap: 100 };
++    },
++    async record_audit_entry() {
++      calls.push('record_audit_entry');
++      return { ok: true };
++    },
++    async require_human_approval(reason) {
++      calls.push(`require_human_approval:${reason}`);
++      return { pending: true };
++    },
++    ...overrides,
++  };
++}
++
+ /** Minimal payments stream spec with a worker mesh. */
+ function paymentsSpec(): StreamSpec {
+   return {
+@@ -65,6 +87,18 @@ function emptySpec(): StreamSpec {
+   };
+ }
+ 
++/** Minimal products spec for cross-stream governance guard tests. */
++function productsSpec(): StreamSpec {
++  return {
++    id: 'products',
++    label: 'Products',
++    purpose: 'test',
++    queen: { name: 'Products Queen', harness: ['queen-coordinator'], selfImprovingLoop: ['package'] },
++    workers: [{ name: 'packager', skill: 'agentic-products', does: 'package product' }],
++    mcp: [],
++  };
++}
++
+ function action(stream: StreamId, partial: Partial<Action> & Pick<Action, 'kind'>): Action {
+   return { stream, irreversible: false, movesMoney: false, crossStream: false, ...partial };
+ }
+@@ -80,6 +114,7 @@ test('worker-guard throws when no worker is available', async () => {
+ 
+ test('stepLoop routes an over-cap payment to escalation, not execution', async () => {
+   const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
+   const overCapTask: Task = {
+     id: 'pay-over',
+     worker: 'spend-cap-enforcer',
+@@ -87,17 +122,28 @@ test('stepLoop routes an over-cap payment to escalation, not execution', async (
+     proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 }),
+   };
+ 
+-  const result = await queen.stepLoop([overCapTask], { vault: fakeVault() });
++  const payments = fakePayments(
++    {
++      async check_spend_cap() {
++        calls.push('check_spend_cap');
++        return { withinCap: false, cap: 100 };
++      },
++    },
++    calls,
++  );
++  const result = await queen.stepLoop([overCapTask], { vault: fakeVault(), payments });
+ 
+   assert.equal(result.decisions.length, 1);
+   const decision = result.decisions[0];
+-  assert.equal(decision.verdict, 'escalate', 'over-cap must escalate, never act');
+-  assert.notEqual(decision.verdict, 'act');
++  assert.equal(decision.verdict, 'escalate', 'over-cap must escalate, never become gate-ready');
++  assert.notEqual(decision.verdict, 'gate-ready');
+   assert.equal(decision.classification.decision, 'founder-board');
++  assert.equal(calls.includes('record_audit_entry'), false, 'over-cap payment must not audit as gate-ready');
+ });
+ 
+-test('stepLoop keeps an in-cap payment at the queen (verdict act, queen-gate)', async () => {
++test('stepLoop keeps an in-cap payment at the queen only after verify, cap, and audit pass', async () => {
+   const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
+   const inCapTask: Task = {
+     id: 'pay-in',
+     worker: 'mandate-verifier',
+@@ -105,10 +151,152 @@ test('stepLoop keeps an in-cap payment at the queen (verdict act, queen-gate)',
+     proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
+   };
+ 
+-  const result = await queen.stepLoop([inCapTask], { vault: fakeVault() });
++  const result = await queen.stepLoop([inCapTask], { vault: fakeVault(), payments: fakePayments({}, calls) });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'gate-ready');
++  assert.equal(decision.classification.decision, 'queen-gate');
++  assert.deepEqual(calls, ['verify_mandate', 'check_spend_cap', 'record_audit_entry']);
++});
++
++test('stepLoop enforces payment governance even when payment kind is mislabeled as not moving money', async () => {
++  const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
++  const mislabeledTask: Task = {
++    id: 'pay-kind-no-money-flag',
++    worker: 'mandate-verifier',
++    description: 'settle within cap but movesMoney flag is false',
++    proposes: action('payments', { kind: 'payment', movesMoney: false, amount: 40, cap: 100 }),
++  };
++
++  const result = await queen.stepLoop([mislabeledTask], { vault: fakeVault(), payments: fakePayments({}, calls) });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'gate-ready');
++  assert.equal(decision.classification.decision, 'queen-gate');
++  assert.deepEqual(calls, ['verify_mandate', 'check_spend_cap', 'record_audit_entry']);
++});
++
++test('stepLoop enforces payment governance for capital spend even when movesMoney is false', async () => {
++  const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
++  const spendTask: Task = {
++    id: 'pay-spend-no-money-flag',
++    worker: 'spend-cap-enforcer',
++    description: 'approve in-cap capital spend',
++    proposes: action('payments', { kind: 'spend', movesMoney: false, amount: 10, cap: 100 }),
++  };
++
++  const result = await queen.stepLoop([spendTask], { vault: fakeVault(), payments: fakePayments({}, calls) });
+   const decision = result.decisions[0];
+-  assert.equal(decision.verdict, 'act');
++  assert.equal(decision.verdict, 'gate-ready');
+   assert.equal(decision.classification.decision, 'queen-gate');
++  assert.deepEqual(calls, ['verify_mandate', 'check_spend_cap', 'record_audit_entry']);
++});
++
++test('stepLoop blocks capital spend from a non-payments queen when Payments MCP is unavailable', async () => {
++  const queen = new Queen(productsSpec());
++  const spendTask: Task = {
++    id: 'prod-spend-no-mcp',
++    worker: 'packager',
++    description: 'buy product asset pack within cap',
++    proposes: action('products', { kind: 'spend', movesMoney: false, amount: 10, cap: 100 }),
++  };
++
++  const result = await queen.stepLoop([spendTask], { vault: fakeVault() });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'human');
++  assert.equal(decision.classification.decision, 'human-gate');
++  assert.match(decision.classification.reason, /Payments MCP unavailable/);
++});
++
++test('stepLoop blocks an in-cap payment when Payments MCP is missing', async () => {
++  const queen = new Queen(paymentsSpec());
++  const task: Task = {
++    id: 'pay-no-mcp',
++    worker: 'mandate-verifier',
++    description: 'settle within cap without payments MCP',
++    proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
++  };
++
++  const result = await queen.stepLoop([task], { vault: fakeVault() });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'human');
++  assert.equal(decision.classification.decision, 'human-gate');
++  assert.match(decision.classification.reason, /Payments MCP unavailable/);
++});
++
++test('stepLoop blocks an in-cap payment when mandate verification fails', async () => {
++  const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
++  const task: Task = {
++    id: 'pay-invalid-mandate',
++    worker: 'mandate-verifier',
++    description: 'settle with invalid mandate',
++    proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
++  };
++
++  const payments = fakePayments(
++    {
++      async verify_mandate() {
++        calls.push('verify_mandate');
++        return { valid: false, reason: 'signature mismatch' };
++      },
++    },
++    calls,
++  );
++  const result = await queen.stepLoop([task], { vault: fakeVault(), payments });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'human');
++  assert.equal(decision.classification.decision, 'human-gate');
++  assert.match(decision.classification.reason, /signature mismatch/);
++  assert.equal(calls.includes('record_audit_entry'), false);
++});
++
++test('stepLoop blocks an in-cap payment when the audit write fails', async () => {
++  const queen = new Queen(paymentsSpec());
++  const calls: string[] = [];
++  const task: Task = {
++    id: 'pay-audit-fails',
++    worker: 'mandate-verifier',
++    description: 'settle but audit fails',
++    proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
++  };
++
++  const payments = fakePayments(
++    {
++      async record_audit_entry() {
++        calls.push('record_audit_entry');
++        return { ok: false };
++      },
++    },
++    calls,
++  );
++  const result = await queen.stepLoop([task], { vault: fakeVault(), payments });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'human');
++  assert.equal(decision.classification.decision, 'human-gate');
++  assert.match(decision.classification.reason, /audit entry failed/);
++  assert.equal(calls.some((call) => call.startsWith('require_human_approval')), true);
++});
++
++test('stepLoop blocks an in-cap payment when Payments MCP throws', async () => {
++  const queen = new Queen(paymentsSpec());
++  const task: Task = {
++    id: 'pay-mcp-throws',
++    worker: 'mandate-verifier',
++    description: 'settle but payments MCP throws',
++    proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
++  };
++
++  const payments = fakePayments({
++    async verify_mandate() {
++      throw new Error('transport down');
++    },
++  });
++  const result = await queen.stepLoop([task], { vault: fakeVault(), payments });
++  const decision = result.decisions[0];
++  assert.equal(decision.verdict, 'human');
++  assert.equal(decision.classification.decision, 'human-gate');
++  assert.match(decision.classification.reason, /transport down/);
+ });
+ 
+ test('move-funds proposal routes to the human gate (verdict human)', async () => {
+@@ -126,8 +314,8 @@ test('move-funds proposal routes to the human gate (verdict human)', async () =>
+ test('decide() maps every classification tier to the right verdict', () => {
+   const queen = new Queen(paymentsSpec());
+   const mk = (a: Action) => queen.decide({ worker: 'w', stream: 'payments', taskId: 't', proposed: a, note: '' }).verdict;
+-  assert.equal(mk(action('content', { kind: 'draft' })), 'act'); // autonomous
+-  assert.equal(mk(action('affiliate', { kind: 'bind-link' })), 'act'); // queen-gate
++  assert.equal(mk(action('content', { kind: 'draft' })), 'gate-ready'); // autonomous
++  assert.equal(mk(action('affiliate', { kind: 'bind-link' })), 'gate-ready'); // queen-gate
+   assert.equal(mk(action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 })), 'escalate');
+   assert.equal(mk(action('payments', { kind: 'move-funds' })), 'human');
+ });
+diff --git a/src/swarm/queen.ts b/src/swarm/queen.ts
+index 9cd41ad..cc3dc1c 100644
+--- a/src/swarm/queen.ts
++++ b/src/swarm/queen.ts
+@@ -5,7 +5,7 @@
+  * patterns (claude-flow), scoped to ONE income stream. A queen:
+  *   - owns a mesh of stateless workers,
+  *   - runs a self-improving loop step,
+- *   - decides act-vs-escalate for every proposed action via classify(),
++ *   - decides gate-ready-vs-escalate for every proposed action via classify(),
+  *   - NEVER commands across streams (coordinates through the founder),
+  *   - NEVER moves money autonomously.
+  *
+@@ -14,7 +14,7 @@
+  * up the escalation ladder. No real side effects.
+  */
+ 
+-import { classify } from './escalation';
++import { classify, requiresPaymentGovernance } from './escalation';
+ import type { Classification, StreamId } from './escalation';
+ import type { SisVaultMcp, PaymentsMcp } from './integrations';
+ import type { Worker, Task, WorkerReport } from './worker';
+@@ -28,11 +28,11 @@ export interface QueenDecision {
+   classification: Classification;
+   /**
+    * The queen's verdict:
+-   *  - 'act'      → autonomous/queen-gate within scope and below caps; queen proceeds behind its gate.
+-   *  - 'escalate' → founder-board (cross-stream, over-cap, new rail/vendor).
+-   *  - 'human'    → human-gate (irreversible or money movement). Agents prepare; humans commit.
++   *  - 'gate-ready' → proposal may continue to its local gate/review; this is not live execution.
++   *  - 'escalate'   → founder-board (cross-stream, over-cap, new rail/vendor).
++   *  - 'human'      → human-gate (irreversible or money movement). Agents prepare; humans commit.
+    */
+-  verdict: 'act' | 'escalate' | 'human';
++  verdict: 'gate-ready' | 'escalate' | 'human';
+ }
+ 
+ /** Outcome of one queen loop step. */
+@@ -47,7 +47,7 @@ export interface QueenLoopResult {
+ /** MCP handles available to a queen (Payments only for the Payments Queen). */
+ export interface QueenMcp {
+   vault: SisVaultMcp;
+-  /** Present only on the Payments Queen (IAM L3 scoping). Verify-only. */
++  /** Required for any payment-governed proposal. Verify-only; missing handle fails closed. */
+   payments?: PaymentsMcp;
+ }
+ 
+@@ -77,7 +77,7 @@ export class Queen {
+   }
+ 
+   /**
+-   * decide() — the act-vs-escalate gate. Pure mapping from a classification to a
++   * decide() — the gate-ready-vs-escalate gate. Pure mapping from a classification to a
+    * queen verdict. This is where the escalation contract becomes the queen's
+    * discipline: anything beyond scope/caps leaves the queen's hands.
+    */
+@@ -94,7 +94,7 @@ export class Queen {
+       case 'autonomous':
+       case 'queen-gate':
+       default:
+-        verdict = 'act';
++        verdict = 'gate-ready';
+         break;
+     }
+     return { worker: report.worker, taskId: report.taskId, classification, verdict };
+@@ -117,29 +117,112 @@ export class Queen {
+         throw new Error('No worker available to execute task: ' + task.id);
+       }
+       const report = await chosen.run(task, mcp.vault);
+-      const decision = this.decide(report);
++      const decision = await this.enforcePaymentGovernance(report, task, mcp, this.decide(report));
+       decisions.push(decision);
+ 
+       this.log(
+         `    • ${decision.worker} → ${decision.classification.decision.toUpperCase()} ` +
+           `(verdict: ${decision.verdict}) — ${decision.classification.reason}`,
+       );
++    }
++
++    return { queen: this.name, stream: this.stream, loopStep, decisions };
++  }
++
++  private async enforcePaymentGovernance(
++    report: WorkerReport,
++    task: Task,
++    mcp: QueenMcp,
++    decision: QueenDecision,
++  ): Promise<QueenDecision> {
++    if (!requiresPaymentGovernance(report.proposed)) {
++      return decision;
++    }
++
++    this.log('    ↳ Payment governance runs verify-only checks (fail-closed):');
++
++    if (!mcp.payments) {
++      return this.blockPayment(decision, 'Payments MCP unavailable; payment governance cannot be proven.');
++    }
++
++    try {
++      const amount = report.proposed.amount ?? 0;
++      const proof = {
++        signature: 'dry-run',
++        amount,
++        purpose: task.description,
++      };
++
++      const mandate = await mcp.payments.verify_mandate(proof);
++      const cap = await mcp.payments.check_spend_cap(this.stream, amount);
++
++      if (!mandate.valid) {
++        await mcp.payments.require_human_approval(mandate.reason);
++        return this.blockPayment(decision, `Mandate verification failed: ${mandate.reason}`);
++      }
++
++      if (!cap.withinCap) {
++        await mcp.payments.require_human_approval(`Spend cap failed for amount ${amount}; cap is ${cap.cap}.`);
++        return this.escalatePayment(decision, `Spend cap failed for amount ${amount}; cap is ${cap.cap}.`);
++      }
++
++      if (decision.verdict !== 'gate-ready') {
++        await mcp.payments.require_human_approval(decision.classification.reason);
++        return decision;
++      }
++
++      const audit = await mcp.payments.record_audit_entry({
++        agent: this.name,
++        stream: this.stream,
++        task: task.id,
++        note: `payment governance passed for ${report.worker}: ${task.description}`,
++        timestamp: new Date().toISOString(),
++      });
+ 
+-      // Demonstrate the verify-only Payments MCP touch WITHOUT moving money.
+-      if (this.stream === 'payments' && mcp.payments && report.proposed.movesMoney) {
+-        this.log('    ↳ Payments Queen runs verify-only governance (fail-closed):');
+-        await mcp.payments.verify_mandate({
+-          signature: 'dry-run',
+-          amount: report.proposed.amount ?? 0,
+-          purpose: task.description,
+-        });
+-        await mcp.payments.check_spend_cap(this.stream, report.proposed.amount ?? 0);
+-        if (decision.verdict !== 'act') {
+-          await mcp.payments.require_human_approval(decision.classification.reason);
+-        }
++      if (!audit.ok) {
++        await mcp.payments.require_human_approval('Payment audit entry failed; action cannot remain autonomous.');
++        return this.blockPayment(decision, 'Payment audit entry failed; action cannot remain autonomous.');
+       }
++    } catch (err) {
++      const reason = `Payments MCP threw during governance: ${(err as Error).message}`;
++      try {
++        await mcp.payments.require_human_approval(reason);
++      } catch {
++        // If the escalation note itself fails, the local verdict still fails closed.
++      }
++      return this.blockPayment(decision, reason);
+     }
+ 
+-    return { queen: this.name, stream: this.stream, loopStep, decisions };
++    return decision;
++  }
++
++  private blockPayment(decision: QueenDecision, reason: string): QueenDecision {
++    return {
++      ...decision,
++      verdict: 'human',
++      classification: {
++        decision: 'human-gate',
++        reason: `Payment governance failed closed. ${reason}`,
++        gates: [...decision.classification.gates, 'human.approval'],
++      },
++    };
++  }
++
++  private escalatePayment(decision: QueenDecision, reason: string): QueenDecision {
++    return {
++      ...decision,
++      verdict: 'escalate',
++      classification: {
++        decision: 'founder-board',
++        reason: `Payment governance failed closed. ${reason}`,
++        gates: [
++          'payments-mcp.verify_mandate',
++          'payments-mcp.check_spend_cap',
++          'founder.review',
++          'starlight-board.pressure-test',
++          'human.approval',
++        ],
++      },
++    };
+   }
+ }
