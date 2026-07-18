@@ -1,0 +1,14 @@
+{
+  "action": "single-run",
+  "free_gib": 200,
+  "available_memory_gib": 12,
+  "checksum_verified": true,
+  "defender_detections": 0,
+  "publisher_signed": false,
+  "credential_strategy": "isolated-pilot",
+  "runtime_process_owned": true,
+  "port_available": true,
+  "equivalent_schedule_count": 0,
+  "adapter_preserves_denies": true,
+  "canonical_memory_writes": false
+}

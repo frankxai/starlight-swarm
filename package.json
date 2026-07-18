@@ -9,7 +9,8 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
-    "swarm:dry-run": "tsx src/swarm/index.ts"
+    "swarm:dry-run": "tsx src/swarm/index.ts",
+    "hand:pilot": "tsx src/swarm/pilot-cli.ts"
   },
   "dependencies": {
     "next": "^14.2.3",
