@@ -30,13 +30,13 @@
 > human holds the last line. The orchestration *contract*, in typed TypeScript —
 > never wired to live funds.
 
-![Status](https://img.shields.io/badge/status-v0.2_dry--run_only-f59e0b?style=for-the-badge&labelColor=0d1117)
+![Status](https://img.shields.io/badge/status-v0.3_dry--run_only-f59e0b?style=for-the-badge&labelColor=0d1117)
 ![Layer](https://img.shields.io/badge/layer-L6_Swarm_Runtime-7fffd4?style=for-the-badge&labelColor=0d1117)
 ![Safety](https://img.shields.io/badge/money_movement-none_by_design-c084fc?style=for-the-badge&labelColor=0d1117)
 [![Built on SIP](https://img.shields.io/badge/Built_on-SIP-78a6ff?style=for-the-badge&labelColor=0d1117)](https://github.com/frankxai/Starlight-Intelligence-System)
 [![License: MIT](https://img.shields.io/badge/license-MIT-white?style=for-the-badge&labelColor=0d1117)](https://opensource.org/licenses/MIT)
 
-[**⚡ Run the dry-run**](#run-the-dry-run) · [**🧬 The model**](#the-model) · [**🪜 Escalation spine**](#escalation-spine) · [**🗺️ Where it sits**](#where-it-sits)
+[**⚡ Run the dry-run**](#run-the-dry-run) · [**🧬 The model**](#the-model) · [**🪜 Escalation spine**](#escalation-spine) · [**🛡️ Benevolence charter**](#benevolence-charter) · [**🗺️ Where it sits**](#where-it-sits)
 
 </div>
 
@@ -52,9 +52,16 @@
 
 ## ⚠️ Status
 
-**v0.2 — unit-tested safety spine + real payments-MCP adapter (still dry-run only).**
+**v0.3 — benevolence charter wired into the queen tier (still dry-run only).**
 
-What v0.2 hardens over the v0.1 scaffold (the model is unchanged; the *confidence* is higher):
+What v0.3 adds: an executable [benevolence charter](#benevolence-charter) — six non-waivable
+clauses that run as a second, independent read on every proposal. It can raise a gate and never
+lower one, so a Queen holding the charter is never more permissive than one without it. Ledger
+clauses (attribution owed, lost sovereignty, unbacked capability claims) refuse outright.
+[`docs/QUEEN-CHARTER.md`](docs/QUEEN-CHARTER.md) is the spawn recipe for a Queen over any
+vertical, business, or team.
+
+What v0.2 hardened over the v0.1 scaffold (the model is unchanged; the *confidence* is higher):
 
 - **The escalation spine is unit-tested.** `classify()` + `overCap()` — the load-bearing
   safety code — have full-branch coverage, including the fail-closed invariants: a
@@ -123,6 +130,44 @@ fail-closed). See [`docs/SWARM-ARCHITECTURE.md`](docs/SWARM-ARCHITECTURE.md).
 
 ---
 
+<a id="benevolence-charter"></a>
+
+## 🛡️ The benevolence charter
+
+"Benevolent" is an unfalsifiable adjective until you say what the system **will not do**.
+`checkCharter(action, ctx)` is that list made executable — six non-waivable clauses from
+[The Blessing Protocol §13](https://github.com/frankxai/bless), inherited downward and never
+relaxed downward.
+
+| # | Clause | Disposition |
+|---|---|---|
+| 1 | **Fail closed** — uncertainty takes the safe verdict | raises the gate |
+| 2 | **Human gate on the irreversible** — agents prepare, humans commit | raises to `human-gate` |
+| 3 | **Attribution honored** — nothing runs with credit outstanding | **refuses** |
+| 4 | **Sovereignty non-waivable** — read, export, leave | **refuses** |
+| 5 | **Refusal is first-class** — reasoned and logged | structural |
+| 6 | **No unbacked capability claim** — claims trace to a ledger entry | **refuses** |
+
+It is a **second, independent read** on every action, deliberately overlapping `classify()`.
+That redundancy is the point: if a future edit downgrades the irreversible-or-money rule in one
+spine, the other still catches it. The two are combined with `raiseTo()`, which takes the harder
+answer, so:
+
+> **The charter may only raise a gate. It may never lower one.**
+
+That property is asserted across the full action matrix in `charter.test.ts`, with an
+anti-vacuity guard so the assertion cannot pass trivially — plus an *agreement* test that fires
+if the two spines ever diverge on a quantified action.
+
+Clauses 3, 4 and 6 are ledger defects: they refuse outright at any tier, because no approval
+makes uncredited work credited or an unbacked claim backed. The remedy is a one-line append to
+`palace/lineage.jsonl`, not a signature.
+
+To spawn a Queen for your own vertical, business, or team, follow
+[`docs/QUEEN-CHARTER.md`](docs/QUEEN-CHARTER.md).
+
+---
+
 ## 📂 Layout
 
 ```
@@ -131,14 +176,17 @@ src/swarm/
   queen.ts         Queen class — owns workers, runs a loop step, act-vs-escalate
   worker.ts        Worker interface — one job, append-only memory, never self-gates
   escalation.ts    classify(action) → autonomous | queen-gate | founder-board | human-gate
+  charter.ts       checkCharter(action, ctx) → the six benevolence clauses, raise-only
   integrations.ts  MCP integration: SIS sis_* stubs + REAL payments-MCP adapter (verify-only, fail-closed)
-  index.ts         the dry-run: prints the tree + escalation path + a real payments-MCP round-trip
+  index.ts         the dry-run: prints the tree + escalation path + charter reads + a real payments-MCP round-trip
   escalation.test.ts    full-branch tests for the safety spine (incl. fail-closed)
   queen.test.ts         worker-guard + act-vs-escalate routing tests
+  charter.test.ts       monotonicity + fail-closed + ledger refusals + actionability
   integrations.test.ts  payments-MCP adapter wire shape + fail-closed + queen↔adapter tests
 src/pages/
   swarm.tsx        cockpit page rendering the stream → queen → worker tree + legend
 docs/SWARM-ARCHITECTURE.md   the architecture narrative
+docs/QUEEN-CHARTER.md        how to spawn a Queen for a vertical, business, or team
 local-cockpit.html           static operator console (now includes the swarm tree)
 ```
 

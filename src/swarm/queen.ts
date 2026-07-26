@@ -15,7 +15,9 @@
  */
 
 import { classify } from './escalation';
-import type { Classification, StreamId } from './escalation';
+import type { Classification, Decision, StreamId } from './escalation';
+import { checkCharter, raiseTo } from './charter';
+import type { CharterContext, CharterVerdict } from './charter';
 import type { SisVaultMcp, PaymentsMcp } from './integrations';
 import type { Worker, Task, WorkerReport } from './worker';
 import { makeWorker } from './worker';
@@ -31,8 +33,16 @@ export interface QueenDecision {
    *  - 'act'      → autonomous/queen-gate within scope and below caps; queen proceeds behind its gate.
    *  - 'escalate' → founder-board (cross-stream, over-cap, new rail/vendor).
    *  - 'human'    → human-gate (irreversible or money movement). Agents prepare; humans commit.
+   *  - 'refuse'   → a charter clause refuses outright; no gate lets this through (charter.ts).
    */
-  verdict: 'act' | 'escalate' | 'human';
+  verdict: 'act' | 'escalate' | 'human' | 'refuse';
+  /** The benevolence charter's independent read on the same action (Blessing Protocol §13). */
+  charter: CharterVerdict;
+  /**
+   * The decision tier actually applied, after the charter floor is combined with
+   * the classification. Always >= classification.decision in severity.
+   */
+  effective: Decision;
 }
 
 /** Outcome of one queen loop step. */
@@ -59,14 +69,22 @@ export class Queen {
   readonly name: string;
   readonly stream: StreamId;
   readonly loop: string[];
+  /**
+   * The ledger-shaped facts this queen's charter checks run against (attribution
+   * owed, capability claims, sovereignty). Defaults to `{}` — which asserts
+   * nothing and therefore blocks nothing. Populate it from the operator's
+   * lineage ledger to give clauses 3, 4 and 6 something to bite on.
+   */
+  readonly charterContext: CharterContext;
   private readonly workers: Worker[];
   private readonly log: (m: string) => void;
 
-  constructor(spec: StreamSpec, log: (m: string) => void = () => {}) {
+  constructor(spec: StreamSpec, log: (m: string) => void = () => {}, charterContext: CharterContext = {}) {
     this.name = spec.queen.name;
     this.stream = spec.id;
     this.loop = spec.queen.selfImprovingLoop;
     this.log = log;
+    this.charterContext = charterContext;
     // Build the worker mesh from config. Each worker is stateless + single-skill.
     this.workers = spec.workers.map((w) => makeWorker(w.name, spec.id, w.skill));
   }
@@ -80,24 +98,43 @@ export class Queen {
    * decide() — the act-vs-escalate gate. Pure mapping from a classification to a
    * queen verdict. This is where the escalation contract becomes the queen's
    * discipline: anything beyond scope/caps leaves the queen's hands.
+   *
+   * Two independent reads run on every proposal:
+   *   1. classify()     — who decides (the escalation spine),
+   *   2. checkCharter() — whether it may proceed at all, and at what floor
+   *                       (the benevolence charter, Blessing Protocol §13).
+   *
+   * They are combined with raiseTo(), which takes the HARDER of the two. The
+   * charter can tighten a verdict and can never loosen one — so a queen holding
+   * the charter is never more permissive than a queen without it. That property
+   * is asserted directly in charter.test.ts.
    */
-  decide(report: WorkerReport): QueenDecision {
+  decide(report: WorkerReport, ctx: CharterContext = this.charterContext): QueenDecision {
     const classification = classify(report.proposed);
+    const charter = checkCharter(report.proposed, ctx);
+    const effective = raiseTo(classification.decision, charter.floor);
+
     let verdict: QueenDecision['verdict'];
-    switch (classification.decision) {
-      case 'human-gate':
-        verdict = 'human';
-        break;
-      case 'founder-board':
-        verdict = 'escalate';
-        break;
-      case 'autonomous':
-      case 'queen-gate':
-      default:
-        verdict = 'act';
-        break;
+    if (charter.refused) {
+      // A ledger defect (uncredited instrument, unbacked claim, lost sovereignty).
+      // No approval tier clears it — the remedy is to fix the ledger, not to ask.
+      verdict = 'refuse';
+    } else {
+      switch (effective) {
+        case 'human-gate':
+          verdict = 'human';
+          break;
+        case 'founder-board':
+          verdict = 'escalate';
+          break;
+        case 'autonomous':
+        case 'queen-gate':
+        default:
+          verdict = 'act';
+          break;
+      }
     }
-    return { worker: report.worker, taskId: report.taskId, classification, verdict };
+    return { worker: report.worker, taskId: report.taskId, classification, verdict, charter, effective };
   }
 
   /**
@@ -121,9 +158,17 @@ export class Queen {
       decisions.push(decision);
 
       this.log(
-        `    • ${decision.worker} → ${decision.classification.decision.toUpperCase()} ` +
+        `    • ${decision.worker} → ${decision.effective.toUpperCase()} ` +
           `(verdict: ${decision.verdict}) — ${decision.classification.reason}`,
       );
+      // Clause 5: a refusal is surfaced with a reason a human can act on, never swallowed.
+      for (const b of decision.charter.breaches) {
+        this.log(`      ↳ charter [${b.clause}] ${b.reason} FIX: ${b.remedy}`);
+      }
+
+      // A charter refusal stops here: no MCP touch, no gate, no further work on
+      // this proposal until the underlying ledger defect is fixed.
+      if (decision.verdict === 'refuse') continue;
 
       // Demonstrate the verify-only Payments MCP touch WITHOUT moving money.
       if (this.stream === 'payments' && mcp.payments && report.proposed.movesMoney) {

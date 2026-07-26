@@ -19,6 +19,8 @@ import { Queen } from './queen';
 import type { Task } from './worker';
 import type { Action, StreamId } from './escalation';
 import { classify } from './escalation';
+import { BENEVOLENCE_CHARTER, checkCharter, explain, raiseTo } from './charter';
+import type { CharterContext } from './charter';
 import { makeDryRunVault, makeDryRunPayments, connectRealPayments } from './integrations';
 import { resolve } from 'node:path';
 
@@ -117,6 +119,41 @@ function demoEscalationLadder(): void {
   out('');
 }
 
+/**
+ * Show the benevolence charter as a second, independent read on the same actions
+ * (Blessing Protocol §13). The charter can raise a gate and never lower one.
+ */
+function demoCharter(): void {
+  out('───────────────────────────────────────────────────────────────');
+  out('  BENEVOLENCE CHARTER (checkCharter() — the second, independent read)');
+  out('───────────────────────────────────────────────────────────────');
+  out(`  ${BENEVOLENCE_CHARTER.protocol} · ${BENEVOLENCE_CHARTER.version} — six non-waivable clauses:`);
+  BENEVOLENCE_CHARTER.clauses.forEach((c, i) => out(`    ${i + 1}. [${c.id}] ${c.text}`));
+  out('');
+  out('  The charter may only RAISE a gate, never lower one. Clauses 3/4/6 are');
+  out('  ledger defects — they refuse outright, because no approval tier makes');
+  out('  uncredited work credited or an unbacked claim backed.');
+
+  const samples: Array<{ label: string; a: Action | null; ctx: CharterContext }> = [
+    { label: 'Quantified in-cap payment — left to the spend-cap ladder', a: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }), ctx: {} },
+    { label: 'Charge with no quantified cap — "how much?" has no answer yet', a: action('payments', { kind: 'payment', movesMoney: true }), ctx: {} },
+    { label: 'A null proposal reaches the gate', a: null, ctx: {} },
+    { label: 'Draft, but an instrument in use has attribution owed', a: action('content', { kind: 'draft' }), ctx: { attributionOwed: ['mind-palace-agent-skills'] } },
+    { label: 'Scheduled post asserting a capability nothing backs', a: action('content', { kind: 'schedule-post' }), ctx: { claims: [{ statement: 'Fully autonomous revenue', backedBy: [] }] } },
+  ];
+
+  for (const { label, a, ctx } of samples) {
+    const v = checkCharter(a, ctx);
+    const base = a ? classify(a).decision : 'human-gate';
+    out('');
+    out(`  ▸ ${label}`);
+    out(`      classify  : ${base}`);
+    out(`      effective : ${v.refused ? 'REFUSED (no gate clears it)' : raiseTo(base, v.floor)}`);
+    for (const line of explain(v).split('\n')) out(`      ${line}`);
+  }
+  out('');
+}
+
 /** Run one loop step per queen, including a demonstrated escalation. */
 async function runLoopSteps(): Promise<void> {
   out('───────────────────────────────────────────────────────────────');
@@ -184,6 +221,7 @@ async function demoRealPaymentsMcp(): Promise<void> {
 async function main(): Promise<void> {
   printTree();
   demoEscalationLadder();
+  demoCharter();
   await runLoopSteps();
   await demoRealPaymentsMcp();
 
