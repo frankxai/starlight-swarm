@@ -121,16 +121,23 @@ export class Queen {
       verdict = 'refuse';
     } else {
       switch (effective) {
-        case 'human-gate':
-          verdict = 'human';
+        case 'autonomous':
+        case 'queen-gate':
+          verdict = 'act';
           break;
         case 'founder-board':
           verdict = 'escalate';
           break;
-        case 'autonomous':
-        case 'queen-gate':
+        case 'human-gate':
+          verdict = 'human';
+          break;
         default:
-          verdict = 'act';
+          // Fail closed (charter clause 1). Only the two tiers named above earn
+          // 'act'; anything this switch does not recognise — a Decision member
+          // added later and not taught here — routes to a human. `raiseTo()`
+          // already ranks an unknown tier as maximally severe, and a permissive
+          // default would throw that away at the last step.
+          verdict = 'human';
           break;
       }
     }

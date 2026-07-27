@@ -132,6 +132,30 @@ test('decide() maps every classification tier to the right verdict', () => {
   assert.equal(mk(action('payments', { kind: 'move-funds' })), 'human');
 });
 
+test('decide() fails closed: only autonomous/queen-gate ever earn the act verdict', () => {
+  // Guards the last step of the pipeline. raiseTo() ranks an unrecognised tier as
+  // maximally severe; a permissive `default` in the verdict switch would discard
+  // that and hand back 'act'. Every tier except the two safe ones must not.
+  const queen = new Queen(paymentsSpec());
+  const decide = (a: Action) => queen.decide({ worker: 'w', stream: 'content', taskId: 't', proposed: a, note: '' });
+
+  // The safe tiers still act.
+  assert.equal(decide(action('content', { kind: 'draft' })).verdict, 'act');
+  assert.equal(decide(action('affiliate', { kind: 'bind-link' })).verdict, 'act');
+
+  // Nothing above queen-gate does, by any route into the switch.
+  const escalating: Action[] = [
+    action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 }), // founder-board
+    action('payments', { kind: 'payment', movesMoney: true }), // unquantified → charter floors to human
+    action('content', { kind: 'delete' }), // commit-class
+    action('content', { kind: 'build-page', crossStream: true }), // cross-stream
+  ];
+  for (const a of escalating) {
+    const v = decide(a);
+    assert.notEqual(v.verdict, 'act', `${a.kind} must not resolve to 'act' (effective: ${v.effective})`);
+  }
+});
+
 test('task with an unknown worker hint falls back to the first worker (no throw)', async () => {
   const queen = new Queen(paymentsSpec());
   const task: Task = {
