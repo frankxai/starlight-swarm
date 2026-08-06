@@ -1,0 +1,14 @@
+{
+  "schema_version": "starlight.hermes-hand-job.v1",
+  "hand_id": "collector-hermes-pilot",
+  "name": "Starlight Hand: collector-hermes-pilot",
+  "enabled": false,
+  "schedule": "every 1440m",
+  "repeat": 14,
+  "deliver": "local",
+  "attach_to_session": false,
+  "enabled_toolsets": [
+    "web"
+  ],
+  "prompt": "Execute Starlight Hand collector-hermes-pilot exactly once.\n\nObjective: Produce one daily source-backed competitive-change brief for autonomous-agent runtimes without taking external action.\n\nBudgets: 30 minutes, 40 tool calls, and USD 1 estimated model cost.\n\nUse only public web search and extraction tools. Do not use shell, files, memory writes, messaging, publishing, spending, credentials, or repository tools.\n\nSIS remains the only canonical memory authority. Produce a sourced graph projection for independent review; never write directly to SIS.\n\nFollow these phases in order: recover, plan, collect, cross-check, graph, verify, receipt.\n\nReturn the report and one starlight.hand.pilot-receipt.v1 JSON object in the final response. Do not schedule another run. The Queen wrapper will stage accepted output into the isolated inbox.\n\nDone conditions:\n\n- A Markdown report exists in the isolated pilot inbox\n- A machine-readable run receipt passes validation\n- Every proposed graph relation contains a public source and confidence score"
+}

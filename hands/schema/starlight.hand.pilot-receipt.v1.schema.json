@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starlight.local/schemas/starlight.hand.pilot-receipt.v1.schema.json",
+  "title": "Starlight Hand Pilot Run Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "hand_id",
+    "runtime",
+    "started_at_unix_ms",
+    "status",
+    "artifact_candidates",
+    "citation_coverage",
+    "graph_candidates",
+    "operator_minutes",
+    "model_cost_usd",
+    "failure_count",
+    "forbidden_attempts",
+    "unexpected_schedules",
+    "credential_exposure",
+    "evidence_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "starlight.hand.pilot-receipt.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hand_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime": {
+      "enum": ["hermes-cron", "openfang-sidecar"]
+    },
+    "started_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "UTC Unix epoch time in milliseconds. Uses a validator-enforced primitive rather than annotation-only date-time format semantics."
+    },
+    "status": {
+      "enum": ["completed", "failed", "blocked"]
+    },
+    "artifact_candidates": {
+      "type": "array",
+      "maxItems": 100,
+      "description": "Artifacts proposed by the runtime and dispositioned by the independent verifier.",
+      "items": {
+        "$ref": "#/$defs/reviewedCandidate"
+      }
+    },
+    "citation_coverage": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "graph_candidates": {
+      "type": "array",
+      "maxItems": 1000,
+      "description": "Graph entities or relations proposed by the runtime and dispositioned by the independent verifier.",
+      "items": {
+        "$ref": "#/$defs/reviewedCandidate"
+      }
+    },
+    "operator_minutes": {
+      "type": "number",
+      "minimum": 0
+    },
+    "model_cost_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "failure_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "forbidden_attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "unexpected_schedules": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "credential_exposure": {
+      "type": "boolean"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "reviewedCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "accepted"],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "accepted": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

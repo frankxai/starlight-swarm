@@ -1,0 +1,79 @@
+{
+  "schema_version": "starlight.hand.v1",
+  "id": "collector-openfang-pilot",
+  "owner": "starlight-queen",
+  "runtime": "openfang-sidecar",
+  "mode": "read-only",
+  "enabled": false,
+  "mission": {
+    "outcome": "Produce one daily source-backed competitive-change brief for autonomous-agent runtimes without taking external action.",
+    "done_when": [
+      "A Markdown report exists in the isolated pilot inbox",
+      "A machine-readable run receipt passes validation",
+      "Every proposed graph relation contains a public source and confidence score"
+    ]
+  },
+  "schedule": {
+    "kind": "interval",
+    "every_minutes": 1440,
+    "timezone": "Europe/Amsterdam",
+    "max_runs": 14
+  },
+  "capabilities": {
+    "tools": [
+      "web_search",
+      "web_fetch",
+      "knowledge_query",
+      "knowledge_add_entity"
+    ],
+    "deny": [
+      "shell_exec",
+      "file_write",
+      "external_send",
+      "publish",
+      "spend",
+      "secrets"
+    ]
+  },
+  "memory": {
+    "canonical_authority": "SIS",
+    "write_mode": "projection-only",
+    "read_namespaces": [
+      "public-strategic"
+    ],
+    "knowledge_graph": {
+      "source_required": true,
+      "confidence_required": true
+    }
+  },
+  "execution": {
+    "max_minutes": 30,
+    "max_model_cost_usd": 1,
+    "max_tool_calls": 40,
+    "workdir": "runtime/openfang-pilot/inbox"
+  },
+  "phases": [
+    "recover",
+    "plan",
+    "collect",
+    "cross-check",
+    "graph",
+    "verify",
+    "receipt"
+  ],
+  "human_gates": [
+    "external_send",
+    "publish",
+    "spend",
+    "secrets",
+    "repo_write"
+  ],
+  "receipt": {
+    "required_artifacts": [
+      "report",
+      "machine-readable-receipt",
+      "sourced-graph-delta"
+    ],
+    "verifier": "independent"
+  }
+}

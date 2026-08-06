@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starlight.local/schemas/starlight.hand.v1.schema.json",
+  "title": "Starlight Hand v1",
+  "description": "A bounded autonomous-worker contract governed by Starlight Queen with SIS as canonical memory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "owner",
+    "runtime",
+    "mode",
+    "enabled",
+    "mission",
+    "schedule",
+    "capabilities",
+    "memory",
+    "execution",
+    "phases",
+    "human_gates",
+    "receipt"
+  ],
+  "properties": {
+    "schema_version": { "const": "starlight.hand.v1" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,63}$" },
+    "owner": { "const": "starlight-queen" },
+    "runtime": { "enum": ["hermes-cron", "openfang-sidecar"] },
+    "mode": { "const": "read-only" },
+    "enabled": { "type": "boolean" },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "done_when"],
+      "properties": {
+        "outcome": { "type": "string", "minLength": 10 },
+        "done_when": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 3 }
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "every_minutes", "timezone", "max_runs"],
+      "properties": {
+        "kind": { "const": "interval" },
+        "every_minutes": { "type": "integer", "minimum": 60 },
+        "timezone": { "type": "string", "minLength": 1 },
+        "max_runs": { "type": "integer", "minimum": 1, "maximum": 30 }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "deny"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "not": { "contains": { "const": "shell_exec" } }
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "allOf": [
+            { "contains": { "const": "shell_exec" } },
+            { "contains": { "const": "file_write" } },
+            { "contains": { "const": "external_send" } },
+            { "contains": { "const": "publish" } },
+            { "contains": { "const": "spend" } },
+            { "contains": { "const": "secrets" } }
+          ]
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_authority", "write_mode", "read_namespaces", "knowledge_graph"],
+      "properties": {
+        "canonical_authority": { "const": "SIS" },
+        "write_mode": { "const": "projection-only" },
+        "read_namespaces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "knowledge_graph": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_required", "confidence_required"],
+          "properties": {
+            "source_required": { "const": true },
+            "confidence_required": { "const": true }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_minutes", "max_model_cost_usd", "max_tool_calls", "workdir"],
+      "properties": {
+        "max_minutes": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "max_model_cost_usd": { "type": "number", "minimum": 0, "maximum": 5 },
+        "max_tool_calls": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "workdir": { "type": "string", "minLength": 1 }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "allOf": [
+        { "contains": { "const": "recover" } },
+        { "contains": { "const": "plan" } },
+        { "contains": { "const": "collect" } },
+        { "contains": { "const": "cross-check" } },
+        { "contains": { "const": "graph" } },
+        { "contains": { "const": "verify" } },
+        { "contains": { "const": "receipt" } }
+      ]
+    },
+    "human_gates": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_artifacts", "verifier"],
+      "properties": {
+        "required_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "verifier": { "const": "independent" }
+      }
+    }
+  }
+}
