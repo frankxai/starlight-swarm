@@ -1,0 +1,146 @@
+{
+  "schema_version": "starlight.team_runtime_plan.v1",
+  "team_id": "starlight-platform-team",
+  "source_profile": {
+    "schema_version": "starlight.team_profile.v2",
+    "version": "2.0.0",
+    "review_date": "2026-08-10",
+    "sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "repository": "frankxai/starlight-agent-config",
+    "commit_sha": "12b8733f1af061578d979e93e7bb6c1763f8f9e3",
+    "path": "core/teams/starlight-platform-team.team-profile.json"
+  },
+  "generated_at": "2026-08-09T01:46:54.000Z",
+  "activation_status": "planned-human-approval-required",
+  "authority": {
+    "mission": "railway-temporal",
+    "model_policy": "queen-model-policy",
+    "observability": "langfuse",
+    "integration": "n8n",
+    "operator": "hermes"
+  },
+  "routing_policy": {
+    "policy_id": "queen-runtime-policy-v1",
+    "policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+    "eve_allowlisted_workload_ids": [
+      "operator-intelligence"
+    ],
+    "allowed_runtimes": [
+      "railway-temporal",
+      "vercel-eve",
+      "hermes-local",
+      "n8n-integration"
+    ]
+  },
+  "human_gate_actions": [
+    "production_high_risk",
+    "dns_change",
+    "secret_change",
+    "billing_change",
+    "spend",
+    "data_migration",
+    "destructive",
+    "external_send",
+    "legal_ip",
+    "brand_identity",
+    "permission_change"
+  ],
+  "budget": {
+    "policy_id": "starlight-platform-pilot-budget-v1",
+    "max_daily_cost_usd": 25,
+    "planned_daily_cost_usd": 19
+  },
+  "lanes": [
+    {
+      "id": "operator-intelligence",
+      "role_id": "coordinator",
+      "workload_contract": {
+        "workload_class": "interactive-specialist",
+        "interaction": "realtime",
+        "durability": "session",
+        "approval_waits": false,
+        "code_execution": false,
+        "third_party_connections": true,
+        "local_private_data": false,
+        "risk": "low"
+      },
+      "runtime": "vercel-eve",
+      "mission_authority": "railway-temporal",
+      "provider_route": "vercel-ai-gateway",
+      "model_route": "balanced",
+      "budget": {
+        "daily_token_cap": 120000,
+        "daily_cost_cap_usd": 4
+      },
+      "mode": "dry-run",
+      "independent_verifier": false,
+      "reason_codes": [
+        "interactive-agent-surface"
+      ],
+      "warnings": [
+        "Vercel Eve is beta; consequential state and approvals remain in Railway Temporal."
+      ]
+    },
+    {
+      "id": "durable-builder",
+      "role_id": "backend-data-engineer",
+      "workload_contract": {
+        "workload_class": "durable-mission",
+        "interaction": "async",
+        "durability": "checkpointed",
+        "approval_waits": true,
+        "code_execution": false,
+        "third_party_connections": false,
+        "local_private_data": false,
+        "risk": "high"
+      },
+      "runtime": "railway-temporal",
+      "mission_authority": "railway-temporal",
+      "provider_route": "direct-provider",
+      "model_route": "frontier",
+      "budget": {
+        "daily_token_cap": 250000,
+        "daily_cost_cap_usd": 12
+      },
+      "mode": "dry-run",
+      "independent_verifier": false,
+      "reason_codes": [
+        "sensitive-capability-requires-durable-gated-runtime",
+        "durable-approval-wait"
+      ],
+      "warnings": [
+        "Sensitive capabilities require explicit Queen and human-gated grants."
+      ]
+    },
+    {
+      "id": "independent-verifier",
+      "role_id": "qa-release-sre-verifier",
+      "workload_contract": {
+        "workload_class": "scheduled-intelligence",
+        "interaction": "scheduled",
+        "durability": "run-receipt",
+        "approval_waits": false,
+        "code_execution": false,
+        "third_party_connections": false,
+        "local_private_data": true,
+        "risk": "medium"
+      },
+      "runtime": "hermes-local",
+      "mission_authority": "railway-temporal",
+      "provider_route": "hermes-profile",
+      "model_route": "checker-independent",
+      "budget": {
+        "daily_token_cap": 80000,
+        "daily_cost_cap_usd": 3
+      },
+      "mode": "dry-run",
+      "independent_verifier": true,
+      "reason_codes": [
+        "private-bounded-local-run"
+      ],
+      "warnings": [
+        "Local Hermes pauses when the Windows host sleeps, is offline, or fails its capacity gate."
+      ]
+    }
+  ]
+}

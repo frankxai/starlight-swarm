@@ -1,0 +1,11 @@
+title = "Starlight Swarm secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated and vendored dependency trees are reproducible and not source inputs"
+paths = [
+  '''^\.next/''',
+  '''^node_modules/'''
+]

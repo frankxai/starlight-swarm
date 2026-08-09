@@ -1,0 +1,97 @@
+{
+  "schema_version": "starlight.prepared_runtime_bundle.v1",
+  "team_id": "starlight-platform-team",
+  "generated_at": "2026-08-09T01:46:54.000Z",
+  "status": "prepared-human-approval-required",
+  "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+  "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+  "source_runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+  "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+  "lanes": [
+    {
+      "schema_version": "starlight.prepared_runtime_lane.v1",
+      "deployment_id": "starlight-platform-team-4207c8411b4016527a4d8ce1-operator-intelligence-0eb4639a0c06836ef09375d5-09e85daf2621",
+      "team_id": "starlight-platform-team",
+      "lane_id": "operator-intelligence",
+      "role_id": "coordinator",
+      "runtime": "vercel-eve",
+      "status": "prepared-human-approval-required",
+      "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+      "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+      "runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+      "max_concurrency": 1,
+      "lease_ttl_seconds": 900,
+      "heartbeat_timeout_seconds": 120,
+      "kill_switch": "STARLIGHT_KILL_OPERATOR_INTELLIGENCE_0EB4639A0C06836EF09375D5",
+      "activation_authority": "trusted-server-internal-authority-not-implemented",
+      "required_secret_names": [
+        "AI_GATEWAY_API_KEY"
+      ],
+      "runtime_config": {
+        "kind": "vercel-eve",
+        "deployment_target": "existing-vercel-project",
+        "workflow_route": "/api/eve",
+        "tool_grants": [],
+        "write_scopes": [],
+        "canonical_state": "read-only-projection"
+      }
+    },
+    {
+      "schema_version": "starlight.prepared_runtime_lane.v1",
+      "deployment_id": "starlight-platform-team-4207c8411b4016527a4d8ce1-durable-builder-692387fb450817d9b121a5d8-09e85daf2621",
+      "team_id": "starlight-platform-team",
+      "lane_id": "durable-builder",
+      "role_id": "backend-data-engineer",
+      "runtime": "railway-temporal",
+      "status": "prepared-human-approval-required",
+      "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+      "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+      "runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+      "max_concurrency": 1,
+      "lease_ttl_seconds": 900,
+      "heartbeat_timeout_seconds": 120,
+      "kill_switch": "STARLIGHT_KILL_DURABLE_BUILDER_692387FB450817D9B121A5D8",
+      "activation_authority": "trusted-server-internal-authority-not-implemented",
+      "required_secret_names": [
+        "TEMPORAL_ADDRESS",
+        "TEMPORAL_NAMESPACE",
+        "DATABASE_URL"
+      ],
+      "runtime_config": {
+        "kind": "railway-temporal",
+        "deployment_target": "existing-railway-service",
+        "task_queue": "starlight-starlight-platform-team-4207c8411b4016527a4d8ce1-durable-builder-692387fb450817d9b121a5d8",
+        "workflow_id_prefix": "starlight/starlight-platform-team-4207c8411b4016527a4d8ce1-durable-builder-692387fb450817d9b121a5d8/09e85daf2621",
+        "canonical_state": "sis-postgres"
+      }
+    },
+    {
+      "schema_version": "starlight.prepared_runtime_lane.v1",
+      "deployment_id": "starlight-platform-team-4207c8411b4016527a4d8ce1-independent-verifier-5dfa980b844c4385c92b98dc-09e85daf2621",
+      "team_id": "starlight-platform-team",
+      "lane_id": "independent-verifier",
+      "role_id": "qa-release-sre-verifier",
+      "runtime": "hermes-local",
+      "status": "prepared-human-approval-required",
+      "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+      "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+      "runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+      "max_concurrency": 1,
+      "lease_ttl_seconds": 900,
+      "heartbeat_timeout_seconds": 120,
+      "kill_switch": "STARLIGHT_KILL_INDEPENDENT_VERIFIER_5DFA980B844C4385C92B98DC",
+      "activation_authority": "trusted-server-internal-authority-not-implemented",
+      "required_secret_names": [],
+      "runtime_config": {
+        "kind": "hermes-local",
+        "deployment_target": "isolated-hermes-profile",
+        "profile": "starlight-team-worker",
+        "canonical_state": "sis-postgres"
+      }
+    }
+  ],
+  "blockers": [
+    "Trusted server-internal activation authority is not implemented.",
+    "Infrastructure mutation requires fresh health, capacity, access, budget, and human approval receipts."
+  ]
+}

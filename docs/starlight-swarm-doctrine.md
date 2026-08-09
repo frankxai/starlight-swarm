@@ -31,3 +31,18 @@ When a task arrives, ask four questions in order:
 4. What must be remembered, sourced, governed, or made reusable? That is SIS.
 
 This doctrine is intentionally compact. It defines boundaries first so future runbooks, dashboards, and queue protocols can build on stable roles without mixing concerns.
+
+---
+
+## God Mode v2 Extensions (2026-08+)
+
+The original layers (SO → Queen → AO → SIS) remain the foundation.
+
+**Additions for god-mode scale**:
+- **God Mode Model Fabric / Router**: Every lane declares primary model + explicit fallbacks (Claude Fable/Opus, GPT-5.6 Sol/Terra/etc., Gemini 3.6, Grok 4.5+). Runtime selects and reports exact route + whether fallback was used. See `MODEL-ROUTER-SPEC.md`.
+- **Expanded Org**: Chief Queen (Empire) + dedicated Domain Queens (FrankX, Arcanea, GenCreator, SIS, Control/Ops, Wealth) each with Generals and specialist swarms. See `ORG-CHART.md` and `config/domain-queens.json`.
+- **Rich Topologies & Primitives Library**: Hierarchical, Mesh, Pipeline, Star, Adaptive + Ruflow (relentless flow), Paperclip (objective maximizer), GStack Council, plus estate-derived primitives (Funnel, Product Dev, Idea Forge, etc.). All generalized for community take-and-tailor. See `primitives/PRIMITIVES-CATALOG.md`.
+- **Massive Action Campaigns**: Bounded, router-routed, topology-chosen campaigns with admission gates, evidence, verification, and business-outcome measurement (not just analysis).
+- **Community Contract**: This repo is the official home for generalized ultra-advanced swarms. Anyone can copy primitives and tailor them. Keep the core layer portable.
+
+The v1 layered OS + v2 god-mode extensions together give us the intelligence, fallback resilience, and domain-scale org structure needed to drive real business progress reliably.
