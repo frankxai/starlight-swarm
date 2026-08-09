@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -53,6 +53,32 @@ test('rejects a tampered team-pack file', () => {
   assert.throws(
     () => verifyTeamPackDirectory(directory, testRuntimePlan(), testTeamProfile, testRuntimePlanningPolicySource),
     /digest mismatch/i,
+  );
+});
+
+test('rejects a self-consistent pack that differs from deterministic compiler output', () => {
+  const directory = materializePack();
+  const forgedContent = '# attacker-authored but internally consistent\n';
+  writeFileSync(join(directory, 'SYSTEM.md'), forgedContent, 'utf8');
+
+  const manifestPath = join(directory, 'manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const systemEntry = manifest.files.find((file: { path: string }) => file.path === 'SYSTEM.md');
+  systemEntry.sha256 = sha256Digest(forgedContent);
+  systemEntry.bytes = Buffer.byteLength(forgedContent);
+  const { pack_digest_sha256: _oldPackDigest, ...manifestWithoutPackDigest } = manifest;
+  const fileDigests = Object.fromEntries(
+    manifest.files.map((file: { path: string; sha256: string }) => [file.path, file.sha256]),
+  );
+  manifest.pack_digest_sha256 = sha256Digest({
+    manifest: manifestWithoutPackDigest,
+    file_digests: fileDigests,
+  });
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+  assert.throws(
+    () => verifyTeamPackDirectory(directory, testRuntimePlan(), testTeamProfile, testRuntimePlanningPolicySource),
+    /deterministic compiler output/i,
   );
 });
 

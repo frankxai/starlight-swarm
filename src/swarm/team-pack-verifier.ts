@@ -6,6 +6,7 @@ import { sha256Digest } from './runtime-digest';
 import { parseTeamRuntimePlan } from './runtime-plan-contract';
 import { parseRuntimePlanningPolicy } from './runtime-policy';
 import { parseTeamProfile } from './runtime-planner';
+import { compileTeamPack } from './team-pack';
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const issuedVerificationResults = new WeakSet<object>();
@@ -193,6 +194,15 @@ export function verifyTeamPackDirectory(
   });
   if (actualPackDigest !== expectedPackDigest) {
     throw new Error('Team-pack manifest digest mismatch.');
+  }
+
+  const canonicalPack = compileTeamPack(profile, plan, runtimePolicy.source);
+  const canonicalPackDigest = sha256Digest({
+    manifest: canonicalPack.manifest,
+    file_digests: canonicalPack.file_digests,
+  });
+  if (actualPackDigest !== canonicalPackDigest) {
+    throw new Error('Team pack does not match the deterministic compiler output.');
   }
 
   const result = Object.freeze({
