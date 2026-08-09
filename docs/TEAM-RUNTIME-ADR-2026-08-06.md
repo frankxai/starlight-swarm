@@ -179,19 +179,20 @@ Initial provider routes:
 
 The current example team ceiling is **$25/day**, with lane caps totaling **$19/day**. These are planner limits, not authorized spend.
 
-## Admission result on 2026-08-06
+## Admission result on 2026-08-09
 
-The planner and assessor were run against the real Starlight platform team and checked-in workload example.
+The planner and assessor were rerun against the governed Starlight platform team, Queen-owned runtime policy, and checked-in workload example. The committed evidence snapshot was observed at `2026-08-09T04:28:06.000Z`.
 
 **Result:** `admitted: false`
 
 Blockers preserved in `runtime/generated/starlight-platform-pilot.assessment.json`:
 
-1. Runtime evidence older than the 15-minute freshness limit.
-2. The production admission authority is intentionally not implemented; caller-authored receipts remain non-authoritative even when digest-bound.
-3. Yogabook available memory was 3.77 GiB, below the 8 GiB local-runtime floor.
+1. Vercel Eve runtime health is `unknown`.
+2. Railway Temporal runtime health is `unknown`.
+3. The isolated Hermes runtime health is `unknown`.
+4. Production admission authority is intentionally not implemented; caller-authored receipts remain non-authoritative even when digest-bound.
 
-The dry-run therefore did not mutate Railway or Vercel and did not arm the Hermes lane.
+The snapshot records 9.85 GiB of available Yogabook memory. That point-in-time local observation is report-only and does not establish live runtime capacity or activation authority. The dry-run therefore did not mutate Railway or Vercel and did not arm the Hermes lane.
 
 ## Rollout gates
 
