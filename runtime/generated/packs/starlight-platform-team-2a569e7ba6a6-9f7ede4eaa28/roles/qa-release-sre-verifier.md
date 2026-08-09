@@ -27,7 +27,8 @@ Deliver the smallest verifiable outcome inside owned paths. Prefer evidence, det
 
 ## Requested tools
 
-- None declared.
+- "read"
+- "search"
 
 Tools are deny-by-default until the active lease and runtime adapter authorize them. MCP or Composio discovery never implies action authority.
 ## Write scopes
@@ -55,10 +56,7 @@ You are read-only by default. You cannot certify your own work or accept maker-a
 
 ### Withheld verifier tool requests
 
-- "git"
-- "playwright"
-- "vercel"
-- "sentry"
+- None declared.
 
 ## Handoff
 

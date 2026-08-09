@@ -228,7 +228,7 @@ profile-provenance, verifier-capability, loopback, and identity hardening:
 
 ```text
 npm test
-128 tests, 128 passed, 0 failed
+152 tests, 152 passed, 0 failed
 
 npm run build
 Next.js production build compiled successfully

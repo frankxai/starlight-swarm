@@ -12,7 +12,7 @@ export const testRuntimePlanningPolicySource: RuntimePlanningPolicySource = {
   max_daily_cost_usd: 5,
   team_profile_source: {
     repository: 'frankxai/starlight-agent-config',
-    commit_sha: '12b8733f1af061578d979e93e7bb6c1763f8f9e3',
+    commit_sha: 'b878eca0eb1367debfa6e52ead75c4f1213259a2',
     path: 'core/teams/starlight-platform-team.team-profile.json',
   },
   eve_allowlisted_workload_ids: ['operator-intelligence'],

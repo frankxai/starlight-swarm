@@ -17,7 +17,7 @@ function pack(): CompiledTeamPack {
       generated_at: '2026-08-06T03:00:00.000Z',
       source_profile_digest_sha256: 'a'.repeat(64),
       source_profile_repository: 'frankxai/starlight-agent-config',
-      source_profile_commit_sha: '12b8733f1af061578d979e93e7bb6c1763f8f9e3',
+      source_profile_commit_sha: 'b878eca0eb1367debfa6e52ead75c4f1213259a2',
       source_profile_path: 'core/teams/test-team.team-profile.json',
       runtime_policy_id: 'test-runtime-policy-v1',
       source_runtime_policy_digest_sha256: '4'.repeat(64),

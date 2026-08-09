@@ -2,15 +2,15 @@
   "schema_version": "starlight.team_pack.v1",
   "compiler_version": "starlight.team_pack.compiler.v2",
   "team_id": "starlight-platform-team",
-  "team_profile_version": "2.0.0",
-  "generated_at": "2026-08-09T01:46:54.000Z",
-  "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+  "team_profile_version": "2.0.1",
+  "generated_at": "2026-08-09T04:28:06.000Z",
+  "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
   "source_profile_repository": "frankxai/starlight-agent-config",
-  "source_profile_commit_sha": "12b8733f1af061578d979e93e7bb6c1763f8f9e3",
+  "source_profile_commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
   "source_profile_path": "core/teams/starlight-platform-team.team-profile.json",
   "runtime_policy_id": "queen-runtime-policy-v1",
-  "source_runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
-  "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+  "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
+  "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
   "activation_status": "planned-human-approval-required",
   "files": [
     {
@@ -45,7 +45,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "07086cf5a861529f8434c1f896ffe8a4539e7fc1ca2c0acfbf0b6965e0c0de40",
+      "sha256": "8610174bced39208cfa331b31ea9ddba59154aeca1aead81d9a338c84c1f0c50",
       "bytes": 359
     },
     {
@@ -60,12 +60,12 @@
     },
     {
       "path": "roles/qa-release-sre-verifier.md",
-      "sha256": "e5532b0b7681ae63deee3657c8101feced5d694d90214095da760f8e794dbebb",
-      "bytes": 2016
+      "sha256": "a14610a088d33c28375d6daeb142ae6671ac0fdf4748f669e6fa8b27b876eba4",
+      "bytes": 1991
     },
     {
       "path": "RUNTIME-POLICY.json",
-      "sha256": "19f884f47eb7c8017e9fae724b583ede045d8e49bf40025b748306d4e3993337",
+      "sha256": "3a02eb2aa3038e731010716eb8fbbfa0b8dcdc82ad2c5705f7386f8e6a66c651",
       "bytes": 711
     },
     {
@@ -84,5 +84,5 @@
       "bytes": 1663
     }
   ],
-  "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5"
+  "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2"
 }
