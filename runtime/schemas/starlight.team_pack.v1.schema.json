@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starlight.local/schemas/starlight.team_pack.v1.schema.json",
+  "title": "Starlight Team Pack Manifest v1",
+  "$comment": "STRUCTURAL EXPORT ONLY. Admission MUST use verifyTeamPackDirectory against externally supplied canonical plan, profile, and policy sources; JSON Schema validation alone is insufficient.",
+  "x-starlight-validation-authority": "export-only-runtime-parser-required",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "compiler_version",
+    "team_id",
+    "team_profile_version",
+    "generated_at",
+    "source_profile_digest_sha256",
+    "source_profile_repository",
+    "source_profile_commit_sha",
+    "source_profile_path",
+    "runtime_policy_id",
+    "source_runtime_policy_digest_sha256",
+    "plan_digest_sha256",
+    "activation_status",
+    "files",
+    "pack_digest_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "starlight.team_pack.v1" },
+    "compiler_version": { "const": "starlight.team_pack.compiler.v2" },
+    "team_id": { "type": "string", "minLength": 1 },
+    "team_profile_version": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "source_profile_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_profile_repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "source_profile_commit_sha": {
+      "type": "string",
+      "pattern": "^(?!0{40}$)[a-f0-9]{40}$"
+    },
+    "source_profile_path": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "runtime_policy_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "source_runtime_policy_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "plan_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "activation_status": {
+      "const": "planned-human-approval-required"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 11,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "bytes": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "pack_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

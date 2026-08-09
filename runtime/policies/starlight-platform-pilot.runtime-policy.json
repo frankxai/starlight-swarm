@@ -1,0 +1,25 @@
+{
+  "schema_version": "starlight.runtime_planning_policy.v1",
+  "policy_id": "queen-runtime-policy-v1",
+  "budget_policy_id": "starlight-platform-pilot-budget-v1",
+  "max_daily_cost_usd": 25,
+  "team_profile_source": {
+    "repository": "frankxai/starlight-agent-config",
+    "commit_sha": "12b8733f1af061578d979e93e7bb6c1763f8f9e3",
+    "path": "core/teams/starlight-platform-team.team-profile.json"
+  },
+  "eve_allowlisted_workload_ids": [
+    "operator-intelligence"
+  ],
+  "allowed_runtimes": [
+    "railway-temporal",
+    "vercel-eve",
+    "hermes-local",
+    "n8n-integration"
+  ],
+  "deferred_runtimes": [
+    "cloudflare-agents"
+  ],
+  "activation_mode": "dry-run-only",
+  "review_date": "2026-08-13"
+}

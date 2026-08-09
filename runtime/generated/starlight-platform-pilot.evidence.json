@@ -1,0 +1,42 @@
+{
+  "observed_at": "2026-08-09T01:46:54.000Z",
+  "duplicate_lane_ids": [],
+  "available_memory_gib": 18.93,
+  "runtime_health": {
+    "vercel-eve": "unknown",
+    "railway-temporal": "unknown",
+    "hermes-local": "unknown"
+  },
+  "verified_pack": {
+    "status": "verified-human-approval-required",
+    "team_id": "starlight-platform-team",
+    "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+    "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+    "compiler_version": "starlight.team_pack.compiler.v2"
+  },
+  "approval_receipt": {
+    "receipt_id": "untrusted-example-approval",
+    "issuer": "untrusted-example-only",
+    "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+    "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+    "compiler_version": "starlight.team_pack.compiler.v2",
+    "expires_at": "2026-08-09T02:46:54.000Z",
+    "scope": "activate-team-runtime"
+  },
+  "budget_receipt": {
+    "receipt_id": "untrusted-example-budget",
+    "issuer": "untrusted-example-only",
+    "plan_digest_sha256": "09e85daf262181220220b3b39fa60947448bdee6416fd987ed2deaec2aaebc19",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "356a2bbfdfe7c611f8a90ad74a0a7380562c61cc582ac92a8e1a4a55dbf8dad2",
+    "pack_digest_sha256": "692f892b9d0db651248a332d6b64b65cf46efdd1ae829353edee06f2c49103b5",
+    "compiler_version": "starlight.team_pack.compiler.v2",
+    "budget_policy_id": "starlight-platform-pilot-budget-v1",
+    "hard_daily_limit_usd": 25,
+    "expires_at": "2026-08-09T02:46:54.000Z"
+  }
+}

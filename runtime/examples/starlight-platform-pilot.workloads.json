@@ -1,0 +1,50 @@
+[
+  {
+    "id": "operator-intelligence",
+    "role_id": "coordinator",
+    "workload_class": "interactive-specialist",
+    "interaction": "realtime",
+    "durability": "session",
+    "approval_waits": false,
+    "code_execution": false,
+    "third_party_connections": true,
+    "local_private_data": false,
+    "always_available": true,
+    "risk": "low",
+    "quality_tier": "balanced",
+    "daily_token_cap": 120000,
+    "daily_cost_cap_usd": 4
+  },
+  {
+    "id": "durable-builder",
+    "role_id": "backend-data-engineer",
+    "workload_class": "durable-mission",
+    "interaction": "async",
+    "durability": "checkpointed",
+    "approval_waits": true,
+    "code_execution": false,
+    "third_party_connections": false,
+    "local_private_data": false,
+    "always_available": true,
+    "risk": "high",
+    "quality_tier": "frontier",
+    "daily_token_cap": 250000,
+    "daily_cost_cap_usd": 12
+  },
+  {
+    "id": "independent-verifier",
+    "role_id": "qa-release-sre-verifier",
+    "workload_class": "scheduled-intelligence",
+    "interaction": "scheduled",
+    "durability": "run-receipt",
+    "approval_waits": false,
+    "code_execution": false,
+    "third_party_connections": false,
+    "local_private_data": true,
+    "always_available": false,
+    "risk": "medium",
+    "quality_tier": "checker-independent",
+    "daily_token_cap": 80000,
+    "daily_cost_cap_usd": 3
+  }
+]
