@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starlight.local/schemas/starlight.team_runtime_plan.v1.schema.json",
+  "title": "Starlight Team Runtime Plan v1",
+  "$comment": "STRUCTURAL EXPORT ONLY. This schema cannot express all cross-field uniqueness and routing invariants; admission MUST use parseTeamRuntimePlan and authority-owned source verification.",
+  "x-starlight-validation-authority": "export-only-runtime-parser-required",
+  "description": "Dry-run deployment plan compiled from starlight.team_profile.v2. Structural validation is necessary but runtime semantic validation and independent admission remain mandatory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "team_id",
+    "source_profile",
+    "generated_at",
+    "activation_status",
+    "authority",
+    "routing_policy",
+    "human_gate_actions",
+    "budget",
+    "lanes"
+  ],
+  "properties": {
+    "schema_version": { "const": "starlight.team_runtime_plan.v1" },
+    "team_id": { "$ref": "#/$defs/id" },
+    "source_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "version", "review_date", "sha256", "repository", "commit_sha", "path"],
+      "properties": {
+        "schema_version": { "const": "starlight.team_profile.v2" },
+        "version": { "type": "string", "minLength": 1 },
+        "review_date": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "repository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+        "commit_sha": { "type": "string", "pattern": "^(?!0{40}$)[a-f0-9]{40}$" },
+        "path": { "type": "string", "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$" }
+      }
+    },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "activation_status": { "const": "planned-human-approval-required" },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mission", "model_policy", "observability", "integration", "operator"],
+      "properties": {
+        "mission": { "const": "railway-temporal" },
+        "model_policy": { "const": "queen-model-policy" },
+        "observability": { "const": "langfuse" },
+        "integration": { "const": "n8n" },
+        "operator": { "const": "hermes" }
+      }
+    },
+    "routing_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "policy_digest_sha256", "eve_allowlisted_workload_ids", "allowed_runtimes"],
+      "properties": {
+        "policy_id": { "$ref": "#/$defs/id" },
+        "policy_digest_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "eve_allowlisted_workload_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        },
+        "allowed_runtimes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": ["railway-temporal", "vercel-eve", "hermes-local", "n8n-integration"]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "human_gate_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "max_daily_cost_usd", "planned_daily_cost_usd"],
+      "properties": {
+        "policy_id": { "$ref": "#/$defs/id" },
+        "max_daily_cost_usd": { "type": "number", "exclusiveMinimum": 0 },
+        "planned_daily_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "lanes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 5,
+      "contains": {
+        "type": "object",
+        "required": ["independent_verifier"],
+        "properties": { "independent_verifier": { "const": true } }
+      },
+      "minContains": 1,
+      "maxContains": 1,
+      "items": { "$ref": "#/$defs/lane" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "uniqueStrings": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "workloadContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workload_class",
+        "interaction",
+        "durability",
+        "approval_waits",
+        "code_execution",
+        "third_party_connections",
+        "local_private_data",
+        "risk"
+      ],
+      "properties": {
+        "workload_class": {
+          "enum": [
+            "durable-mission",
+            "interactive-specialist",
+            "scheduled-intelligence",
+            "integration-automation",
+            "edge-session"
+          ]
+        },
+        "interaction": { "enum": ["async", "realtime", "scheduled", "event-driven"] },
+        "durability": { "enum": ["ephemeral", "session", "run-receipt", "checkpointed"] },
+        "approval_waits": { "type": "boolean" },
+        "code_execution": { "type": "boolean" },
+        "third_party_connections": { "type": "boolean" },
+        "local_private_data": { "type": "boolean" },
+        "risk": { "enum": ["low", "medium", "high"] }
+      }
+    },
+    "lane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role_id",
+        "workload_contract",
+        "runtime",
+        "mission_authority",
+        "provider_route",
+        "model_route",
+        "budget",
+        "mode",
+        "independent_verifier",
+        "reason_codes",
+        "warnings"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "role_id": { "$ref": "#/$defs/id" },
+        "workload_contract": { "$ref": "#/$defs/workloadContract" },
+        "runtime": {
+          "enum": ["railway-temporal", "vercel-eve", "hermes-local", "n8n-integration"]
+        },
+        "mission_authority": { "const": "railway-temporal" },
+        "provider_route": {
+          "enum": ["direct-provider", "vercel-ai-gateway", "hermes-profile", "none"]
+        },
+        "model_route": {
+          "enum": ["economy", "balanced", "frontier", "checker-independent"]
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["daily_token_cap", "daily_cost_cap_usd"],
+          "properties": {
+            "daily_token_cap": { "type": "integer", "minimum": 1 },
+            "daily_cost_cap_usd": { "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "mode": { "const": "dry-run" },
+        "independent_verifier": { "type": "boolean" },
+        "reason_codes": {
+          "allOf": [{ "$ref": "#/$defs/uniqueStrings" }, { "minItems": 1 }]
+        },
+        "warnings": { "$ref": "#/$defs/uniqueStrings" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "runtime": { "const": "railway-temporal" } }, "required": ["runtime"] },
+          "then": { "properties": { "provider_route": { "const": "direct-provider" } } }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "hermes-local" } }, "required": ["runtime"] },
+          "then": { "properties": { "provider_route": { "const": "hermes-profile" } } }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "n8n-integration" } }, "required": ["runtime"] },
+          "then": {
+            "properties": {
+              "provider_route": { "const": "none" },
+              "workload_contract": {
+                "allOf": [
+                  { "$ref": "#/$defs/workloadContract" },
+                  { "properties": { "workload_class": { "const": "integration-automation" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "vercel-eve" } }, "required": ["runtime"] },
+          "then": {
+            "properties": {
+              "provider_route": { "const": "vercel-ai-gateway" },
+              "independent_verifier": { "const": false },
+              "workload_contract": {
+                "allOf": [
+                  { "$ref": "#/$defs/workloadContract" },
+                  {
+                    "properties": {
+                      "risk": { "const": "low" },
+                      "code_execution": { "const": false },
+                      "local_private_data": { "const": false },
+                      "approval_waits": { "const": false },
+                      "durability": { "enum": ["ephemeral", "session", "run-receipt"] }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "independent_verifier": { "const": true } }, "required": ["independent_verifier"] },
+          "then": { "properties": { "model_route": { "const": "checker-independent" } } },
+          "else": {
+            "properties": { "model_route": { "enum": ["economy", "balanced", "frontier"] } }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "schema_version": "starlight.team_pack.v1",
+  "compiler_version": "starlight.team_pack.compiler.v2",
+  "team_id": "starlight-platform-team",
+  "team_profile_version": "2.0.1",
+  "generated_at": "2026-08-09T04:28:06.000Z",
+  "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
+  "source_profile_repository": "frankxai/starlight-agent-config",
+  "source_profile_commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+  "source_profile_path": "core/teams/starlight-platform-team.team-profile.json",
+  "runtime_policy_id": "queen-runtime-policy-v1",
+  "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
+  "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
+  "activation_status": "planned-human-approval-required",
+  "files": [
+    {
+      "path": "CAPABILITIES.md",
+      "sha256": "5748485035724cf145f09ce455cf4e4ddfa9877add41c17103c59093e84974fa",
+      "bytes": 1260
+    },
+    {
+      "path": "GUARDRAILS.md",
+      "sha256": "4a526e7a6301916e8d9fc344eecd07057849e327f520a2f699f43a3c37d03803",
+      "bytes": 2134
+    },
+    {
+      "path": "ICP-AGENT.md",
+      "sha256": "08bf49cdfbe5d66215acaad33a2c6f8a8d20156bc81eb1b5fc0b287b250b31e2",
+      "bytes": 1087
+    },
+    {
+      "path": "MEMORY.md",
+      "sha256": "84ed4ec673eaf83b2d461e89059095c2b0bba1f85ce2edf9a2d01e971a212762",
+      "bytes": 937
+    },
+    {
+      "path": "MODEL-ROUTING.md",
+      "sha256": "1035a55d2d1a3230dead7c8dc9e4d4250f01ebbf529ba6e463512659905a2685",
+      "bytes": 1448
+    },
+    {
+      "path": "QUALITY.md",
+      "sha256": "60499cc31976adc9d51cd93fb70db5bbfab8fc59b42324494b2ba559ab000176",
+      "bytes": 1360
+    },
+    {
+      "path": "README.md",
+      "sha256": "8610174bced39208cfa331b31ea9ddba59154aeca1aead81d9a338c84c1f0c50",
+      "bytes": 359
+    },
+    {
+      "path": "roles/backend-data-engineer.md",
+      "sha256": "35514ab7c5a074de635f0a863c0c683dc5ca3be64260afd4b917728dd100c7a9",
+      "bytes": 1900
+    },
+    {
+      "path": "roles/coordinator.md",
+      "sha256": "e98fbe785c70b70ebf052269d0bbd89222c38d89d89514b584a660bc2f74bb50",
+      "bytes": 1992
+    },
+    {
+      "path": "roles/qa-release-sre-verifier.md",
+      "sha256": "a14610a088d33c28375d6daeb142ae6671ac0fdf4748f669e6fa8b27b876eba4",
+      "bytes": 1991
+    },
+    {
+      "path": "RUNTIME-POLICY.json",
+      "sha256": "3a02eb2aa3038e731010716eb8fbbfa0b8dcdc82ad2c5705f7386f8e6a66c651",
+      "bytes": 711
+    },
+    {
+      "path": "SYSTEM.md",
+      "sha256": "1cdbfb5db71823579b3bd06ca25cdaca4c02caf44801cc2b8fada823453f400b",
+      "bytes": 1548
+    },
+    {
+      "path": "TASTE.md",
+      "sha256": "52ccaee8313ad37a7164ff59b80bb69305a3488642e2ccf77d19bb8dd9c7f85b",
+      "bytes": 963
+    },
+    {
+      "path": "WORKFLOWS.md",
+      "sha256": "4d5947f79f931d8688ecaa93b18c94990701d72a8a779232abfb4ea998cbfd5f",
+      "bytes": 1663
+    }
+  ],
+  "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2"
+}

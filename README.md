@@ -79,6 +79,65 @@ This hardens the model; it does **not** make the swarm autonomously act.
 
 ---
 
+## Governed team runtime planner
+
+The dry-run team planner compiles existing `starlight.team_profile.v2` definitions into
+bounded runtime plans across Railway Temporal, Vercel Eve, local Hermes, n8n, and the
+deferred Cloudflare edge route. Plans include independent verification, provider routing,
+token/cost ceilings, human gates, and a separate fail-closed admission assessment. The CLI
+is report-only: it cannot admit a plan because it has no trusted approval/budget verifier.
+
+```bash
+npm run runtime:plan -- \
+  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/examples/starlight-platform-pilot.workloads.json \
+  runtime/policies/starlight-platform-pilot.runtime-policy.json \
+  --output runtime/generated/starlight-platform-pilot.plan.json \
+  --force
+
+npm run runtime:assess -- \
+  runtime/generated/starlight-platform-pilot.plan.json \
+  runtime/generated/starlight-platform-pilot.evidence.json \
+  --output runtime/generated/starlight-platform-pilot.assessment.json \
+  --force
+
+npm run runtime:pack -- \
+  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/generated/starlight-platform-pilot.plan.json \
+  runtime/policies/starlight-platform-pilot.runtime-policy.json
+
+npm run runtime:pack:verify -- \
+  runtime/generated/packs/<content-addressed-pack-directory> \
+  runtime/generated/starlight-platform-pilot.plan.json \
+  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/policies/starlight-platform-pilot.runtime-policy.json
+
+npm run runtime:prepare -- \
+  runtime/generated/packs/<content-addressed-pack-directory> \
+  runtime/generated/starlight-platform-pilot.plan.json \
+  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/policies/starlight-platform-pilot.runtime-policy.json \
+  --output runtime/generated/starlight-platform-pilot.prepared-runtime.json \
+  --force
+```
+
+See [`docs/TEAM-RUNTIME-ADR-2026-08-06.md`](docs/TEAM-RUNTIME-ADR-2026-08-06.md) for the
+evidence-backed runtime matrix, team-pack contract, three-lane proof, admission blockers,
+and scale path. The pack compiler emits content-addressed `SYSTEM.md`, `WORKFLOWS.md`,
+`QUALITY.md`, `GUARDRAILS.md`, `TASTE.md`, memory, capability, economics, synthetic-ICP,
+and role-prompt contracts with a hash manifest plus the exact Queen-owned runtime-policy
+snapshot. Verification requires the canonical profile, plan, and policy sources and rejects
+tampering, source drift, undeclared files, and symlinks. `runtime:prepare` emits bounded,
+non-activating runtime descriptors with leases, heartbeat timeouts, kill-switch names, and
+runtime-specific targets. Preparation accepts only a frozen verification result issued by the
+in-process pack verifier. Its strict runtime parser rejects adapter-shape confusion, duplicate
+identities, and source/digest drift; the checked-in JSON Schemas are structural export aids, not
+admission authority. Remote health probing is disabled until a server-owned endpoint registry
+and DNS pinning exist; the Phase-0 probe accepts only loopback HTTP(S) on exact `/health`.
+These commands do not deploy or activate workers.
+
+---
+
 <a id="the-model"></a>
 
 ## 🧬 The model: hybrid queens-per-stream

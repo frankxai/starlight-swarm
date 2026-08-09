@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://starlight.local/schemas/starlight.prepared_runtime_bundle.v1.schema.json",
+  "title": "Starlight Prepared Runtime Bundle v1",
+  "$comment": "STRUCTURAL EXPORT ONLY. This schema is not admission authority; consumers MUST also run the canonical runtime parser and deterministic plan/issued-pack verification.",
+  "x-starlight-validation-authority": "export-only-runtime-parser-required",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "team_id",
+    "generated_at",
+    "status",
+    "plan_digest_sha256",
+    "source_profile_digest_sha256",
+    "source_runtime_policy_digest_sha256",
+    "pack_digest_sha256",
+    "lanes",
+    "blockers"
+  ],
+  "properties": {
+    "schema_version": { "const": "starlight.prepared_runtime_bundle.v1" },
+    "team_id": { "$ref": "#/$defs/id" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "status": { "const": "prepared-human-approval-required" },
+    "plan_digest_sha256": { "$ref": "#/$defs/digest" },
+    "source_profile_digest_sha256": { "$ref": "#/$defs/digest" },
+    "source_runtime_policy_digest_sha256": { "$ref": "#/$defs/digest" },
+    "pack_digest_sha256": { "$ref": "#/$defs/digest" },
+    "lanes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/lane" }
+    },
+    "blockers": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "lane": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "deployment_id",
+        "team_id",
+        "lane_id",
+        "role_id",
+        "runtime",
+        "status",
+        "plan_digest_sha256",
+        "pack_digest_sha256",
+        "runtime_policy_digest_sha256",
+        "max_concurrency",
+        "lease_ttl_seconds",
+        "heartbeat_timeout_seconds",
+        "kill_switch",
+        "activation_authority",
+        "required_secret_names",
+        "runtime_config"
+      ],
+      "properties": {
+        "schema_version": { "const": "starlight.prepared_runtime_lane.v1" },
+        "deployment_id": { "$ref": "#/$defs/id" },
+        "team_id": { "$ref": "#/$defs/id" },
+        "lane_id": { "$ref": "#/$defs/id" },
+        "role_id": { "$ref": "#/$defs/id" },
+        "runtime": {
+          "enum": ["railway-temporal", "vercel-eve", "hermes-local", "n8n-integration"]
+        },
+        "status": { "const": "prepared-human-approval-required" },
+        "plan_digest_sha256": { "$ref": "#/$defs/digest" },
+        "pack_digest_sha256": { "$ref": "#/$defs/digest" },
+        "runtime_policy_digest_sha256": { "$ref": "#/$defs/digest" },
+        "max_concurrency": { "const": 1 },
+        "lease_ttl_seconds": { "const": 900 },
+        "heartbeat_timeout_seconds": { "const": 120 },
+        "kill_switch": { "type": "string", "pattern": "^STARLIGHT_KILL_[A-Z0-9_]+$" },
+        "activation_authority": { "const": "trusted-server-internal-authority-not-implemented" },
+        "required_secret_names": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" }
+        },
+        "runtime_config": {
+          "oneOf": [
+            { "$ref": "#/$defs/railwayTemporalConfig" },
+            { "$ref": "#/$defs/vercelEveConfig" },
+            { "$ref": "#/$defs/hermesLocalConfig" },
+            { "$ref": "#/$defs/n8nIntegrationConfig" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "runtime": { "const": "railway-temporal" } }, "required": ["runtime"] },
+          "then": { "properties": { "runtime_config": { "$ref": "#/$defs/railwayTemporalConfig" } } }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "vercel-eve" } }, "required": ["runtime"] },
+          "then": { "properties": { "runtime_config": { "$ref": "#/$defs/vercelEveConfig" } } }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "hermes-local" } }, "required": ["runtime"] },
+          "then": { "properties": { "runtime_config": { "$ref": "#/$defs/hermesLocalConfig" } } }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "n8n-integration" } }, "required": ["runtime"] },
+          "then": { "properties": { "runtime_config": { "$ref": "#/$defs/n8nIntegrationConfig" } } }
+        }
+      ]
+    },
+    "railwayTemporalConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "deployment_target", "task_queue", "workflow_id_prefix", "canonical_state"],
+      "properties": {
+        "kind": { "const": "railway-temporal" },
+        "deployment_target": { "const": "existing-railway-service" },
+        "task_queue": { "type": "string", "minLength": 1 },
+        "workflow_id_prefix": { "type": "string", "minLength": 1 },
+        "canonical_state": { "const": "sis-postgres" }
+      }
+    },
+    "vercelEveConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "deployment_target", "workflow_route", "tool_grants", "write_scopes", "canonical_state"],
+      "properties": {
+        "kind": { "const": "vercel-eve" },
+        "deployment_target": { "const": "existing-vercel-project" },
+        "workflow_route": { "const": "/api/eve" },
+        "tool_grants": { "type": "array", "maxItems": 0 },
+        "write_scopes": { "type": "array", "maxItems": 0 },
+        "canonical_state": { "const": "read-only-projection" }
+      }
+    },
+    "hermesLocalConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "deployment_target", "profile", "canonical_state"],
+      "properties": {
+        "kind": { "const": "hermes-local" },
+        "deployment_target": { "const": "isolated-hermes-profile" },
+        "profile": { "const": "starlight-team-worker" },
+        "canonical_state": { "const": "sis-postgres" }
+      }
+    },
+    "n8nIntegrationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "deployment_target", "workflow_tag", "canonical_state"],
+      "properties": {
+        "kind": { "const": "n8n-integration" },
+        "deployment_target": { "const": "existing-n8n-service" },
+        "workflow_tag": { "type": "string", "minLength": 1 },
+        "canonical_state": { "const": "event-connector-only" }
+      }
+    }
+  }
+}

@@ -9,7 +9,12 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
     "swarm:dry-run": "tsx src/swarm/index.ts",
-    "hand:pilot": "tsx src/swarm/pilot-cli.ts"
+    "hand:pilot": "tsx src/swarm/pilot-cli.ts",
+    "runtime:plan": "tsx scripts/plan-team-runtime.ts",
+    "runtime:assess": "tsx scripts/assess-team-runtime.ts",
+    "runtime:pack": "tsx scripts/compile-team-pack.ts",
+    "runtime:pack:verify": "tsx scripts/verify-team-pack.ts",
+    "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts"
   },
   "dependencies": {
     "next": "^14.2.3",
