@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
 
 import { verifyTeamPackDirectory } from '../src/swarm/team-pack-verifier';
+import { assertGitJsonSourceProvenance } from '../src/swarm/runtime-provenance';
+import { parseRuntimePlanningPolicy } from '../src/swarm/runtime-policy';
 
 const requestedPath = process.argv[2];
 const planPath = process.argv[3];
@@ -36,6 +38,11 @@ const readJson = (path: string): unknown =>
 const plan = readJson(planPath);
 const profile = readJson(profilePath);
 const runtimePolicy = readJson(runtimePolicyPath);
+const parsedRuntimePolicy = parseRuntimePlanningPolicy(runtimePolicy);
+assertGitJsonSourceProvenance(
+  resolve(repositoryRoot, profilePath),
+  parsedRuntimePolicy.source.team_profile_source,
+);
 
 process.stdout.write(
   `${JSON.stringify({

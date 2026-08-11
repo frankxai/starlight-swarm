@@ -5,6 +5,7 @@ import { parseWorkloadRequirements } from '../src/swarm/runtime-input';
 import { resolveGeneratedOutput } from '../src/swarm/runtime-output';
 import { planTeamRuntime } from '../src/swarm/runtime-planner';
 import { parseRuntimePlanningPolicy } from '../src/swarm/runtime-policy';
+import { assertGitJsonSourceProvenance } from '../src/swarm/runtime-provenance';
 
 interface Arguments {
   teamPath: string;
@@ -68,6 +69,7 @@ function main(): void {
   const team = readJson(args.teamPath);
   const workloads = parseWorkloadRequirements(readJson(args.workloadsPath));
   const policy = parseRuntimePlanningPolicy(readJson(args.policyPath));
+  assertGitJsonSourceProvenance(args.teamPath, policy.source.team_profile_source);
   const plan = planTeamRuntime(team, workloads, args.generatedAt, {
     max_daily_cost_usd: policy.source.max_daily_cost_usd,
     policy_id: policy.source.budget_policy_id,

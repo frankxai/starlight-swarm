@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   assessTeamRuntimeAdmission,
   computePlanDigest,
+  parseRuntimeAdmissionEvidence,
   type RuntimeAdmissionEvidence,
 } from './runtime-admission';
 import { parseTeamRuntimePlan } from './runtime-plan-contract';
@@ -108,4 +109,13 @@ test('receipts must bind the exact verified profile, plan, pack, and compiler tu
 
   assert.equal(result.admitted, false);
   assert.match(result.blockers.join(' '), /pack digest/i);
+});
+
+test('admission evidence rejects unknown runtime health keys', () => {
+  const malformed = evidence();
+  (malformed.runtime_health as Record<string, string>).railwayTemporal = 'ready';
+  assert.throws(
+    () => parseRuntimeAdmissionEvidence(malformed),
+    /runtime_health[\s\S]*(?:unrecognized|invalid)/i,
+  );
 });

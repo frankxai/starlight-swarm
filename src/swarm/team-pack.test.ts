@@ -8,6 +8,7 @@ import {
   testWorkloads,
 } from './runtime-test-fixtures';
 import { planTeamRuntime } from './runtime-planner';
+import { compareCodeUnits } from './runtime-digest';
 import { compileTeamPack } from './team-pack';
 
 const team = testTeamProfile;
@@ -25,6 +26,8 @@ test('compiles a deterministic batteries-included team pack from a governed prof
   assert.equal(pack.manifest.source_profile_path, policy.team_profile_source.path);
   assert.match(pack.manifest.plan_digest_sha256, /^[a-f0-9]{64}$/);
   assert.equal(pack.manifest.files.length, Object.keys(pack.files).length);
+  const manifestPaths = pack.manifest.files.map((file) => file.path);
+  assert.deepEqual(manifestPaths, [...manifestPaths].sort(compareCodeUnits));
 
   for (const required of [
     'README.md',
@@ -116,6 +119,8 @@ test('verifier prompts withhold mutation-capable profile tool requests', () => {
   const pack = compileTeamPack(governedTeam, governedPlan, policy);
   const verifier = pack.files['roles/qa-release-sre-verifier.md'];
   assert.match(verifier, /## Requested tools[\s\S]*- "read"[\s\S]*- "search"[\s\S]*## Write scopes/i);
+  assert.match(verifier, /## Write scopes\s+\n- None declared\./i);
+  assert.doesNotMatch(verifier, /## Write scopes[\s\S]*- "receipts"[\s\S]*Writing outside/i);
   for (const withheld of ['git', 'playwright', 'sentry', 'vercel']) {
     assert.match(verifier, new RegExp(`withheld verifier tool requests[\\s\\S]*"${withheld}"`, 'i'));
     assert.doesNotMatch(

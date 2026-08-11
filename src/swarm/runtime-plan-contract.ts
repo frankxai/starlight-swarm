@@ -209,6 +209,7 @@ const teamRuntimePlanSchema = z
         if (
           contract.risk !== 'low' ||
           contract.code_execution ||
+          contract.third_party_connections ||
           contract.local_private_data ||
           contract.approval_waits ||
           !['ephemeral', 'session', 'run-receipt'].includes(contract.durability)

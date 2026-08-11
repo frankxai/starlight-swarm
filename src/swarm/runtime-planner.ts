@@ -188,6 +188,7 @@ export interface TeamRuntimePlan {
 
 const idSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/:*-]*$/);
 const scopeSchema = z.string().regex(/^[A-Za-z0-9.][A-Za-z0-9._\/*:-]*$/);
+const generatedAtSchema = z.iso.datetime({ offset: true });
 const profileTextSchema = z
   .string()
   .trim()
@@ -321,9 +322,7 @@ export function recommendRuntime(
   if (
     workload.risk === 'high' ||
     workload.code_execution ||
-    (workload.third_party_connections &&
-      workload.workload_class !== 'integration-automation' &&
-      !eveAllowlisted)
+    (workload.third_party_connections && workload.workload_class !== 'integration-automation')
   ) {
     return {
       ...base,
@@ -368,6 +367,8 @@ export function recommendRuntime(
 
   if (
     (workload.workload_class === 'interactive-specialist' || workload.interaction === 'realtime') &&
+    workload.risk === 'low' &&
+    !workload.third_party_connections &&
     !workload.local_private_data &&
     eveAllowlisted
   ) {
@@ -420,6 +421,10 @@ export function planTeamRuntime(
 ): TeamRuntimePlan {
   const team = parseTeamProfile(input);
   const routingPolicy = limits.routing_policy ?? embeddedRoutingPolicy;
+  const generatedAtResult = generatedAtSchema.safeParse(generatedAt);
+  if (!generatedAtResult.success) {
+    throw new Error('Generated timestamp must be a valid ISO datetime with an explicit timezone.');
+  }
 
   if (workloads.length < 3 || workloads.length > 5) {
     throw new Error('A team runtime plan requires three to five workload lanes.');
@@ -483,7 +488,7 @@ export function planTeamRuntime(
       commit_sha: profileSource.commit_sha,
       path: profileSource.path,
     },
-    generated_at: generatedAt,
+    generated_at: generatedAtResult.data,
     activation_status: 'planned-human-approval-required',
     authority: {
       mission: 'railway-temporal',

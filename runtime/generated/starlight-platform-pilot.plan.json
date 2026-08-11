@@ -3,14 +3,14 @@
   "team_id": "starlight-platform-team",
   "source_profile": {
     "schema_version": "starlight.team_profile.v2",
-    "version": "2.0.1",
-    "review_date": "2026-08-09",
-    "sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
+    "version": "2.0.0",
+    "review_date": "2026-08-10",
+    "sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
     "repository": "frankxai/starlight-agent-config",
-    "commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+    "commit_sha": "b12e904a89747434d77b7ddc29e17de3c29f708d",
     "path": "core/teams/starlight-platform-team.team-profile.json"
   },
-  "generated_at": "2026-08-09T04:28:06.000Z",
+  "generated_at": "2026-08-10T00:08:50.000Z",
   "activation_status": "planned-human-approval-required",
   "authority": {
     "mission": "railway-temporal",
@@ -21,7 +21,7 @@
   },
   "routing_policy": {
     "policy_id": "queen-runtime-policy-v1",
-    "policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
+    "policy_digest_sha256": "8e77d7e6d0e3f2923fe6593555f52213ef33cea266953e98e5e50d3fce570eec",
     "eve_allowlisted_workload_ids": [
       "operator-intelligence"
     ],
@@ -64,9 +64,9 @@
         "local_private_data": false,
         "risk": "low"
       },
-      "runtime": "vercel-eve",
+      "runtime": "railway-temporal",
       "mission_authority": "railway-temporal",
-      "provider_route": "vercel-ai-gateway",
+      "provider_route": "direct-provider",
       "model_route": "balanced",
       "budget": {
         "daily_token_cap": 120000,
@@ -75,10 +75,10 @@
       "mode": "dry-run",
       "independent_verifier": false,
       "reason_codes": [
-        "interactive-agent-surface"
+        "sensitive-capability-requires-durable-gated-runtime"
       ],
       "warnings": [
-        "Vercel Eve is beta; consequential state and approvals remain in Railway Temporal."
+        "Sensitive capabilities require explicit Queen and human-gated grants."
       ]
     },
     {

@@ -135,7 +135,7 @@ test('recommends Vercel Eve for an interactive low-risk specialist while keeping
       interaction: 'realtime',
       durability: 'session',
       approval_waits: false,
-      third_party_connections: true,
+      third_party_connections: false,
       risk: 'low',
       quality_tier: 'balanced',
     }),
@@ -181,7 +181,7 @@ test('compiles a three-lane pilot with stable authority, model, budget, and huma
         interaction: 'realtime',
         durability: 'session',
         approval_waits: false,
-        third_party_connections: true,
+        third_party_connections: false,
         risk: 'low',
         quality_tier: 'balanced',
         daily_token_cap: 120_000,
@@ -264,5 +264,27 @@ test('rejects plans that omit a required team role or exceed its daily budget', 
         { max_daily_cost_usd: 100 },
       ),
     /daily cost cap.*150.*team limit.*100/i,
+  );
+});
+
+test('planner rejects a generated timestamp without an explicit timezone', () => {
+  const lanes = [
+    workload({ id: 'coordinator', role_id: 'coordinator', daily_cost_cap_usd: 1 }),
+    workload({ id: 'maker', role_id: 'backend-data-engineer', daily_cost_cap_usd: 1 }),
+    workload({
+      id: 'verifier',
+      role_id: 'qa-release-sre-verifier',
+      quality_tier: 'checker-independent',
+      daily_cost_cap_usd: 1,
+    }),
+  ];
+
+  assert.throws(
+    () =>
+      planTeamRuntime(platformTeam(), lanes, '2026-08-06T02:30:00', {
+        max_daily_cost_usd: 25,
+        source_profile: profileSource,
+      }),
+    /generated.*timestamp|invalid.*datetime/i,
   );
 });
