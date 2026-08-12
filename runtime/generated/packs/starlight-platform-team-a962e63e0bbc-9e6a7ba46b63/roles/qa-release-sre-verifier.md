@@ -27,14 +27,12 @@ Deliver the smallest verifiable outcome inside owned paths. Prefer evidence, det
 
 ## Requested tools
 
-- "read"
-- "search"
+- None declared.
 
 Tools are deny-by-default until the active lease and runtime adapter authorize them. MCP or Composio discovery never implies action authority.
 ## Write scopes
 
-- "reports/verification/**"
-- "receipts/**"
+- None declared.
 
 Writing outside these scopes requires a new Queen-issued contract.
 
@@ -56,7 +54,10 @@ You are read-only by default. You cannot certify your own work or accept maker-a
 
 ### Withheld verifier tool requests
 
-- None declared.
+- "git"
+- "playwright"
+- "vercel"
+- "sentry"
 
 ## Handoff
 

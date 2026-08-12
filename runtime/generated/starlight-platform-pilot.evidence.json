@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-08-09T04:28:06.000Z",
+  "observed_at": "2026-08-10T00:08:50.000Z",
   "duplicate_lane_ids": [],
   "available_memory_gib": 9.85,
   "runtime_health": {
@@ -10,33 +10,33 @@
   "verified_pack": {
     "status": "verified-human-approval-required",
     "team_id": "starlight-platform-team",
-    "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
-    "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
-    "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
-    "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2",
+    "plan_digest_sha256": "a962e63e0bbc76a844938dedba8f02fcccef28c1d4ca96336dd4e65e90eb53dc",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "8e77d7e6d0e3f2923fe6593555f52213ef33cea266953e98e5e50d3fce570eec",
+    "pack_digest_sha256": "9e6a7ba46b63f2637190d64a03f2ad02c6fa1027d8aca0fa9ae3959bffb53dbf",
     "compiler_version": "starlight.team_pack.compiler.v2"
   },
   "approval_receipt": {
     "receipt_id": "untrusted-example-approval",
     "issuer": "untrusted-example-only",
-    "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
-    "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
-    "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
-    "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2",
+    "plan_digest_sha256": "a962e63e0bbc76a844938dedba8f02fcccef28c1d4ca96336dd4e65e90eb53dc",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "8e77d7e6d0e3f2923fe6593555f52213ef33cea266953e98e5e50d3fce570eec",
+    "pack_digest_sha256": "9e6a7ba46b63f2637190d64a03f2ad02c6fa1027d8aca0fa9ae3959bffb53dbf",
     "compiler_version": "starlight.team_pack.compiler.v2",
-    "expires_at": "2026-08-09T05:28:06.000Z",
+    "expires_at": "2026-08-10T01:08:50.000Z",
     "scope": "activate-team-runtime"
   },
   "budget_receipt": {
     "receipt_id": "untrusted-example-budget",
     "issuer": "untrusted-example-only",
-    "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
-    "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
-    "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
-    "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2",
+    "plan_digest_sha256": "a962e63e0bbc76a844938dedba8f02fcccef28c1d4ca96336dd4e65e90eb53dc",
+    "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+    "source_runtime_policy_digest_sha256": "8e77d7e6d0e3f2923fe6593555f52213ef33cea266953e98e5e50d3fce570eec",
+    "pack_digest_sha256": "9e6a7ba46b63f2637190d64a03f2ad02c6fa1027d8aca0fa9ae3959bffb53dbf",
     "compiler_version": "starlight.team_pack.compiler.v2",
     "budget_policy_id": "starlight-platform-pilot-budget-v1",
     "hard_daily_limit_usd": 25,
-    "expires_at": "2026-08-09T05:28:06.000Z"
+    "expires_at": "2026-08-10T01:08:50.000Z"
   }
 }

@@ -68,8 +68,8 @@ const evidenceSchema = z
     observed_at: z.iso.datetime({ offset: true }),
     duplicate_lane_ids: z.array(z.string().min(1)),
     available_memory_gib: z.number().nonnegative().finite(),
-    runtime_health: z.record(
-      z.string(),
+    runtime_health: z.partialRecord(
+      z.enum(runtimeIds),
       z.enum(['ready', 'degraded', 'offline', 'unknown']),
     ),
     verified_pack: z

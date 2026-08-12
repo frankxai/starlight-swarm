@@ -134,6 +134,10 @@ in-process pack verifier. Its strict runtime parser rejects adapter-shape confus
 identities, and source/digest drift; the checked-in JSON Schemas are structural export aids, not
 admission authority. Remote health probing is disabled until a server-owned endpoint registry
 and DNS pinning exist; the Phase-0 probe accepts only loopback HTTP(S) on exact `/health`.
+All profile-consuming runtime CLIs also verify the declared GitHub origin, repository-relative
+path, canonical JSON content, and that the declared commit is reachable from a fetched `origin`
+ref before planning, compiling, verifying, or preparing. Working-tree profile drift and
+unpublished or dangling commits fail closed instead of being mislabeled as governed provenance.
 These commands do not deploy or activate workers.
 
 ---

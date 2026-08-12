@@ -2,15 +2,15 @@
   "schema_version": "starlight.team_pack.v1",
   "compiler_version": "starlight.team_pack.compiler.v2",
   "team_id": "starlight-platform-team",
-  "team_profile_version": "2.0.1",
-  "generated_at": "2026-08-09T04:28:06.000Z",
-  "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
+  "team_profile_version": "2.0.0",
+  "generated_at": "2026-08-10T00:08:50.000Z",
+  "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
   "source_profile_repository": "frankxai/starlight-agent-config",
-  "source_profile_commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+  "source_profile_commit_sha": "b12e904a89747434d77b7ddc29e17de3c29f708d",
   "source_profile_path": "core/teams/starlight-platform-team.team-profile.json",
   "runtime_policy_id": "queen-runtime-policy-v1",
-  "source_runtime_policy_digest_sha256": "ca503253bc6cdeeabb81ea8cb5161cf3af4d427f961e1e46bfe85a3a8857042d",
-  "plan_digest_sha256": "2a569e7ba6a6df97fac9e998bf1739a2e123b29f33a9a700a8f8d9bd4f3eeacd",
+  "source_runtime_policy_digest_sha256": "8e77d7e6d0e3f2923fe6593555f52213ef33cea266953e98e5e50d3fce570eec",
+  "plan_digest_sha256": "a962e63e0bbc76a844938dedba8f02fcccef28c1d4ca96336dd4e65e90eb53dc",
   "activation_status": "planned-human-approval-required",
   "files": [
     {
@@ -35,8 +35,8 @@
     },
     {
       "path": "MODEL-ROUTING.md",
-      "sha256": "1035a55d2d1a3230dead7c8dc9e4d4250f01ebbf529ba6e463512659905a2685",
-      "bytes": 1448
+      "sha256": "9a01e52490eee8bb0ae1b2e0e26d855a342bcf58934857857c6015b07fc006b3",
+      "bytes": 1452
     },
     {
       "path": "QUALITY.md",
@@ -45,27 +45,12 @@
     },
     {
       "path": "README.md",
-      "sha256": "8610174bced39208cfa331b31ea9ddba59154aeca1aead81d9a338c84c1f0c50",
+      "sha256": "46f8765b7caab70e8ec1b2bec25444d72c80931315e4a5a9bc11b5a4f871e40d",
       "bytes": 359
     },
     {
-      "path": "roles/backend-data-engineer.md",
-      "sha256": "35514ab7c5a074de635f0a863c0c683dc5ca3be64260afd4b917728dd100c7a9",
-      "bytes": 1900
-    },
-    {
-      "path": "roles/coordinator.md",
-      "sha256": "e98fbe785c70b70ebf052269d0bbd89222c38d89d89514b584a660bc2f74bb50",
-      "bytes": 1992
-    },
-    {
-      "path": "roles/qa-release-sre-verifier.md",
-      "sha256": "a14610a088d33c28375d6daeb142ae6671ac0fdf4748f669e6fa8b27b876eba4",
-      "bytes": 1991
-    },
-    {
       "path": "RUNTIME-POLICY.json",
-      "sha256": "3a02eb2aa3038e731010716eb8fbbfa0b8dcdc82ad2c5705f7386f8e6a66c651",
+      "sha256": "64b1c38df571a53a7ac829b04fa422cb01286c33fc70a6fad408a4917302c2fa",
       "bytes": 711
     },
     {
@@ -82,7 +67,22 @@
       "path": "WORKFLOWS.md",
       "sha256": "4d5947f79f931d8688ecaa93b18c94990701d72a8a779232abfb4ea998cbfd5f",
       "bytes": 1663
+    },
+    {
+      "path": "roles/backend-data-engineer.md",
+      "sha256": "35514ab7c5a074de635f0a863c0c683dc5ca3be64260afd4b917728dd100c7a9",
+      "bytes": 1900
+    },
+    {
+      "path": "roles/coordinator.md",
+      "sha256": "e4e616acda728efaec798401bc70fe2981c5ac5beacde062c7899dfcb13616d6",
+      "bytes": 1861
+    },
+    {
+      "path": "roles/qa-release-sre-verifier.md",
+      "sha256": "0bb14265352594b1900ced5fbf87c8288bb879be9e6341ae774d0b3bee217d74",
+      "bytes": 1989
     }
   ],
-  "pack_digest_sha256": "9f7ede4eaa2874be5cfc4952e36ec7ea6b2141119f516898195989479bc178b2"
+  "pack_digest_sha256": "9e6a7ba46b63f2637190d64a03f2ad02c6fa1027d8aca0fa9ae3959bffb53dbf"
 }

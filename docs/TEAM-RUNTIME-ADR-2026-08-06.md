@@ -108,6 +108,13 @@ runtime-policy digests. `runtime:pack:verify` independently receives those three
 sources and rejects tampering, source drift, undeclared files, missing files, byte drift,
 path escape, and symlinks. A verified pack is still not an activation approval.
 
+The planning, pack compilation, pack verification, and runtime-preparation CLIs also verify
+Git provenance before accepting a team profile. The supplied file must resolve inside the
+declared GitHub repository, match the declared repository-relative path, be semantically
+identical JSON to that path at the declared 40-character commit, and prove that commit is
+reachable from a fetched `origin` ref. A working-tree file, dangling commit, or unpublished
+local commit cannot be relabeled as governed provenance merely because its shape still validates.
+
 Pack-verification results are frozen and recorded in a process-local issuance registry before
 `runtime:prepare` accepts them. A caller-created object with identical fields is rejected. This
 removes an accidental object-forging path inside the preparation process; it is not a substitute
@@ -121,7 +128,7 @@ Yogabook is highly available:
 
 | Lane | Mission | Runtime | Permissions |
 |---|---|---|---|
-| Operator intelligence / coordinator | Interactive intake, routing, and bounded decision support | Vercel Eve through Vercel AI Gateway; Temporal remains mission authority | Explicit Eve allowlist; no independent schedule, canonical writes, deployment, send, or approval authority. |
+| Operator intelligence / coordinator | Interactive intake, routing, and bounded decision support with declared third-party connections | Railway worker under Temporal using one direct-provider ingress | Connected work cannot route to Eve even when allowlisted; no independent schedule, canonical writes, deployment, send, or approval authority. |
 | Durable builder | Typed backend/data implementation with checkpoints and approval waits | Railway worker under Temporal using one direct-provider ingress | Owned paths only; production, secrets, migration, spend, and destructive operations remain gated. |
 | Independent verifier | Reproduce tests, security, release, rollback, and evidence checks | Local Hermes pilot under Temporal authority; move to an isolated Railway checker before HA claims | Read/audit by default; cannot certify its own work or mutate the source artifact. |
 
@@ -179,18 +186,17 @@ Initial provider routes:
 
 The current example team ceiling is **$25/day**, with lane caps totaling **$19/day**. These are planner limits, not authorized spend.
 
-## Admission result on 2026-08-09
+## Admission result on 2026-08-10
 
-The planner and assessor were rerun against the governed Starlight platform team, Queen-owned runtime policy, and checked-in workload example. The committed evidence snapshot was observed at `2026-08-09T04:28:06.000Z`.
+The planner and assessor were rerun against the governed Starlight platform team, Queen-owned runtime policy, and checked-in workload example. The committed evidence snapshot was observed at `2026-08-10T00:08:50.000Z`.
 
 **Result:** `admitted: false`
 
 Blockers preserved in `runtime/generated/starlight-platform-pilot.assessment.json`:
 
-1. Vercel Eve runtime health is `unknown`.
-2. Railway Temporal runtime health is `unknown`.
-3. The isolated Hermes runtime health is `unknown`.
-4. Production admission authority is intentionally not implemented; caller-authored receipts remain non-authoritative even when digest-bound.
+1. Railway Temporal runtime health is `unknown`.
+2. The isolated Hermes runtime health is `unknown`.
+3. Production admission authority is intentionally not implemented; caller-authored receipts remain non-authoritative even when digest-bound.
 
 The snapshot records 9.85 GiB of available Yogabook memory. That point-in-time local observation is report-only and does not establish live runtime capacity or activation authority. The dry-run therefore did not mutate Railway or Vercel and did not arm the Hermes lane.
 
@@ -224,12 +230,12 @@ The snapshot records 9.85 GiB of available Yogabook memory. That point-in-time l
 
 ## Verification evidence
 
-The canonical test and release checks were refreshed on 2026-08-09 after compiler-v2,
+The canonical test and release checks were refreshed on 2026-08-11 after compiler-v2,
 profile-provenance, verifier-capability, loopback, and identity hardening:
 
 ```text
 npm test
-153 tests, 153 passed, 0 failed
+159 tests, 159 passed, 0 failed
 
 npm run build
 Next.js production build compiled successfully

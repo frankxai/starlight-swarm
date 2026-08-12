@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { sha256Digest } from '../src/swarm/runtime-digest';
+import { assertGitJsonSourceProvenance } from '../src/swarm/runtime-provenance';
+import { parseRuntimePlanningPolicy } from '../src/swarm/runtime-policy';
 import { compileTeamPack } from '../src/swarm/team-pack';
 import { writeTeamPackAtomically } from '../src/swarm/team-pack-writer';
 
@@ -31,6 +33,11 @@ for (let index = 3; index < args.length; index += 1) {
 const teamInput: unknown = JSON.parse(readFileSync(resolve(teamProfilePath), 'utf8'));
 const planInput: unknown = JSON.parse(readFileSync(resolve(planPath), 'utf8'));
 const runtimePolicyInput: unknown = JSON.parse(readFileSync(resolve(runtimePolicyPath), 'utf8'));
+const runtimePolicy = parseRuntimePlanningPolicy(runtimePolicyInput);
+assertGitJsonSourceProvenance(
+  resolve(teamProfilePath),
+  runtimePolicy.source.team_profile_source,
+);
 const pack = compileTeamPack(teamInput, planInput, runtimePolicyInput);
 const packDigest = sha256Digest({ manifest: pack.manifest, file_digests: pack.file_digests });
 const defaultOutput = `runtime/generated/packs/${pack.manifest.team_id}-${pack.manifest.plan_digest_sha256.slice(0, 12)}-${packDigest.slice(0, 12)}`;

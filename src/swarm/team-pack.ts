@@ -1,5 +1,5 @@
 import { computePlanDigest } from './runtime-admission';
-import { sha256Digest } from './runtime-digest';
+import { compareCodeUnits, sha256Digest } from './runtime-digest';
 import { parseTeamRuntimePlan } from './runtime-plan-contract';
 import { parseRuntimePlanningPolicy } from './runtime-policy';
 import {
@@ -65,7 +65,7 @@ function renderRole(team: TeamProfileInput, lane: TeamRuntimeLane, role: TeamRol
   const withheldTools = lane.independent_verifier
     ? role.tools.filter((tool) => !effectiveVerifierToolAllowlist.has(tool))
     : [];
-  const writeScopes = eveAttenuated ? [] : role.write_scopes;
+  const writeScopes = eveAttenuated || lane.independent_verifier ? [] : role.write_scopes;
   const eveRule = eveAttenuated
     ? '\nVercel Eve receives no tool or write grants from this generated prompt. Any separately approved adapter capability must be verified against the canonical lease and cannot write canonical state.\n'
     : '';
@@ -190,7 +190,7 @@ export function compileTeamPack(
       sha256: fileDigests[path],
       bytes: Buffer.byteLength(content, 'utf8'),
     }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort((left, right) => compareCodeUnits(left.path, right.path));
 
   return {
     manifest: {

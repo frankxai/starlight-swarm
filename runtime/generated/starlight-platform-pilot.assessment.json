@@ -3,12 +3,9 @@
   "approval_receipt_id": null,
   "budget_receipt_id": null,
   "blockers": [
-    "Runtime vercel-eve is unknown; expected ready.",
     "Runtime railway-temporal is unknown; expected ready.",
     "Runtime hermes-local is unknown; expected ready.",
     "Production admission gate is not implemented; this assessor is report-only and caller-authored evidence can never activate workers."
   ],
-  "warnings": [
-    "Vercel Eve remains a beta interaction surface, not canonical mission authority."
-  ]
+  "warnings": []
 }

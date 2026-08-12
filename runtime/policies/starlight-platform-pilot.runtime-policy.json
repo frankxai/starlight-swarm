@@ -5,7 +5,7 @@
   "max_daily_cost_usd": 25,
   "team_profile_source": {
     "repository": "frankxai/starlight-agent-config",
-    "commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+    "commit_sha": "b12e904a89747434d77b7ddc29e17de3c29f708d",
     "path": "core/teams/starlight-platform-team.team-profile.json"
   },
   "eve_allowlisted_workload_ids": [

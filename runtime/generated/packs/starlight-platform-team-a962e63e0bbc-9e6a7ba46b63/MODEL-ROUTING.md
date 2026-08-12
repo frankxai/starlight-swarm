@@ -4,7 +4,7 @@ Queen policy chooses one provider ingress per lane. Do not stack direct provider
 
 | Role | Runtime | Provider ingress | Quality route | Daily tokens | Daily cost |
 |---|---|---|---|---:|---:|
-| coordinator | vercel-eve | vercel-ai-gateway | balanced | 120,000 | $4.00 |
+| coordinator | railway-temporal | direct-provider | balanced | 120,000 | $4.00 |
 | backend-data-engineer | railway-temporal | direct-provider | frontier | 250,000 | $12.00 |
 | qa-release-sre-verifier | hermes-local | hermes-profile | checker-independent | 80,000 | $3.00 |
 

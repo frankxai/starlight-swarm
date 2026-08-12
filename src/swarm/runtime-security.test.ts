@@ -14,6 +14,7 @@ import {
   type TeamProfileInput,
   type WorkloadRequirement,
 } from './runtime-planner';
+import { testRuntimePlan } from './runtime-test-fixtures';
 
 const profileSource = {
   repository: 'frankxai/starlight-agent-config',
@@ -233,6 +234,31 @@ test('high-risk, code-executing, or connected interactive work cannot route to E
     );
     assert.equal(decision.runtime, 'railway-temporal');
   }
+});
+
+test('Eve allowlisting never overrides connected or non-low-risk routing', () => {
+  const policy = { eve_allowlisted_workload_ids: ['interactive'] };
+  for (const overrides of [
+    { third_party_connections: true },
+    { risk: 'medium' as const },
+  ]) {
+    const decision = recommendRuntime(
+      workload('interactive', 'maker', {
+        workload_class: 'interactive-specialist',
+        interaction: 'realtime',
+        local_private_data: false,
+        ...overrides,
+      }),
+      policy,
+    );
+    assert.equal(decision.runtime, 'railway-temporal');
+  }
+});
+
+test('runtime plan parser rejects a forged connected Eve lane', () => {
+  const forged = testRuntimePlan();
+  forged.lanes[0].workload_contract.third_party_connections = true;
+  assert.throws(() => parseTeamRuntimePlan(forged), /Eve lanes must remain/i);
 });
 
 test('runtime plan parser rejects an empty or structurally forged plan', () => {
