@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
     "swarm:dry-run": "tsx src/swarm/index.ts",
+    "swarm:kernel": "tsx -e \"import { observatorySnapshot } from './src/swarm/observatory.ts'; console.log(JSON.stringify(observatorySnapshot(), null, 2))\"",
     "hand:pilot": "tsx src/swarm/pilot-cli.ts",
     "runtime:plan": "tsx scripts/plan-team-runtime.ts",
     "runtime:assess": "tsx scripts/assess-team-runtime.ts",

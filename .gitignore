@@ -47,6 +47,10 @@ link-checker-report.txt
 .starlight/
 .gemini/
 
+# local python caches from skill scripts
+__pycache__/
+*.pyc
+
 # web-excellence pack — local evidence, not repo artifacts
 .visual-proof/
 .lighthouse.json

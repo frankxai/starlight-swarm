@@ -111,6 +111,23 @@ Each entry includes:
 
 ---
 
-**Status**: Catalog v0.1 — core topologies + high-value estate primitives documented. Code implementations and more examples will follow in subsequent phases.
+## Absorbed from the open swarm field (2026-08-28)
 
-See `docs/GOD-MODE-SWARM-OS-V2.md` and `MODEL-ROUTER-SPEC.md` for the broader system.
+These are **patterns**, not vendored runtimes. Full attribution and refuse
+lines live in [`src/swarm/absorption.ts`](../src/swarm/absorption.ts) and are
+tested. Taking a topology from Ruflo or a team-cell size from oh-my-openagent
+does not grant their scheduler, OAuth, or consensus any authority here.
+
+| Source | What we took | Starlight seat | What we refused |
+|---|---|---|---|
+| [ruvnet/ruflo](https://github.com/ruvnet/ruflo) (ex claude-flow) | Hierarchical / mesh / star / adaptive; anti-drift 6–8 specialized agents | topology + team-cell | Consensus as Queen; second hive-mind scheduler |
+| [code-yeongyu/oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) | Lead + parallel members; hostile-critic council; persistent loop | team-cell + Ruflow | `team_*` bypass of `classify()`; OAuth-login patterns; continuous Hands |
+| [openai/swarm](https://github.com/openai/swarm) | Agent + handoff as two primitives | `starlight.hand.v1` | Stateless handoff as memory or Temporal identity |
+| OpenAI Agents SDK | Guardrails + tracing (watch) | charter + Langfuse | Dual-primary traces; SDK as Queen |
+| OpenFang v0.6.9 | Reactive sidecar Hand | hand-sidecar | Queen / scheduler / SIS writer |
+| Hermes + Temporal | Control plane + durable backbone | already in ADR | Prepared JSON as activation |
+
+**Status**: Catalog v0.2 — topologies documented **and** absorbed in the typed ledger.
+
+See `docs/GOD-MODE-SWARM-OS-V2.md`, `docs/ECOSYSTEM-KERNEL.md`, and
+`MODEL-ROUTER-SPEC.md`.
