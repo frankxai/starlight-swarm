@@ -262,6 +262,7 @@ local-cockpit.html           static operator console (now includes the swarm tre
 ```bash
 npm install
 npm run swarm:dry-run    # founder→queen→worker tree + escalation ladder + per-queen loop step + real payments-MCP round-trip
+npm run swarm:eval       # governance suite: golden scenarios + invariants swept over every action the types admit
 npm run typecheck        # tsc --noEmit
 npm test                 # tsc --noEmit && node --test --import tsx src/swarm/*.test.ts
 npm run build            # next build (cockpit)
@@ -271,7 +272,12 @@ npm run dev              # next dev -p 3007  →  http://localhost:3007/swarm
 The dry-run walks every escalation tier through `classify()`, runs one self-improving-loop
 step per queen (including an over-cap payment that escalates worker → queen → founder →
 human), and connects the **real** payments-MCP adapter for one verify-only round-trip.
-Nothing fires; no money moves.
+It then shows the capability broker refusing three real calls, issues the handoff packets
+the founder and human gates receive, verifies the run's hash-chained ledger against its own
+plain-text export, and runs the governance suite. Nothing fires; no money moves.
+
+The run uses a fixed clock, so two runs are byte-identical and diffable. Re-base it with
+`SWARM_CLOCK`, and mirror the ledger to a local append-only file with `SWARM_LEDGER_PATH`.
 
 To exercise the real adapter against your own checkout, point it at the built server
 (defaults to `../payment-intelligence-system/mcp/dist/index.js`):

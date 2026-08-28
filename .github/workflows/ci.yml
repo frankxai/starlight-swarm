@@ -29,5 +29,8 @@ jobs:
       - name: Build (next build)
         run: npm run build
 
+      - name: Governance evaluation (golden scenarios + swept invariants)
+        run: npm run swarm:eval
+
       - name: Swarm dry-run (no live action, no money)
         run: npm run swarm:dry-run
