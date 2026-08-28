@@ -49,7 +49,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet" />
       </Head>
 
-      <a className="skip" href="#admission">Skip to admission hold</a>
+      <a className="skip" href="#main">Skip to observatory</a>
 
       <header className="top">
         <div className="brand">
@@ -94,9 +94,9 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         </article>
       </section>
 
-      <main>
+      <main id="main" className="main">
         <section id="admission" className="panel">
-          <h2><Mark kind="hold" /> Admission hold</h2>
+          <h2><Mark kind="hold" /> Admission Hold</h2>
           <p className="panel-lede">
             The report-only assessor cannot admit a plan. Unknown health stays unknown.
             These blockers are the checked-in snapshot, not a live probe.
@@ -109,7 +109,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         </section>
 
         <section id="kernel" className="panel">
-          <h2><Mark kind="kernel" /> Kernel ring</h2>
+          <h2><Mark kind="kernel" /> Kernel Ring</h2>
           <p className="panel-lede">
             Adjacent products stay in their own repos. This runtime pins them.
             Monorepo merge is rejected. Policy: {snap.kernel.policy.monorepo} merge,
@@ -133,7 +133,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
           <ul className="sat-list">
             {snap.kernel.satellites.map((m) => (
               <li key={m.id}>
-                <a href={m.url} rel="noreferrer">{m.repo}</a>
+                <a href={m.url} rel="noreferrer" translate="no">{m.repo}</a>
                 <span> — {m.role}</span>
               </li>
             ))}
@@ -141,9 +141,9 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         </section>
 
         <section id="streams" className="panel">
-          <h2><Mark kind="stream" /> Stream queens</h2>
+          <h2><Mark kind="stream" /> Stream Queens</h2>
           <p className="panel-lede">
-            Founder {snap.founder.name} holds {snap.founder.gate}. Queens never command across streams.
+            Founder <span translate="no">{snap.founder.name}</span> holds <span translate="no">{snap.founder.gate}</span>. Queens never command across streams.
           </p>
           <ul className="stream-grid">
             {snap.streams.map((s) => (
@@ -194,7 +194,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         </div>
 
         <section id="absorbed" className="panel">
-          <h2><Mark kind="kernel" /> Absorbed research</h2>
+          <h2><Mark kind="kernel" /> Absorbed Research</h2>
           <p className="panel-lede">
             Patterns taken, attributed, and refused where they would create a second Queen.
             {` ${snap.absorbed.count} entries.`}
@@ -203,7 +203,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
             {snap.absorbed.items.map((p) => (
               <li key={p.id}>
                 <p className="abs-head">
-                  <a href={p.url} rel="noreferrer">{p.source}</a>
+                  <a href={p.url} rel="noreferrer" translate="no">{p.source}</a>
                   <span className="tag">{p.disposition}</span>
                   <span className="tag quiet">{p.mapsTo}</span>
                 </p>
@@ -216,7 +216,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         </section>
 
         <section id="criteria" className="panel">
-          <h2><Mark kind="ok" /> Success criteria</h2>
+          <h2><Mark kind="ok" /> Success Criteria</h2>
           <p className="panel-lede">{snap.criteria.headline}</p>
           <ul className="criteria">
             {snap.criteria.items.map((c) => (
@@ -246,7 +246,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
           --font-inter: 'Inter', sans-serif;
           --focus: 0 0 0 3px hsl(190, 80%, 58%);
         }
-        html { scroll-behavior: smooth; color-scheme: dark; }
+        html { scroll-behavior: smooth; color-scheme: dark; touch-action: manipulation; }
         @media (prefers-reduced-motion: reduce) {
           html { scroll-behavior: auto; }
         }
@@ -261,26 +261,30 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
           min-height: 100vh;
         }
         * { box-sizing: border-box; }
-        a:focus-visible, button:focus-visible, .skip:focus-visible {
-          outline: none;
-          box-shadow: var(--focus);
+        a:focus-visible, button:focus-visible {
+          outline: 3px solid hsl(190, 80%, 58%);
+          outline-offset: 3px;
         }
       `}</style>
 
       <style jsx>{`
-        .shell { max-width: 1180px; margin: 0 auto; padding: 20px 16px 64px; }
+        .shell {
+          max-width: 1180px; margin: 0 auto;
+          padding: max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(64px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+        }
         .skip {
           position: absolute; left: 12px; top: -48px;
           background: var(--accent-secondary); color: #041018;
           padding: 8px 12px; border-radius: 8px; font-weight: 700; z-index: 10;
         }
-        .skip:focus { top: 12px; }
+        .skip:focus-visible { top: 12px; }
         .top {
           display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
           background: var(--bg-surface); border: 1px solid var(--border-color);
           border-radius: 16px; padding: 18px 20px; flex-wrap: wrap;
         }
         .brand { display: flex; gap: 14px; min-width: 0; }
+        .brand > div { min-width: 0; }
         .logo { font-family: var(--font-outfit); font-size: 28px; color: var(--accent-primary); line-height: 1; }
         :global(.mark) { flex-shrink: 0; display: block; }
         .kicker {
@@ -297,6 +301,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         }
         .pulse {
           width: 8px; height: 8px; border-radius: 50%; background: var(--accent-warning);
+          transform-origin: center;
           animation: pulse 1.8s ease-out infinite;
         }
         @keyframes pulse {
@@ -314,6 +319,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
           border: 1px solid var(--border-color); border-radius: 999px;
           padding: 8px 12px; font-size: 13px; font-weight: 600; min-height: 44px;
           display: inline-flex; align-items: center;
+          transition: color 160ms ease, border-color 160ms ease;
         }
         .toc a:hover { border-color: var(--accent-secondary); color: var(--accent-secondary); }
         .metrics {
@@ -329,6 +335,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
         .metric-label { margin: 0; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
         .metric-value { margin: 6px 0 0; font-family: var(--font-outfit); font-size: 18px; font-weight: 700; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
         .metric-value.stop { color: var(--accent-warning); }
+        .main { scroll-margin-top: 16px; }
         .panel {
           background: var(--bg-surface); border: 1px solid var(--border-color);
           border-radius: 16px; padding: 18px 18px 20px; margin-bottom: 14px; min-width: 0;
@@ -367,6 +374,7 @@ export default function SwarmObservatory({ snap }: { snap: ObservatorySnapshot }
           overflow-wrap: anywhere; text-underline-offset: 3px;
         }
         .pin-repo:hover, .sat-list a:hover, .abs-head a:hover { color: var(--accent-secondary); }
+        .pin-repo, .sat-list a, .abs-head a { transition: color 160ms ease; }
         .pin-role, .pin-next, .purpose, .w-does, .abs-pattern, .abs-refuse { margin: 6px 0 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); overflow-wrap: anywhere; }
         .pin-next, .abs-refuse { color: var(--accent-warning); }
         .subhead { font-family: var(--font-outfit); font-size: 13px; margin: 16px 0 8px; }
