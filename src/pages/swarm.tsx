@@ -42,6 +42,7 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
           </div>
         </div>
         <div className="header-status">
+          <a className="identities-link" href="/identities">Identity Atlas →</a>
           <span className="pulse-dot" />
           <span>SCAFFOLD (DRY-RUN)</span>
         </div>
@@ -140,6 +141,9 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
         h1 { font-family: var(--font-outfit); font-size: 20px; font-weight: 800; letter-spacing: 0.5px; margin: 0; }
         .subtitle { font-size: 12px; color: var(--text-muted); margin: 4px 0 0; }
         .header-status { display: flex; align-items: center; gap: 10px; font-family: var(--font-outfit); font-size: 13px; font-weight: 600; }
+        .identities-link { color: var(--accent-secondary); text-decoration: none; margin-right: 8px; font-size: 12px; }
+        .identities-link:hover { text-decoration: underline; }
+        .identities-link:focus-visible { outline: 2px solid var(--accent-secondary); outline-offset: 3px; }
         .pulse-dot { width: 8px; height: 8px; background: var(--accent-warning); border-radius: 50%; box-shadow: 0 0 8px var(--accent-warning); }
         .dashboard-grid { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; }
         .card { background: var(--bg-surface); backdrop-filter: blur(16px); border: 1px solid var(--border-color); border-radius: 16px; padding: 24px; }
