@@ -21,10 +21,38 @@ import type { Action, StreamId } from './escalation';
 import { classify } from './escalation';
 import { BENEVOLENCE_CHARTER, checkCharter, explain, raiseTo } from './charter';
 import type { CharterContext } from './charter';
+import { brokerPayments, brokerVault, ledgerAudit, queenGrant, CapabilityRefusal } from './capabilities';
+import { evaluateGovernance } from './eval-harness';
+import { GOVERNANCE_SCENARIOS } from './eval-scenarios';
 import { makeDryRunVault, makeDryRunPayments, connectRealPayments } from './integrations';
+import { SwarmLedger, explainVerification, readLedgerJsonl } from './ledger';
+import { appendFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const out = (m = '') => console.log(m);
+
+/**
+ * A fixed, monotonic clock. A dry-run whose every entry carries a wall-clock
+ * stamp cannot be diffed against the previous run, which costs the runtime the
+ * cheapest regression signal it has. Override with SWARM_CLOCK to re-base.
+ */
+const CLOCK_BASE = Date.parse(process.env.SWARM_CLOCK ?? '2026-01-01T00:00:00.000Z');
+let tick = 0;
+const clock = () => new Date(CLOCK_BASE + tick++ * 1000).toISOString();
+
+/**
+ * One ledger for the whole run. Every queen writes into it, so the export at
+ * the end is the complete history of the run rather than four partial ones.
+ *
+ * Set SWARM_LEDGER_PATH to mirror it to a local append-only file as it is
+ * written. Opt-in rather than default: the runtime does not decide on the
+ * operator's behalf where their history lives (clause 4).
+ */
+const LEDGER_PATH = process.env.SWARM_LEDGER_PATH;
+const ledger = new SwarmLedger({
+  clock,
+  sink: LEDGER_PATH ? (line) => appendFileSync(LEDGER_PATH, `${line}\n`, 'utf8') : undefined,
+});
 
 /**
  * Where the built Payments MCP server lives. Configurable via env so CI / other
@@ -183,9 +211,122 @@ async function runLoopSteps(): Promise<void> {
   };
 
   for (const spec of STREAMS) {
-    const queen = new Queen(spec, out);
+    const queen = new Queen(spec, out, {}, { ledger, clock });
     const mcp = spec.id === 'payments' ? { vault, payments } : { vault };
     await queen.stepLoop(tasksByStream[spec.id], mcp);
+  }
+  out('');
+}
+
+/**
+ * Show the IAM boundary refusing, rather than asserting that it would.
+ *
+ * Both holders below are handed a WORKING handle. What stops them is the grant
+ * they carry, which is the only version of this boundary that survives a
+ * refactor — a comment saying "workers have no payment access" does not.
+ */
+async function demoCapabilityBoundary(): Promise<void> {
+  out('───────────────────────────────────────────────────────────────');
+  out('  CAPABILITY GRANTS (the IAM boundary, enforced — charter §13.2)');
+  out('───────────────────────────────────────────────────────────────');
+
+  const audit = ledgerAudit(ledger);
+  const contentQueen = queenGrant('content', 'Content Queen');
+  const paymentsQueen = queenGrant('payments', 'Payments Queen');
+  out(`  Content Queen  holds: ${contentQueen.list().join(', ')}`);
+  out(`  Payments Queen holds: ${paymentsQueen.list().join(', ')}`);
+  out('  worker mesh    holds: vault.append  (on every stream, Payments included)');
+  out('');
+
+  // A queen outside the Payments seat, holding a real payments handle.
+  try {
+    await brokerPayments(makeDryRunPayments(() => {}), contentQueen, audit).verify_mandate({
+      signature: 'dry-run',
+      amount: 40,
+      purpose: 'reaching across the IAM boundary',
+    });
+    out('  ✗ the money surface answered a seat that does not hold it');
+  } catch (err) {
+    out(`  ▸ ${(err as CapabilityRefusal).message}`);
+  }
+
+  // A worker reaching past append-only into the queen's read surface.
+  try {
+    await brokerVault(makeDryRunVault(() => {}), contentQueen.restrict('writer', ['vault.append']), audit).sis_vault_search(
+      'prior context',
+    );
+    out('  ✗ append-only memory answered a read');
+  } catch (err) {
+    out(`  ▸ ${(err as CapabilityRefusal).message}`);
+  }
+
+  // §13.2 as code: a holder cannot grant what it does not itself hold.
+  try {
+    contentQueen.restrict('distributor', ['payments.check_spend_cap']);
+    out('  ✗ a grant was widened downward');
+  } catch (err) {
+    out(`  ▸ ${(err as CapabilityRefusal).message}`);
+  }
+  out('');
+}
+
+/**
+ * The ledger, verified and exported. Clause 4 promises the operator can read,
+ * export, and leave; clause 6 promises claims trace to an entry. Both are
+ * checkable right here, on the run that just happened.
+ */
+function printLedger(): void {
+  out('───────────────────────────────────────────────────────────────');
+  out('  DECISION LEDGER (append-only, hash-chained — clauses 4 + 6)');
+  out('───────────────────────────────────────────────────────────────');
+
+  const attested = ledger.attestClaim('starlight-orchestrator', 'The swarm gates every proposal it receives', [
+    'test:eval-harness',
+    'test:charter.test.ts',
+  ]);
+  out(`  ▸ backed claim   → recorded as "${attested.entry.kind}"`);
+  const overclaim = ledger.attestClaim('starlight-orchestrator', 'Fully autonomous revenue', []);
+  out(`  ▸ unbacked claim → ${overclaim.attested ? 'RECORDED (wrong)' : 'REFUSED and written down'}`);
+  out('');
+
+  for (const entry of ledger.entries().slice(-4)) {
+    out(`    #${String(entry.seq).padStart(2, '0')} ${entry.kind.padEnd(18)} ${entry.actor.padEnd(24)} ${entry.subject}`);
+  }
+  out('');
+
+  // Round-trip through the plain-text export: the operator's exit path is only
+  // real if the bytes they walk away with re-verify without this process.
+  const roundTrip = readLedgerJsonl(ledger.toJsonl());
+  out(`  ${explainVerification(ledger.verify())}`);
+  out(`  export → ${ledger.toJsonl().length} bytes of JSONL, re-read and re-verified: ${roundTrip.verification.intact}`);
+  out(
+    LEDGER_PATH
+      ? `  mirrored to ${LEDGER_PATH} as it was written.`
+      : '  Set SWARM_LEDGER_PATH to mirror it to a local file as it is written.',
+  );
+  out('  The operator holds plain text they can read, export, and leave with.');
+  out('');
+}
+
+/** The governance suite, run as part of the heartbeat rather than only in CI. */
+function printGovernanceEvaluation(): void {
+  out('───────────────────────────────────────────────────────────────');
+  out('  GOVERNANCE EVALUATION (npm run swarm:eval)');
+  out('───────────────────────────────────────────────────────────────');
+  const report = evaluateGovernance(GOVERNANCE_SCENARIOS);
+  out(`  scenarios  ${report.scenarios.passed}/${report.scenarios.total} passed`);
+  out(
+    `  invariants ${report.invariants.passed}/${report.invariants.total} held ` +
+      `(each swept over ${report.invariants.results[0]?.checked ?? 0} actions)`,
+  );
+  out(`  digest     ${report.digest}`);
+  if (!report.ok) {
+    for (const failure of report.scenarios.results.filter((r) => !r.passed)) {
+      out(`  ✗ ${failure.id}: ${failure.mismatches.join('; ')}`);
+    }
+    for (const failure of report.invariants.results.filter((r) => !r.passed)) {
+      out(`  ✗ ${failure.id}: ${failure.violationCount} violation(s)`);
+    }
   }
   out('');
 }
@@ -222,12 +363,16 @@ async function main(): Promise<void> {
   printTree();
   demoEscalationLadder();
   demoCharter();
+  await demoCapabilityBoundary();
   await runLoopSteps();
   await demoRealPaymentsMcp();
+  printLedger();
+  printGovernanceEvaluation();
 
   out('═══════════════════════════════════════════════════════════════');
   out('  DRY-RUN COMPLETE — no action fired, no money moved.');
   out(`  Founder: ${FOUNDER.name}  ·  Streams: ${STREAMS.map((s) => s.label).join(', ')}`);
+  out(`  Ledger: ${ledger.size} entries, head ${ledger.head().slice(0, 12)}… (reproducible — fixed clock)`);
   out('  Standing rule: agents draft, gate, and commit; humans deploy, post, send.');
   out('═══════════════════════════════════════════════════════════════');
 }
