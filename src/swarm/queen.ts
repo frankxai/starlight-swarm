@@ -20,8 +20,11 @@ import { checkCharter, raiseTo } from './charter';
 import type { CharterContext, CharterVerdict } from './charter';
 import { brokerPayments, brokerVault, ledgerAudit, queenGrant } from './capabilities';
 import type { CapabilityGrant } from './capabilities';
+import { issueHandoff } from './handoff';
+import type { HandoffPacket } from './handoff';
 import type { SisVaultMcp, PaymentsMcp } from './integrations';
 import { SwarmLedger } from './ledger';
+import type { LedgerEntry } from './ledger';
 import type { Worker, Task, WorkerReport } from './worker';
 import { makeWorker } from './worker';
 import type { StreamSpec } from './streams';
@@ -55,6 +58,11 @@ export interface QueenLoopResult {
   /** The self-improving-loop step label this run represents. */
   loopStep: string;
   decisions: QueenDecision[];
+  /**
+   * Verifiable packets for everything this step could not settle itself. A
+   * refusal never produces one — there is nothing for a human to approve.
+   */
+  handoffs: HandoffPacket[];
 }
 
 /** MCP handles available to a queen (Payments only for the Payments Queen). */
@@ -103,6 +111,7 @@ export class Queen {
   readonly grant: CapabilityGrant;
   private readonly workers: Worker[];
   private readonly log: (m: string) => void;
+  private readonly clock: () => string;
 
   constructor(
     spec: StreamSpec,
@@ -115,6 +124,7 @@ export class Queen {
     this.loop = spec.queen.selfImprovingLoop;
     this.log = log;
     this.charterContext = charterContext;
+    this.clock = governance.clock ?? (() => new Date().toISOString());
     this.ledger = governance.ledger ?? new SwarmLedger({ clock: governance.clock });
     this.grant = governance.grant ?? queenGrant(spec.id, spec.queen.name);
     // Build the worker mesh from config. Each worker is stateless + single-skill.
@@ -183,8 +193,8 @@ export class Queen {
    * refusals but not approvals answers "what did it block?" and cannot answer
    * "what did it do?", and clause 6 needs the second question answerable too.
    */
-  private record(decision: QueenDecision, report: WorkerReport): void {
-    this.ledger.append({
+  private record(decision: QueenDecision, report: WorkerReport): LedgerEntry {
+    return this.ledger.append({
       kind: decision.verdict === 'refuse' ? 'refusal' : 'decision',
       actor: this.name,
       stream: this.stream,
@@ -224,6 +234,7 @@ export class Queen {
   async stepLoop(tasks: Task[], mcp: QueenMcp, loopStep = this.loop[0]): Promise<QueenLoopResult> {
     this.log(`\n  [${this.name}] loop step: "${loopStep}" — dispatching ${tasks.length} worker task(s)`);
     const decisions: QueenDecision[] = [];
+    const handoffs: HandoffPacket[] = [];
     const audit = ledgerAudit(this.ledger, this.stream);
     const payments = mcp.payments ? brokerPayments(mcp.payments, this.grant, audit) : undefined;
 
@@ -237,7 +248,28 @@ export class Queen {
       const report = await chosen.run(task, workerVault);
       const decision = this.decide(report);
       decisions.push(decision);
-      this.record(decision, report);
+      const entry = this.record(decision, report);
+
+      // Anything the queen cannot settle leaves as a document, not a log line:
+      // whoever holds the gate can verify it against the ledger and the spine.
+      const packet = issueHandoff(
+        decision,
+        report.proposed,
+        { queen: this.name, worker: decision.worker, stream: this.stream, taskId: task.id, task: task.description },
+        entry,
+        this.clock(),
+      );
+      if (packet) {
+        handoffs.push(packet);
+        this.ledger.append({
+          kind: 'note',
+          actor: this.name,
+          stream: this.stream,
+          subject: packet.packet_id,
+          summary: `Handoff issued to ${packet.gate} for ${task.id}.`,
+          detail: { bound_to_ledger_seq: entry.seq, outstanding_gates: packet.outstanding_gates },
+        });
+      }
 
       this.log(
         `    • ${decision.worker} → ${decision.effective.toUpperCase()} ` +
@@ -267,6 +299,6 @@ export class Queen {
       }
     }
 
-    return { queen: this.name, stream: this.stream, loopStep, decisions };
+    return { queen: this.name, stream: this.stream, loopStep, decisions, handoffs };
   }
 }

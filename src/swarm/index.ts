@@ -24,6 +24,8 @@ import type { CharterContext } from './charter';
 import { brokerPayments, brokerVault, ledgerAudit, queenGrant, CapabilityRefusal } from './capabilities';
 import { evaluateGovernance } from './eval-harness';
 import { GOVERNANCE_SCENARIOS } from './eval-scenarios';
+import { formatHandoff, verifyHandoff } from './handoff';
+import type { HandoffPacket } from './handoff';
 import { makeDryRunVault, makeDryRunPayments, connectRealPayments } from './integrations';
 import { SwarmLedger, explainVerification, readLedgerJsonl } from './ledger';
 import { appendFileSync } from 'node:fs';
@@ -183,7 +185,7 @@ function demoCharter(): void {
 }
 
 /** Run one loop step per queen, including a demonstrated escalation. */
-async function runLoopSteps(): Promise<void> {
+async function runLoopSteps(): Promise<HandoffPacket[]> {
   out('───────────────────────────────────────────────────────────────');
   out('  QUEEN LOOP STEPS (one heartbeat per stream — dry-run)');
   out('───────────────────────────────────────────────────────────────');
@@ -210,11 +212,45 @@ async function runLoopSteps(): Promise<void> {
     ],
   };
 
+  const issued: HandoffPacket[] = [];
   for (const spec of STREAMS) {
     const queen = new Queen(spec, out, {}, { ledger, clock });
     const mcp = spec.id === 'payments' ? { vault, payments } : { vault };
-    await queen.stepLoop(tasksByStream[spec.id], mcp);
+    const result = await queen.stepLoop(tasksByStream[spec.id], mcp);
+    for (const packet of result.handoffs) issued.push(packet);
   }
+  out('');
+  return issued;
+}
+
+/**
+ * What left the swarm's hands, as documents rather than log lines.
+ *
+ * Each packet is verified here against the ledger it names and the spine that
+ * issued it — the same check whoever holds the gate would run before acting on
+ * one. A packet the runtime cannot verify is a packet nobody should act on.
+ */
+function printHandoffs(packets: HandoffPacket[]): void {
+  out('───────────────────────────────────────────────────────────────');
+  out('  HANDOFF PACKETS (what the gate receives — clause 2)');
+  out('───────────────────────────────────────────────────────────────');
+
+  if (packets.length === 0) {
+    out('  Nothing left the queens this step.');
+    out('');
+    return;
+  }
+
+  for (const packet of packets) {
+    for (const line of formatHandoff(packet).split('\n')) out(`  ${line}`);
+    const verification = verifyHandoff(packet, ledger.entries());
+    out(
+      `  verify   ${verification.valid ? 'VALID — binds to the ledger and re-derives at the same tier' : `INVALID — ${verification.defects.map((d) => d.code).join(', ')}`}`,
+    );
+    out('');
+  }
+  out('  A refusal issues no packet: there is nothing for a human to approve, and');
+  out('  no tier converts a ledger defect into a permission.');
   out('');
 }
 
@@ -364,8 +400,9 @@ async function main(): Promise<void> {
   demoEscalationLadder();
   demoCharter();
   await demoCapabilityBoundary();
-  await runLoopSteps();
+  const handoffs = await runLoopSteps();
   await demoRealPaymentsMcp();
+  printHandoffs(handoffs);
   printLedger();
   printGovernanceEvaluation();
 

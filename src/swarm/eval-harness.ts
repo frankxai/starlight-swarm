@@ -27,6 +27,8 @@ import { checkCharter, raiseTo } from './charter';
 import type { CharterContext, ClauseId } from './charter';
 import { classify } from './escalation';
 import type { Action, ActionKind, Decision, StreamId } from './escalation';
+import { issueHandoff, verifyHandoff } from './handoff';
+import { SwarmLedger } from './ledger';
 import { Queen } from './queen';
 import type { QueenDecision } from './queen';
 import { sha256Digest } from './runtime-digest';
@@ -119,10 +121,8 @@ function queenFor(action: Action | null): Queen {
   return QUEENS[stream];
 }
 
-/** Run one proposal through the real decision path. */
-export function observe(action: Action | null, context: CharterContext = {}): ObservedOutcome {
-  const queen = queenFor(action);
-  const decision = queen.decide(
+function decideFor(action: Action | null, context: CharterContext): QueenDecision {
+  return queenFor(action).decide(
     {
       worker: 'eval-harness',
       stream: action?.stream ?? 'content',
@@ -134,6 +134,11 @@ export function observe(action: Action | null, context: CharterContext = {}): Ob
     },
     context,
   );
+}
+
+/** Run one proposal through the real decision path. */
+export function observe(action: Action | null, context: CharterContext = {}): ObservedOutcome {
+  const decision = decideFor(action, context);
   return {
     classification: decision.classification.decision,
     effective: decision.effective,
@@ -355,6 +360,34 @@ const PROPERTIES: readonly Property[] = [
       const first = sha256Digest(observe(action));
       const second = sha256Digest(observe(action));
       return first === second ? null : `${describeAction(action)} — two decisions disagreed (${first.slice(0, 8)} vs ${second.slice(0, 8)})`;
+    },
+  },
+  {
+    id: 'handoffs-are-issued-and-verifiable',
+    description: 'Anything the queen cannot settle leaves as a packet that verifies at the tier it was ruled at.',
+    check(action) {
+      const decision = decideFor(action, {});
+      const ledger = new SwarmLedger({ clock: () => '2026-01-01T00:00:00.000Z' });
+      const entry = ledger.append({ kind: 'decision', actor: 'eval', subject: 'eval', summary: 'probe' });
+      const packet = issueHandoff(
+        decision,
+        action,
+        { queen: 'eval', worker: 'eval-harness', stream: action.stream, taskId: 'eval', task: 'probe' },
+        entry,
+        '2026-01-01T00:00:00.000Z',
+      );
+
+      if (decision.verdict === 'act' || decision.verdict === 'refuse') {
+        return packet === null ? null : `${describeAction(action)} — a ${decision.verdict} verdict issued a handoff packet`;
+      }
+      if (packet === null) return `${describeAction(action)} — ${decision.effective} issued no packet for the gate to act on`;
+      if (packet.gate !== decision.effective) {
+        return `${describeAction(action)} — packet asks for ${packet.gate} on a ${decision.effective} ruling`;
+      }
+      const verification = verifyHandoff(packet, ledger.entries());
+      return verification.valid
+        ? null
+        : `${describeAction(action)} — freshly issued packet failed verification: ${verification.defects.map((d) => d.code).join(', ')}`;
     },
   },
   {
