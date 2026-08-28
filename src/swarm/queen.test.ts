@@ -17,6 +17,9 @@ import type { StreamSpec } from './streams';
 import type { Task } from './worker';
 import type { Action, StreamId } from './escalation';
 import type { SisVaultMcp } from './integrations';
+import { makeDryRunPayments } from './integrations';
+import { CapabilityRefusal, queenGrant } from './capabilities';
+import { SwarmLedger } from './ledger';
 
 /** A vault double that records appends without any real side effect. */
 function fakeVault(appends: string[] = []): SisVaultMcp {
@@ -154,6 +157,104 @@ test('decide() fails closed: only autonomous/queen-gate ever earn the act verdic
     const v = decide(a);
     assert.notEqual(v.verdict, 'act', `${a.kind} must not resolve to 'act' (effective: ${v.effective})`);
   }
+});
+
+/* ---------------------------------------------------------------- *
+ * LEDGER — no ruling happens with nowhere to record it (clauses 4 + 6).
+ * ---------------------------------------------------------------- */
+
+test('every decision in a loop step lands in the ledger, chained and intact', async () => {
+  const ledger = new SwarmLedger({ clock: () => '2026-01-01T00:00:00.000Z' });
+  const queen = new Queen(paymentsSpec(), undefined, {}, { ledger });
+
+  await queen.stepLoop(
+    [
+      { id: 'pay-in', worker: 'mandate-verifier', description: 'in cap', proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }) },
+      { id: 'pay-over', worker: 'spend-cap-enforcer', description: 'over cap', proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 500, cap: 100 }) },
+    ],
+    { vault: fakeVault() },
+  );
+
+  const decisions = ledger.entriesOfKind('decision');
+  assert.equal(decisions.length, 2, 'approvals are recorded too, not just refusals');
+  assert.deepEqual(decisions.map((e) => e.subject), ['pay-in', 'pay-over']);
+  assert.equal(decisions[1].detail?.effective, 'founder-board');
+  assert.equal(ledger.verify().intact, true);
+});
+
+test('a queen always has a ledger, even when the caller supplies none', async () => {
+  const queen = new Queen(paymentsSpec());
+  await queen.stepLoop(
+    [{ id: 'pay-in', description: 'in cap', proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }) }],
+    { vault: fakeVault() },
+  );
+  assert.equal(queen.ledger.size, 1);
+});
+
+test('a charter refusal is recorded as a refusal, carrying the clause and the remedy', async () => {
+  const ledger = new SwarmLedger({ clock: () => '2026-01-01T00:00:00.000Z' });
+  const queen = new Queen(paymentsSpec(), undefined, { attributionOwed: ['unpaid-instrument'] }, { ledger });
+
+  await queen.stepLoop(
+    [{ id: 'pay-in', description: 'in cap', proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }) }],
+    { vault: fakeVault() },
+  );
+
+  const refusals = ledger.entriesOfKind('refusal');
+  assert.equal(refusals.length, 1);
+  assert.equal(ledger.entriesOfKind('decision').length, 0);
+  const breaches = refusals[0].detail?.breaches as Array<{ clause: string; remedy: string }>;
+  assert.equal(breaches[0].clause, 'attribution');
+  assert.ok(breaches[0].remedy.length > 0);
+});
+
+/* ---------------------------------------------------------------- *
+ * CAPABILITIES — the IAM boundary as an object, not a comment.
+ * ---------------------------------------------------------------- */
+
+test('a queen holds its seat\'s grant, and only Payments reaches the money surface', () => {
+  assert.equal(new Queen(paymentsSpec()).grant.has('payments.verify_mandate'), true);
+  assert.equal(new Queen(emptySpec()).grant.has('payments.verify_mandate'), false);
+});
+
+test('a queen whose grant lacks the money surface is refused it, handle or not', async () => {
+  // The Payments seat, deliberately issued a Content-tier grant. It still holds
+  // a working payments handle; that is exactly the case a comment cannot stop.
+  const ledger = new SwarmLedger({ clock: () => '2026-01-01T00:00:00.000Z' });
+  const queen = new Queen(paymentsSpec(), undefined, {}, { ledger, grant: queenGrant('content', 'Payments Queen') });
+
+  await assert.rejects(
+    () =>
+      queen.stepLoop(
+        [{ id: 'pay-in', description: 'in cap', proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }) }],
+        { vault: fakeVault(), payments: makeDryRunPayments(() => {}) },
+      ),
+    CapabilityRefusal,
+    'an ungranted tool call aborts the step loudly rather than proceeding',
+  );
+
+  const denials = ledger.entriesOfKind('capability-denied');
+  assert.equal(denials.length, 1);
+  assert.equal(denials[0].subject, 'payments.verify_mandate');
+});
+
+test('workers receive a vault narrowed to append-only, whatever the queen holds', async () => {
+  // The queen can read the vault; what it hands the worker cannot. Asserted on
+  // the grant the mesh is actually issued, since the worker only ever appends.
+  const queen = new Queen(paymentsSpec());
+  assert.equal(queen.grant.has('vault.read'), true);
+
+  const workerScoped = queen.grant.restrict('mandate-verifier', ['vault.append']);
+  assert.equal(workerScoped.has('vault.append'), true);
+  assert.equal(workerScoped.has('vault.read'), false);
+  assert.throws(() => workerScoped.restrict('sub', ['payments.verify_mandate']), CapabilityRefusal);
+
+  const appends: string[] = [];
+  await queen.stepLoop(
+    [{ id: 'pay-in', worker: 'mandate-verifier', description: 'in cap', proposes: action('payments', { kind: 'draft' }) }],
+    { vault: fakeVault(appends) },
+  );
+  assert.deepEqual(appends, ['mandate-verifier:pay-in'], 'the append the worker is granted still goes through');
 });
 
 test('task with an unknown worker hint falls back to the first worker (no throw)', async () => {
