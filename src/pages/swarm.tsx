@@ -149,16 +149,18 @@ function MemoryImportDialog({
         </p>
 
         {loading && <p className="muted">Scanning Claude Code + Cursor surfaces…</p>}
-        {error && (
-          <p className="import-error" role="alert">
-            {error}
-          </p>
-        )}
-        {status && (
-          <p className="import-status" role="status">
-            {status}
-          </p>
-        )}
+        <div aria-live="polite">
+          {error && (
+            <p className="import-error" role="alert">
+              {error}
+            </p>
+          )}
+          {status && (
+            <p className="import-status" role="status">
+              {status}
+            </p>
+          )}
+        </div>
 
         {!loading && payload && (
           <>
@@ -174,7 +176,12 @@ function MemoryImportDialog({
                     />
                     <span>
                       {bucket.label} ({bucket.count})
-                      {!bucket.promotable && <em className="muted"> — refused for durable memory</em>}
+                      {!bucket.promotable && bucket.id === 'chats' && (
+                        <em className="muted"> — refused for durable memory</em>
+                      )}
+                      {!bucket.promotable && bucket.id !== 'chats' && bucket.count === 0 && (
+                        <em className="muted"> — none found</em>
+                      )}
                     </span>
                   </label>
                 </li>
@@ -210,12 +217,18 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
     <div className="cockpit-container">
       <Head>
         <title>Starlight Swarm — L6 Runtime</title>
+        <meta name="theme-color" content="#0c1016" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
         <link
           href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Outfit:wght@500;700;800&display=swap"
           rel="stylesheet"
         />
       </Head>
+
+      <a className="skip-link" href="#swarm-main">
+        Skip to content
+      </a>
 
       <header>
         <div className="brand">
@@ -238,7 +251,7 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
         </div>
       </header>
 
-      <main className="dashboard-grid">
+      <main id="swarm-main" className="dashboard-grid">
         <section className="card founder-card">
           <h2>Founder</h2>
           <div className="founder-name">{tree.founder.name}</div>
@@ -302,6 +315,7 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
 
       <style jsx global>{`
         :root {
+          color-scheme: dark;
           --bg-base: hsl(220, 24%, 7%);
           --bg-surface: hsla(220, 20%, 12%, 0.82);
           --border-color: hsla(200, 12%, 28%, 0.45);
@@ -315,6 +329,24 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
           --font-display: 'Outfit', sans-serif;
           --font-body: 'IBM Plex Sans', sans-serif;
           --focus-ring: 0 0 0 2px hsl(220, 24%, 7%), 0 0 0 4px hsl(168, 55%, 48%);
+        }
+        .skip-link {
+          position: absolute;
+          left: 12px;
+          top: 12px;
+          z-index: 50;
+          padding: 8px 12px;
+          border-radius: 8px;
+          background: var(--accent-primary);
+          color: hsl(220, 30%, 6%);
+          font-weight: 600;
+          text-decoration: none;
+          transform: translateY(-200%);
+        }
+        .skip-link:focus-visible {
+          transform: translateY(0);
+          box-shadow: var(--focus-ring);
+          outline: none;
         }
         @media (prefers-reduced-motion: reduce) {
           *, *::before, *::after {
@@ -345,7 +377,7 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
         }
         .brand { display: flex; align-items: center; gap: 16px; }
         .brand-logo { font-size: 32px; font-family: var(--font-display); color: var(--accent-primary); }
-        h1 { font-family: var(--font-display); font-size: 20px; font-weight: 800; letter-spacing: 0.5px; margin: 0; }
+        h1 { font-family: var(--font-display); font-size: 20px; font-weight: 800; letter-spacing: 0.5px; margin: 0; text-wrap: balance; }
         .subtitle { font-size: 12px; color: var(--text-muted); margin: 4px 0 0; }
         .header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
         .header-status { display: flex; align-items: center; gap: 10px; font-family: var(--font-display); font-size: 13px; font-weight: 600; }
@@ -366,6 +398,8 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
           padding: 10px 16px;
           font-weight: 700;
           font-size: 13px;
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
         }
         .import-open:hover { background: hsl(168, 55%, 48%); }
         .dashboard-grid { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; }
@@ -398,9 +432,13 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
           position: fixed; inset: 0; z-index: 40;
           background: hsla(220, 30%, 4%, 0.72);
           display: grid; place-items: center; padding: 24px;
+          overscroll-behavior: contain;
         }
         .import-dialog {
           width: min(420px, 100%);
+          max-height: min(90vh, 720px);
+          overflow: auto;
+          overscroll-behavior: contain;
           background: hsl(220, 22%, 10%);
           border: 1px solid hsla(200, 12%, 32%, 0.5);
           border-radius: 16px;
@@ -427,7 +465,7 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
         .import-glyph.starlight { background: hsl(220, 18%, 16%); border: 1px solid var(--border-color); color: var(--accent-primary); }
         .import-dots { color: var(--text-muted); letter-spacing: 2px; }
         .import-dialog h2 {
-          text-align: center; margin: 0 0 8px; font-size: 20px;
+          text-align: center; margin: 0 0 8px; font-size: 20px; text-wrap: balance;
         }
         .import-sub {
           text-align: center; color: var(--text-muted); font-size: 13px; line-height: 1.45;
@@ -459,6 +497,8 @@ export default function SwarmCockpit({ tree }: { tree: Tree }) {
           font-weight: 700;
           background: hsl(0, 0%, 96%);
           color: hsl(220, 24%, 8%);
+          touch-action: manipulation;
+          -webkit-tap-highlight-color: transparent;
         }
         .import-sync:hover:not(:disabled) { background: white; }
         .import-sync:disabled { opacity: 0.55; cursor: not-allowed; }
