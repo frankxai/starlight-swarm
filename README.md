@@ -262,12 +262,18 @@ local-cockpit.html           static operator console (now includes the swarm tre
 ```bash
 npm install
 npm run swarm:dry-run    # founder→queen→worker tree + escalation ladder + per-queen loop step + real payments-MCP round-trip
+npm run swarm:sync       # inventory: charter, skills, pack MEMORY, import readiness
+npm run swarm:import     # Cursor-parity scan of Claude Code / Cursor memories (candidates only)
 npm run typecheck        # tsc --noEmit
 npm test                 # tsc --noEmit && node --test --import tsx src/swarm/*.test.ts
 npm run build            # next build (cockpit)
 npm run dev              # next dev -p 3007  →  http://localhost:3007/swarm
 ```
 
+Memory import (Cursor-parity for swarm apps) is documented in
+[`docs/MEMORY-IMPORT.md`](docs/MEMORY-IMPORT.md). Scan is read-only; `Sync` on `/swarm`
+requires an explicit human gate and promotes compact candidates into the dry-run vault
+only — chats and secrets are refused.
 The dry-run walks every escalation tier through `classify()`, runs one self-improving-loop
 step per queen (including an over-cap payment that escalates worker → queen → founder →
 human), and connects the **real** payments-MCP adapter for one verify-only round-trip.
