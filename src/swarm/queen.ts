@@ -18,7 +18,10 @@ import { classify } from './escalation';
 import type { Classification, Decision, StreamId } from './escalation';
 import { checkCharter, raiseTo } from './charter';
 import type { CharterContext, CharterVerdict } from './charter';
+import { brokerPayments, brokerVault, ledgerAudit, queenGrant } from './capabilities';
+import type { CapabilityGrant } from './capabilities';
 import type { SisVaultMcp, PaymentsMcp } from './integrations';
+import { SwarmLedger } from './ledger';
 import type { Worker, Task, WorkerReport } from './worker';
 import { makeWorker } from './worker';
 import type { StreamSpec } from './streams';
@@ -61,6 +64,24 @@ export interface QueenMcp {
   payments?: PaymentsMcp;
 }
 
+/** Governance wiring a queen carries beyond its stream config. */
+export interface QueenGovernance {
+  /**
+   * Where decisions are written down. Omitted → the queen keeps its own, so
+   * `queen.ledger` is never absent: clause 6 cannot hold if a decision can
+   * happen with nowhere to record it.
+   */
+  ledger?: SwarmLedger;
+  /**
+   * The queen's tool grant. Defaults to the stream's seat — money tools only on
+   * the Payments seat. Passing a narrower grant is always allowed; a wider one
+   * is a deliberate act the caller has to write down.
+   */
+  grant?: CapabilityGrant;
+  /** Injectable clock, so a dry-run can be reproduced byte-for-byte. */
+  clock?: () => string;
+}
+
 /**
  * Queen — the sovereign of one stream's hive. Centralized decision, decentralized
  * (mesh) worker execution.
@@ -76,17 +97,28 @@ export class Queen {
    * lineage ledger to give clauses 3, 4 and 6 something to bite on.
    */
   readonly charterContext: CharterContext;
+  /** Append-only record of everything this queen ruled on (clauses 4 + 6). */
+  readonly ledger: SwarmLedger;
+  /** The tool capabilities this queen holds. Workers inherit a narrowing of it. */
+  readonly grant: CapabilityGrant;
   private readonly workers: Worker[];
   private readonly log: (m: string) => void;
 
-  constructor(spec: StreamSpec, log: (m: string) => void = () => {}, charterContext: CharterContext = {}) {
+  constructor(
+    spec: StreamSpec,
+    log: (m: string) => void = () => {},
+    charterContext: CharterContext = {},
+    governance: QueenGovernance = {},
+  ) {
     this.name = spec.queen.name;
     this.stream = spec.id;
     this.loop = spec.queen.selfImprovingLoop;
     this.log = log;
     this.charterContext = charterContext;
+    this.ledger = governance.ledger ?? new SwarmLedger({ clock: governance.clock });
+    this.grant = governance.grant ?? queenGrant(spec.id, spec.queen.name);
     // Build the worker mesh from config. Each worker is stateless + single-skill.
-    this.workers = spec.workers.map((w) => makeWorker(w.name, spec.id, w.skill));
+    this.workers = spec.workers.map((w) => makeWorker(w.name, spec.id, w.skill, governance.clock));
   }
 
   /** The worker roster (read-only view). */
@@ -145,14 +177,55 @@ export class Queen {
   }
 
   /**
+   * record() — write one decision into the append-only ledger.
+   *
+   * Every ruling lands here, not only the interesting ones. A ledger that holds
+   * refusals but not approvals answers "what did it block?" and cannot answer
+   * "what did it do?", and clause 6 needs the second question answerable too.
+   */
+  private record(decision: QueenDecision, report: WorkerReport): void {
+    this.ledger.append({
+      kind: decision.verdict === 'refuse' ? 'refusal' : 'decision',
+      actor: this.name,
+      stream: this.stream,
+      subject: decision.taskId,
+      summary:
+        `${decision.verdict.toUpperCase()} at ${decision.effective} — ` +
+        (decision.verdict === 'refuse'
+          ? decision.charter.breaches.map((b) => b.reason).join(' ')
+          : decision.classification.reason),
+      detail: {
+        worker: decision.worker,
+        action_kind: report.proposed?.kind ?? null,
+        classified: decision.classification.decision,
+        effective: decision.effective,
+        gates: decision.classification.gates,
+        breaches: decision.charter.breaches.map((b) => ({
+          clause: b.clause,
+          disposition: b.disposition,
+          reason: b.reason,
+          remedy: b.remedy,
+        })),
+      },
+    });
+  }
+
+  /**
    * stepLoop() — run one self-improving-loop step across the worker mesh.
    *
    * Workers PROPOSE (read/draft only + append to vault); the queen CLASSIFIES and
    * decides. Nothing gated is executed here. This is the dry-run heartbeat.
+   *
+   * Both MCP handles are brokered before use. The worker mesh receives a grant
+   * narrowed to append-only memory — so the IAM boundary that streams.ts states
+   * in prose is enforced by the object the worker actually holds — and the
+   * queen's own payments calls are checked against its seat's grant.
    */
   async stepLoop(tasks: Task[], mcp: QueenMcp, loopStep = this.loop[0]): Promise<QueenLoopResult> {
     this.log(`\n  [${this.name}] loop step: "${loopStep}" — dispatching ${tasks.length} worker task(s)`);
     const decisions: QueenDecision[] = [];
+    const audit = ledgerAudit(this.ledger, this.stream);
+    const payments = mcp.payments ? brokerPayments(mcp.payments, this.grant, audit) : undefined;
 
     for (const task of tasks) {
       const worker = task.worker ? this.workers.find((w) => w.name === task.worker) : undefined;
@@ -160,9 +233,11 @@ export class Queen {
       if (!chosen) {
         throw new Error('No worker available to execute task: ' + task.id);
       }
-      const report = await chosen.run(task, mcp.vault);
+      const workerVault = brokerVault(mcp.vault, this.grant.restrict(chosen.name, ['vault.append']), audit);
+      const report = await chosen.run(task, workerVault);
       const decision = this.decide(report);
       decisions.push(decision);
+      this.record(decision, report);
 
       this.log(
         `    • ${decision.worker} → ${decision.effective.toUpperCase()} ` +
@@ -178,16 +253,16 @@ export class Queen {
       if (decision.verdict === 'refuse') continue;
 
       // Demonstrate the verify-only Payments MCP touch WITHOUT moving money.
-      if (this.stream === 'payments' && mcp.payments && report.proposed.movesMoney) {
+      if (this.stream === 'payments' && payments && report.proposed.movesMoney) {
         this.log('    ↳ Payments Queen runs verify-only governance (fail-closed):');
-        await mcp.payments.verify_mandate({
+        await payments.verify_mandate({
           signature: 'dry-run',
           amount: report.proposed.amount ?? 0,
           purpose: task.description,
         });
-        await mcp.payments.check_spend_cap(this.stream, report.proposed.amount ?? 0);
+        await payments.check_spend_cap(this.stream, report.proposed.amount ?? 0);
         if (decision.verdict !== 'act') {
-          await mcp.payments.require_human_approval(decision.classification.reason);
+          await payments.require_human_approval(decision.classification.reason);
         }
       }
     }
