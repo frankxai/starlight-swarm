@@ -17,17 +17,18 @@
     "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
     "next": "^14.2.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "@modelcontextprotocol/sdk": "latest",
     "zod": "latest"
   },
   "devDependencies": {
-    "typescript": "^5.4.5",
-    "tsx": "^4.19.2",
     "@types/node": "^20.12.7",
     "@types/react": "^18.2.79",
-    "@types/react-dom": "^18.2.25"
+    "@types/react-dom": "^18.2.25",
+    "playwright": "^1.62.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.4.5"
   }
 }
