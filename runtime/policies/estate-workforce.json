@@ -1,0 +1,28 @@
+{
+  "schema": "starlight.workforce-projection/v1",
+  "portfolio_id": "starlight",
+  "authority": "starlight-queen",
+  "topology_source": "queen/reports/swarm-topology-ruling-2026-09-02.md",
+  "identity_source": "starlight-agent-army-architecture",
+  "capability_source": "ai-capability-registry",
+  "steward_source": "ops/stewards/STEWARDSHIP.md",
+  "mode": "internal-tenant-ready",
+  "routing": "evaluated-role-with-independent-provider-check",
+  "budget": { "planning_daily_usd": 25, "authorized_daily_usd": 0 },
+  "pilot_concurrency": 1,
+  "roles": ["coordinator", "maker", "independent-verifier", "synthetic-user"],
+  "units": [
+    { "id": "frankx", "name": "FrankX", "pilot": true, "steward": "steward-frankx", "repo": "frankx.ai-vercel-website", "outcome": "Qualified demand and verified product delivery" },
+    { "id": "starlight", "name": "Starlight Intelligence", "pilot": true, "steward": "steward-substrate", "repo": "Starlight-Intelligence-System", "outcome": "Reliable agent infrastructure and reusable delivery tools" },
+    { "id": "gencreator", "name": "GenCreator", "pilot": true, "steward": "steward-revenue", "repo": "gencreator.ai", "outcome": "Creator activation and completed useful artifacts" },
+    { "id": "gencreator-community", "name": "GenCreator Community / VibeClubs", "pilot": false, "steward": "steward-partnerships", "repo": "gencreator-community", "outcome": "Completed creator sessions and retained participation" },
+    { "id": "arcanea", "name": "Arcanea", "pilot": false, "steward": "steward-arcanea", "repo": "arcanea-ai-app", "outcome": "Canon-consistent worlds and creator activation" },
+    { "id": "anime-legends", "name": "Anime Legends", "pilot": false, "steward": "steward-arcanea", "repo": "AnimeLegends", "outcome": "Original finished media with verified rights" },
+    { "id": "agentic-income", "name": "Agentic Income", "pilot": false, "steward": "steward-revenue", "repo": "agenticincome", "outcome": "Qualified implementation demand and retained use" },
+    { "id": "reality-architect", "name": "Reality Architect", "pilot": false, "steward": "steward-content", "repo": "realityarchitect", "outcome": "Completed methods and useful customer outcomes" },
+    { "id": "starlight-academy", "name": "Starlight Academy", "pilot": false, "steward": "steward-partnerships", "repo": "starlight-intelligence-academy", "outcome": "Completed operator capstones and qualified applications" },
+    { "id": "blue-life", "name": "Blue Life Commons", "pilot": false, "steward": "steward-content", "repo": "blue-life-commons", "outcome": "Sourced records, reuse and reviewed contributions" },
+    { "id": "ocean-intelligence", "name": "Ocean Intelligence", "pilot": false, "steward": "steward-substrate", "repo": "ocean-intelligence", "outcome": "Source accuracy and institutional operator time saved" },
+    { "id": "ana", "name": "Ana", "pilot": false, "steward": "steward-partnerships", "repo": "Ana", "outcome": "Owner-approved service outcomes within a separate data boundary" }
+  ]
+}
