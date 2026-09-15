@@ -1,6 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { cancellationInputSchema, consumptionInputSchema, operationBindingSchema, startLeaseInputSchema } from './operation-authority';
+import {
+  cancellationInputSchema,
+  consumptionInputSchema,
+  operationBindingSchema,
+  startLeaseInputSchema,
+  startRedemptionInputSchema,
+} from './operation-authority';
 import { sha256Digest } from './runtime-digest';
 import type {
   AdmissionReservation,
@@ -16,6 +22,9 @@ import type {
   StartLeaseInput,
   StartLeaseReceipt,
   StartLeaseResult,
+  StartRedemptionInput,
+  StartRedemptionReceipt,
+  StartRedemptionResult,
   TrustedHostEvidence,
 } from './operation-authority';
 import { z } from 'zod';
@@ -62,11 +71,15 @@ INSERT INTO swarm_authority_control (singleton) VALUES (TRUE) ON CONFLICT (singl
 CREATE TABLE IF NOT EXISTS swarm_authority_hosts (
   host_id TEXT PRIMARY KEY, evidence JSONB NOT NULL, observed_at TIMESTAMPTZ NOT NULL,
   capacity_slots INTEGER NOT NULL CHECK (capacity_slots >= 0),
-  reserved_slots INTEGER NOT NULL DEFAULT 0 CHECK (reserved_slots >= 0)
+  reserved_slots INTEGER NOT NULL DEFAULT 0 CHECK (reserved_slots >= 0),
+  authorized_slots INTEGER NOT NULL DEFAULT 0 CHECK (authorized_slots >= 0),
+  CHECK (reserved_slots + authorized_slots <= capacity_slots)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_budgets (
   receipt_id TEXT PRIMARY KEY, hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
-  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0)
+  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  committed_usd NUMERIC NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
+  CHECK (reserved_usd + committed_usd <= hard_limit_usd)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_budget_windows (
   window_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL,
@@ -75,6 +88,8 @@ CREATE TABLE IF NOT EXISTS swarm_authority_budget_windows (
   currency CHAR(3) NOT NULL CHECK (currency='USD'),
   hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
   reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  committed_usd NUMERIC NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
+  CHECK (reserved_usd + committed_usd <= hard_limit_usd),
   CHECK (ends_at > starts_at)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_prepared_operations (
@@ -92,14 +107,18 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   consumption_id UUID UNIQUE, consumed_at TIMESTAMPTZ, lease_claim_token_sha256 CHAR(64),
   lease_id UUID, start_request_id UUID, lease_issued_at TIMESTAMPTZ,
   lease_expires_at TIMESTAMPTZ, lease_duration_ms INTEGER,
-  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','cancelled','expired'))
+  redemption_token_sha256 CHAR(64), control_token_sha256 CHAR(64),
+  broker_execution_identity TEXT, broker_identity_evidence_ref TEXT,
+  redemption_id UUID, redemption_request_id UUID, start_authorized_at TIMESTAMPTZ,
+  committed_cost_usd NUMERIC,
+  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'))
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
   reservation_id UUID NOT NULL, window_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL CHECK (reserved_cost_usd >= 0),
   PRIMARY KEY (reservation_id,window_id)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','reservation-cancelled','expired','budget-window-registered','budget-window-denied')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -109,6 +128,9 @@ CREATE TABLE IF NOT EXISTS swarm_authority_audit (
 -- so they are cancelled as replay tombstones and their per-receipt holds released.
 ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS capacity_slots INTEGER;
 ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS reserved_slots INTEGER;
+ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS authorized_slots INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE swarm_authority_budgets ADD COLUMN IF NOT EXISTS committed_usd NUMERIC NOT NULL DEFAULT 0;
+ALTER TABLE swarm_authority_budget_windows ADD COLUMN IF NOT EXISTS committed_usd NUMERIC NOT NULL DEFAULT 0;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS binding JSONB;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS revocation_refs JSONB;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS consume_token_sha256 CHAR(64);
@@ -122,6 +144,14 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_request_
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_issued_at TIMESTAMPTZ;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_duration_ms INTEGER;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS control_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_execution_identity TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_identity_evidence_ref TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_request_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_authorized_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS committed_cost_usd NUMERIC;
 
 DO $migration$
 BEGIN
@@ -234,6 +264,80 @@ UPDATE swarm_authority_reservations r SET state='cancelled'
 WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
   AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id);
 
+-- Leases issued before redemption and control credentials existed cannot be
+-- credential-grafted safely. They never authorized a runner, so cancel them as
+-- replay tombstones and release their still-reserved resources exactly once.
+DO $legacy_lease_migration$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM (
+      SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
+      FROM swarm_authority_reservations
+      WHERE state='leased-not-started'
+        AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+          OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
+      GROUP BY budget_receipt_id
+    ) legacy LEFT JOIN swarm_authority_budgets b ON b.receipt_id=legacy.budget_receipt_id
+    WHERE b.receipt_id IS NULL OR legacy.cost < 0 OR b.reserved_usd < legacy.cost
+  ) THEN
+    RAISE EXCEPTION 'legacy start lease budget ledger is inconsistent';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM (
+      SELECT host_id,COUNT(*)::INTEGER AS slots
+      FROM swarm_authority_reservations
+      WHERE state='leased-not-started'
+        AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+          OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
+      GROUP BY host_id
+    ) legacy LEFT JOIN swarm_authority_hosts h ON h.host_id=legacy.host_id
+    WHERE h.host_id IS NULL OR h.reserved_slots < legacy.slots
+  ) THEN
+    RAISE EXCEPTION 'legacy start lease host ledger is inconsistent';
+  END IF;
+END
+$legacy_lease_migration$;
+UPDATE swarm_authority_budgets b SET reserved_usd=reserved_usd-legacy.cost
+FROM (
+  SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
+  FROM swarm_authority_reservations
+  WHERE state='leased-not-started'
+    AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+      OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
+  GROUP BY budget_receipt_id
+) legacy WHERE b.receipt_id=legacy.budget_receipt_id;
+UPDATE swarm_authority_budget_windows w SET reserved_usd=reserved_usd-legacy.cost
+FROM (
+  SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
+  FROM swarm_authority_budget_holds h
+  JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
+  WHERE r.state='leased-not-started'
+    AND (r.redemption_token_sha256 IS NULL OR r.control_token_sha256 IS NULL
+      OR r.broker_execution_identity IS NULL OR r.broker_identity_evidence_ref IS NULL)
+  GROUP BY h.window_id
+) legacy WHERE w.window_id=legacy.window_id AND w.reserved_usd >= legacy.cost;
+UPDATE swarm_authority_hosts h SET reserved_slots=reserved_slots-legacy.slots
+FROM (
+  SELECT host_id,COUNT(*)::INTEGER AS slots
+  FROM swarm_authority_reservations
+  WHERE state='leased-not-started'
+    AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+      OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
+  GROUP BY host_id
+) legacy WHERE h.host_id=legacy.host_id AND h.reserved_slots >= legacy.slots;
+INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+SELECT 'reservation-cancelled',operation_id,binding_digest_sha256,clock_timestamp(),
+  jsonb_build_object('reservation_id',reservation_id,'lease_id',lease_id,
+    'reason','lease predated redemption and control credentials','released_cost_usd',reserved_cost_usd)
+FROM swarm_authority_reservations
+WHERE state='leased-not-started'
+  AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+    OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL);
+UPDATE swarm_authority_reservations SET state='cancelled'
+WHERE state='leased-not-started'
+  AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
+    OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL);
+
 -- Any attributed active reservation must be bound to exactly one policy and one
 -- daily window for its signed policy, and every aggregate ledger must reconcile
 -- exactly to the active holds. Partial or fabricated attribution fails migration.
@@ -271,6 +375,71 @@ BEGIN
 END
 $aggregate_integrity$;
 
+DO $start_authority_integrity$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_reservations r
+    LEFT JOIN swarm_authority_budgets b ON b.receipt_id=r.budget_receipt_id
+    LEFT JOIN swarm_authority_hosts host ON host.host_id=r.host_id
+    LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
+    LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
+    WHERE r.state IN ('start-authorized-not-observed','stop-requested')
+    GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd,r.committed_cost_usd,
+      b.receipt_id,host.host_id
+    HAVING b.receipt_id IS NULL OR host.host_id IS NULL
+      OR r.host_id IS DISTINCT FROM r.binding->>'host_id'
+      OR r.reserved_cost_usd IS DISTINCT FROM (r.binding->>'requested_cost_usd')::numeric
+      OR r.committed_cost_usd IS DISTINCT FROM r.reserved_cost_usd
+      OR COUNT(h.window_id) <> 2 OR COUNT(DISTINCT w.kind) <> 2
+      OR COUNT(*) FILTER (WHERE w.kind='policy') <> 1
+      OR COUNT(*) FILTER (WHERE w.kind='daily') <> 1
+      OR COUNT(*) FILTER (WHERE w.policy_id IS DISTINCT FROM r.binding->>'budget_policy_id'
+        OR w.currency IS DISTINCT FROM 'USD'
+        OR h.reserved_cost_usd IS DISTINCT FROM r.reserved_cost_usd) > 0
+  ) THEN
+    RAISE EXCEPTION 'authorized operation attribution is missing, ambiguous, or inconsistent';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_budgets b
+    LEFT JOIN (
+      SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
+      FROM swarm_authority_reservations
+      WHERE state IN ('start-authorized-not-observed','stop-requested')
+      GROUP BY budget_receipt_id
+    ) committed ON committed.budget_receipt_id=b.receipt_id
+    WHERE b.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
+  ) THEN
+    RAISE EXCEPTION 'committed receipt budget ledger does not reconcile';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_budget_windows w
+    LEFT JOIN (
+      SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
+      FROM swarm_authority_budget_holds h
+      JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
+      WHERE r.state IN ('start-authorized-not-observed','stop-requested')
+      GROUP BY h.window_id
+    ) committed ON committed.window_id=w.window_id
+    WHERE w.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
+  ) THEN
+    RAISE EXCEPTION 'committed aggregate budget ledger does not reconcile';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_hosts h
+    LEFT JOIN (
+      SELECT host_id,COUNT(*)::INTEGER AS slots
+      FROM swarm_authority_reservations
+      WHERE state IN ('start-authorized-not-observed','stop-requested')
+      GROUP BY host_id
+    ) authorized ON authorized.host_id=h.host_id
+    WHERE h.authorized_slots IS DISTINCT FROM COALESCE(authorized.slots,0)
+      OR h.reserved_slots + h.authorized_slots > h.capacity_slots
+  ) THEN
+    RAISE EXCEPTION 'authorized host ledger does not reconcile';
+  END IF;
+END
+$start_authority_integrity$;
+
 DO $aggregate_constraints$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_budget_holds_reservation_fk') THEN
@@ -287,10 +456,20 @@ $aggregate_constraints$;
 ALTER TABLE swarm_authority_hosts ALTER COLUMN capacity_slots SET NOT NULL;
 ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET DEFAULT 0;
 ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET NOT NULL;
+ALTER TABLE swarm_authority_hosts ALTER COLUMN authorized_slots SET DEFAULT 0;
+ALTER TABLE swarm_authority_hosts ALTER COLUMN authorized_slots SET NOT NULL;
 ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_capacity_slots_check;
 ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_capacity_slots_check CHECK (capacity_slots >= 0);
 ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_reserved_slots_check;
 ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_reserved_slots_check CHECK (reserved_slots >= 0);
+ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_authorized_slots_check;
+ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_authorized_slots_check CHECK (authorized_slots >= 0);
+ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_total_slots_check;
+ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_total_slots_check CHECK (reserved_slots + authorized_slots <= capacity_slots);
+ALTER TABLE swarm_authority_budgets DROP CONSTRAINT IF EXISTS swarm_authority_budgets_total_usd_check;
+ALTER TABLE swarm_authority_budgets ADD CONSTRAINT swarm_authority_budgets_total_usd_check CHECK (reserved_usd + committed_usd <= hard_limit_usd);
+ALTER TABLE swarm_authority_budget_windows DROP CONSTRAINT IF EXISTS swarm_authority_budget_windows_total_usd_check;
+ALTER TABLE swarm_authority_budget_windows ADD CONSTRAINT swarm_authority_budget_windows_total_usd_check CHECK (reserved_usd + committed_usd <= hard_limit_usd);
 ALTER TABLE swarm_authority_reservations ALTER COLUMN binding SET NOT NULL;
 ALTER TABLE swarm_authority_reservations ALTER COLUMN revocation_refs SET NOT NULL;
 ALTER TABLE swarm_authority_reservations ALTER COLUMN consume_token_sha256 SET NOT NULL;
@@ -300,6 +479,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_lease_id_uq
   ON swarm_authority_reservations(lease_id) WHERE lease_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_start_request_id_uq
   ON swarm_authority_reservations(start_request_id) WHERE start_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_id_uq
+  ON swarm_authority_reservations(redemption_id) WHERE redemption_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_request_id_uq
+  ON swarm_authority_reservations(redemption_request_id) WHERE redemption_request_id IS NOT NULL;
 ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_lease_fields_check;
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_lease_fields_check CHECK (
   num_nonnulls(lease_id,start_request_id,lease_issued_at,lease_expires_at,lease_duration_ms) IN (0,5)
@@ -308,14 +491,48 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND lease_expires_at=lease_issued_at+(lease_duration_ms*INTERVAL '1 millisecond')
   ))
   AND (state <> 'reserved-not-started' OR (lease_id IS NULL AND lease_claim_token_sha256 IS NULL))
-  AND (state <> 'consumed-not-started' OR lease_id IS NULL)
-  AND (state <> 'leased-not-started' OR (lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL))
+  AND (state IN ('cancelled','expired') OR consume_token_sha256 <> cancel_token_sha256)
+  AND (state <> 'consumed-not-started' OR (
+    lease_id IS NULL
+    AND (lease_claim_token_sha256 IS NULL OR (
+      consume_token_sha256 <> lease_claim_token_sha256
+      AND cancel_token_sha256 <> lease_claim_token_sha256
+    ))
+  ))
+  AND (state <> 'leased-not-started' OR (
+    lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
+    AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
+    AND cancel_token_sha256 <> lease_claim_token_sha256
+    AND cancel_token_sha256 <> redemption_token_sha256
+    AND cancel_token_sha256 <> control_token_sha256
+    AND consume_token_sha256 <> lease_claim_token_sha256
+    AND consume_token_sha256 <> redemption_token_sha256
+    AND consume_token_sha256 <> control_token_sha256
+    AND lease_claim_token_sha256 <> redemption_token_sha256
+    AND lease_claim_token_sha256 <> control_token_sha256
+    AND redemption_token_sha256 <> control_token_sha256
+  ))
+  AND (state NOT IN ('start-authorized-not-observed','stop-requested') OR (
+    lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
+    AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
+    AND cancel_token_sha256 <> lease_claim_token_sha256
+    AND cancel_token_sha256 <> redemption_token_sha256
+    AND cancel_token_sha256 <> control_token_sha256
+    AND consume_token_sha256 <> lease_claim_token_sha256
+    AND consume_token_sha256 <> redemption_token_sha256
+    AND consume_token_sha256 <> control_token_sha256
+    AND lease_claim_token_sha256 <> redemption_token_sha256
+    AND lease_claim_token_sha256 <> control_token_sha256
+    AND redemption_token_sha256 <> control_token_sha256
+    AND num_nonnulls(redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd)=4
+    AND committed_cost_usd=reserved_cost_usd
+  ))
 );
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
-  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','cancelled','expired'));
+  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','reservation-cancelled','expired','budget-window-registered','budget-window-denied'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -337,10 +554,14 @@ function startLeaseDenied(blocker: string): StartLeaseResult {
   return { leased: false, receipt: null, blockers: [blocker] };
 }
 
+function startRedemptionDenied(blocker: string): StartRedemptionResult {
+  return { redeemed: false, receipt: null, blockers: [blocker] };
+}
+
 function cancellationDenied(
   reservationId: string,
   blocker: string,
-  state: null | 'expired' = null,
+  state: null | 'expired' | 'stop-requested' = null,
   alreadyTerminal = false,
 ): CancellationResult {
   return {
@@ -425,8 +646,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     const client = await this.pool.connect();
     try {
       await client.query(
-        `INSERT INTO swarm_authority_hosts (host_id,evidence,observed_at,capacity_slots,reserved_slots)
-         VALUES ($1,$2::jsonb,$3::timestamptz,$4,0)
+        `INSERT INTO swarm_authority_hosts (host_id,evidence,observed_at,capacity_slots,reserved_slots,authorized_slots)
+         VALUES ($1,$2::jsonb,$3::timestamptz,$4,0,0)
          ON CONFLICT (host_id) DO UPDATE SET evidence=EXCLUDED.evidence,
          observed_at=EXCLUDED.observed_at, capacity_slots=EXCLUDED.capacity_slots`,
         [trusted.host_id, JSON.stringify(trusted), trusted.observed_at, trusted.capacity_slots],
@@ -581,6 +802,22 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           })],
         );
       }
+      const authorized = await client.query(
+        `UPDATE swarm_authority_reservations SET state='stop-requested'
+         WHERE operation_id=$1 AND state='start-authorized-not-observed'
+         RETURNING reservation_id,binding_digest_sha256`,
+        [operationId],
+      );
+      for (const row of authorized.rows) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [operationId, row.binding_digest_sha256, transactionAt, JSON.stringify({
+            reservation_id: row.reservation_id, reason: 'prepared operation cancelled after start authorization',
+            execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+      }
       await client.query(
         `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
          VALUES ('cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
@@ -637,6 +874,23 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({ reservation_id: row.reservation_id, reason: 'authority revoked', revocation_ref: ref, released_cost_usd: released })],
         );
       }
+      const authorized = await client.query(
+        `UPDATE swarm_authority_reservations SET state='stop-requested'
+         WHERE state='start-authorized-not-observed'
+           AND revocation_refs @> jsonb_build_array($1::text)
+         RETURNING reservation_id,operation_id,binding_digest_sha256`,
+        [ref],
+      );
+      for (const row of authorized.rows) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
+            reservation_id: row.reservation_id, reason: 'authority revoked after start authorization',
+            revocation_ref: ref, execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+      }
       await client.query(
         `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
          VALUES ('revoked','control-plane',$1,$2::timestamptz,$3::jsonb)`,
@@ -676,7 +930,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                FROM swarm_authority_budget_holds h2
                JOIN swarm_authority_reservations r2 ON r2.reservation_id=h2.reservation_id
                WHERE h2.window_id=w.window_id
-                 AND r2.state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS ledger_reconciles
+                 AND r2.state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS ledger_reconciles,
+              (w.committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(h3.reserved_cost_usd),0)
+               FROM swarm_authority_budget_holds h3
+               JOIN swarm_authority_reservations r3 ON r3.reservation_id=h3.reservation_id
+               WHERE h3.window_id=w.window_id
+                 AND r3.state IN ('start-authorized-not-observed','stop-requested'))) AS committed_reconciles
        FROM swarm_authority_budget_holds h JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
        WHERE h.reservation_id=$1::uuid ORDER BY w.kind`,
       [reservationId, expectedCost],
@@ -685,7 +944,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     if (result.rows.length !== 2
       || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')
       || result.rows.some((row) => row.policy_id !== expectedPolicyId
-        || row.currency !== 'USD' || row.hold_cost_matches !== true || row.ledger_reconciles !== true)) return null;
+        || row.currency !== 'USD' || row.hold_cost_matches !== true
+        || row.ledger_reconciles !== true || row.committed_reconciles !== true)) return null;
     try {
       return result.rows.map((row) => ({
         window_id: String(row.window_id),
@@ -776,7 +1036,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                 approval_receipt_id,budget_receipt_id,host_id,reserved_cost_usd,
                 (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding,
                 reservation_expires_at,max_host_evidence_age_ms,state,consumption_id,consumed_at,
-                lease_claim_token_sha256
+                consume_token_sha256,cancel_token_sha256,lease_claim_token_sha256
          FROM swarm_authority_reservations
          WHERE reservation_id=$1::uuid AND consume_token_sha256=$2 FOR UPDATE`,
         [request.reservation_id, createHash('sha256').update(request.consume_token, 'utf8').digest('hex')],
@@ -785,6 +1045,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (!row) return await deny('Reservation does not exist.');
       if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id || row.binding_digest_sha256 !== request.binding_digest_sha256) {
         return await deny('Consumption request does not match the reserved operation and effect.');
+      }
+      const leaseClaimDigest = createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex');
+      if (leaseClaimDigest === row.consume_token_sha256 || leaseClaimDigest === row.cancel_token_sha256) {
+        return await deny('Consume, cancel, and lease-claim credentials must be distinct.');
       }
       const binding = operationBindingSchema.safeParse(row.binding);
       if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
@@ -866,7 +1130,6 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         if (typeof row.consumption_id !== 'string' || !row.consumption_id || !row.consumed_at) {
           return await deny('Stored consumption receipt is incomplete.');
         }
-        const leaseClaimDigest = createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex');
         if (!row.lease_claim_token_sha256) {
           return await deny('Stored consumption is not bound to a lease-claim credential.');
         }
@@ -894,12 +1157,13 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       }
 
       const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
+        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
         [row.host_id],
       );
       const host = hostEvidence(hostRow.rows[0]);
       const capacity = Number(hostRow.rows[0]?.capacity_slots);
       const reserved = Number(hostRow.rows[0]?.reserved_slots);
+      const authorized = Number(hostRow.rows[0]?.authorized_slots);
       const maxAge = Number(row.max_host_evidence_age_ms);
       if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
         return await deny('Trusted host is unavailable at consumption time.');
@@ -909,7 +1173,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return await deny('Trusted host evidence is stale or from the future at consumption time.');
       }
       if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired at consumption time.');
-      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || reserved < 1 || capacity < reserved) {
+      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
+        || reserved < 1 || authorized < 0 || capacity < reserved + authorized) {
         return await deny('Trusted host capacity ledger cannot honor the reservation.');
       }
       const hostCaps = new Set(host.allowed_capabilities);
@@ -926,7 +1191,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         identity_evidence_ref: request.identity_evidence_ref,
         budget_policy_id: binding.data.budget_policy_id,
         budget_windows: heldWindows,
-        lease_claim_token_sha256: createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex'),
+          lease_claim_token_sha256: leaseClaimDigest,
         consumed_at: at,
         consumption_expires_at: sqlInstant(row.reservation_expires_at),
         state: 'consumed-not-started',
@@ -986,6 +1251,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       execution_identity: request.execution_identity,
       identity_evidence_ref: request.identity_evidence_ref,
       lease_claim_token_sha256: String(row.lease_claim_token_sha256),
+      redemption_token_sha256: String(row.redemption_token_sha256),
+      control_token_sha256: String(row.control_token_sha256),
+      broker_execution_identity: String(row.broker_execution_identity),
+      broker_identity_evidence_ref: String(row.broker_identity_evidence_ref),
       lease_issued_at: sqlInstant(row.lease_issued_at),
       lease_expires_at: sqlInstant(row.lease_expires_at),
       lease_duration_ms: Number(row.lease_duration_ms),
@@ -1002,7 +1271,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
                 budget_receipt_id,host_id,reserved_cost_usd,reservation_expires_at,max_host_evidence_age_ms,
                 state,consumption_id,consumed_at,lease_id,start_request_id,lease_issued_at,lease_expires_at,lease_duration_ms,
-                lease_claim_token_sha256,
+                consume_token_sha256,cancel_token_sha256,lease_claim_token_sha256,redemption_token_sha256,control_token_sha256,
+                broker_execution_identity,broker_identity_evidence_ref,
                 (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
          FROM swarm_authority_reservations
          WHERE reservation_id=$1::uuid AND lease_claim_token_sha256=$2 FOR UPDATE`,
@@ -1010,6 +1280,15 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       );
       const row = found.rows[0];
       if (!row) return await deny('Reservation does not exist.');
+      const redemptionDigest = createHash('sha256').update(request.redemption_token, 'utf8').digest('hex');
+      const controlDigest = createHash('sha256').update(request.control_token, 'utf8').digest('hex');
+      const leaseClaimDigest = createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex');
+      if (new Set([
+        String(row.consume_token_sha256), String(row.cancel_token_sha256),
+        leaseClaimDigest, redemptionDigest, controlDigest,
+      ]).size !== 5) {
+        return await deny('Consume, cancel, lease-claim, redemption, and control credentials must be pairwise distinct.');
+      }
       if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
         || row.binding_digest_sha256 !== request.binding_digest_sha256 || row.consumption_id !== request.consumption_id) {
         return await deny('Start-lease request does not match the consumed operation.');
@@ -1104,12 +1383,13 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       }
 
       const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
+        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
         [row.host_id],
       );
       const host = hostEvidence(hostRow.rows[0]);
       const capacity = Number(hostRow.rows[0]?.capacity_slots);
       const reserved = Number(hostRow.rows[0]?.reserved_slots);
+      const authorized = Number(hostRow.rows[0]?.authorized_slots);
       const maxAge = Number(row.max_host_evidence_age_ms);
       if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
         return await deny('Trusted host is unavailable at start-lease time.');
@@ -1119,7 +1399,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return await deny('Trusted host evidence is stale or from the future at start-lease time.');
       }
       if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired at start-lease time.');
-      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || reserved < 1 || capacity < reserved) {
+      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
+        || reserved < 1 || authorized < 0 || capacity < reserved + authorized) {
         return await deny('Trusted host capacity ledger cannot honor the start lease.');
       }
       const hostCaps = new Set(host.allowed_capabilities);
@@ -1138,7 +1419,11 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (row.state === 'leased-not-started') {
         if (row.start_request_id !== request.start_request_id
           || Number(row.lease_duration_ms) !== request.lease_duration_ms
-          || !row.lease_id || !row.lease_issued_at || !row.lease_expires_at) {
+          || !row.lease_id || !row.lease_issued_at || !row.lease_expires_at
+          || row.redemption_token_sha256 !== redemptionDigest
+          || row.control_token_sha256 !== controlDigest
+          || row.broker_execution_identity !== request.broker_execution_identity
+          || row.broker_identity_evidence_ref !== request.broker_identity_evidence_ref) {
           return await deny('A different start lease was already issued for this reservation.');
         }
         const receipt = receiptFrom(row);
@@ -1155,11 +1440,15 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const transitioned = await client.query(
         `UPDATE swarm_authority_reservations
          SET state='leased-not-started',lease_id=$2::uuid,start_request_id=$3::uuid,
-             lease_issued_at=$4::timestamptz,lease_expires_at=$5::timestamptz,lease_duration_ms=$6
+             lease_issued_at=$4::timestamptz,lease_expires_at=$5::timestamptz,lease_duration_ms=$6,
+             redemption_token_sha256=$7,control_token_sha256=$8,
+             broker_execution_identity=$9,broker_identity_evidence_ref=$10
          WHERE reservation_id=$1::uuid AND state='consumed-not-started'
          RETURNING lease_id,start_request_id,consumption_id,lease_claim_token_sha256,
+                   redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref,
                    lease_issued_at,lease_expires_at,lease_duration_ms`,
-        [request.reservation_id, leaseId, request.start_request_id, at, leaseExpiresAt, request.lease_duration_ms],
+        [request.reservation_id, leaseId, request.start_request_id, at, leaseExpiresAt, request.lease_duration_ms,
+          redemptionDigest, controlDigest, request.broker_execution_identity, request.broker_identity_evidence_ref],
       );
       if (transitioned.rows.length !== 1) return await deny('Start lease could not be issued exactly once.');
       const receipt = receiptFrom(transitioned.rows[0]);
@@ -1175,6 +1464,371 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
         action: 'lease-start', reservation_id: request.reservation_id,
         error: error instanceof Error ? error.message : 'unknown start-lease failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
+  }
+
+  async redeemStartAuthorization(input: StartRedemptionInput): Promise<StartRedemptionResult> {
+    const parsed = startRedemptionInputSchema.safeParse(input);
+    if (!parsed.success) return startRedemptionDenied('Start-redemption request is invalid.');
+    const request = parsed.data;
+    const client = await this.pool.connect();
+    let at = new Date().toISOString();
+    const deny = async (blocker: string) => {
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('start-redemption-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+          reservation_id: request.reservation_id, lease_id: request.lease_id,
+          redemption_request_id: request.redemption_request_id, blockers: [blocker],
+        })],
+      );
+      await client.query('COMMIT');
+      return startRedemptionDenied(blocker);
+    };
+    const receiptFrom = (row: Record<string, unknown>): StartRedemptionReceipt => ({
+      schema_version: 'starlight.worker_start_redemption.v1',
+      redemption_id: String(row.redemption_id),
+      redemption_request_id: String(row.redemption_request_id),
+      lease_id: String(row.lease_id),
+      consumption_id: String(row.consumption_id),
+      reservation_id: request.reservation_id,
+      operation_id: request.operation_id,
+      effect_id: request.effect_id,
+      binding_digest_sha256: request.binding_digest_sha256,
+      execution_identity: request.execution_identity,
+      identity_evidence_ref: request.identity_evidence_ref,
+      broker_execution_identity: String(row.broker_execution_identity),
+      broker_identity_evidence_ref: String(row.broker_identity_evidence_ref),
+      redemption_token_sha256: String(row.redemption_token_sha256),
+      control_token_sha256: String(row.control_token_sha256),
+      start_authorized_at: sqlInstant(row.start_authorized_at),
+      committed_cost_usd: Number(row.committed_cost_usd),
+      authorization_state: 'start-authorized',
+      execution_observed: false,
+      state: 'start-authorized-not-observed',
+    });
+    try {
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
+      at = await wallClock(client);
+      const nowMs = Date.parse(at);
+      const redemptionDigest = createHash('sha256').update(request.redemption_token, 'utf8').digest('hex');
+      const found = await client.query(
+        `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
+                budget_receipt_id,host_id,reserved_cost_usd,reservation_expires_at,max_host_evidence_age_ms,
+                state,consumption_id,lease_id,start_request_id,lease_expires_at,
+                lease_claim_token_sha256,redemption_token_sha256,control_token_sha256,
+                broker_execution_identity,broker_identity_evidence_ref,
+                redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
+         FROM swarm_authority_reservations
+         WHERE reservation_id=$1::uuid AND lease_id=$2::uuid AND redemption_token_sha256=$3 FOR UPDATE`,
+        [request.reservation_id, request.lease_id, redemptionDigest],
+      );
+      const row = found.rows[0];
+      if (!row) return await deny('Start lease does not exist or the redemption credential is invalid.');
+      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
+        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await deny('Start-redemption request does not match the leased operation.');
+      }
+      const authorizedState = row.state === 'start-authorized-not-observed';
+      const exactRequest = authorizedState && row.redemption_request_id === request.redemption_request_id;
+      const quarantineRetry = async (reason: string, blocker: string): Promise<StartRedemptionResult> => {
+        const stopped = await client.query(
+          `UPDATE swarm_authority_reservations SET state='stop-requested'
+           WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (stopped.rows.length !== 1) return await deny('Start-authorization quarantine lost its authority race.');
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, lease_id: request.lease_id, reason,
+            execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+        await client.query('COMMIT');
+        return startRedemptionDenied(blocker);
+      };
+      if (authorizedState && !exactRequest) {
+        return await deny('A different redemption request already authorized this start lease.');
+      }
+      const binding = operationBindingSchema.safeParse(row.binding);
+      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
+        if (exactRequest) return await quarantineRetry(
+          'stored binding or signed cost invalid on start-authorization retry',
+          'Stored binding or signed cost is invalid on the authorization retry.',
+        );
+        return await deny('Stored reservation binding or signed cost is invalid.');
+      }
+      if (binding.data.execution_identity !== request.execution_identity
+        || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
+        return await deny('Start-redemption worker identity does not match the operation binding.');
+      }
+      if (row.broker_execution_identity !== request.broker_execution_identity
+        || row.broker_identity_evidence_ref !== request.broker_identity_evidence_ref) {
+        return await deny('Start-redemption broker identity does not match the start lease.');
+      }
+      if (row.host_id !== binding.data.host_id) {
+        if (exactRequest) return await quarantineRetry(
+          'stored host attribution drifted from signed binding on authorization retry',
+          'Stored host attribution drifted from the signed binding on the authorization retry.',
+        );
+        return await deny('Stored host attribution does not match the signed operation binding.');
+      }
+      if (exactRequest) {
+        if (!row.redemption_id || !row.start_authorized_at
+          || Number(row.committed_cost_usd) !== binding.data.requested_cost_usd) {
+          return await quarantineRetry(
+            'stored redemption receipt invalid on start-authorization retry',
+            'Stored redemption receipt is invalid on the authorization retry.',
+          );
+        }
+      }
+      if (!exactRequest && row.state !== 'leased-not-started') {
+        return await deny(`Start lease cannot be redeemed from state ${String(row.state)}.`);
+      }
+
+      const heldWindows = await this.readBudgetWindows(
+        client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd,
+      );
+      if (!heldWindows) {
+        if (exactRequest) return await quarantineRetry(
+          'aggregate budget attribution invalid on authorization retry',
+          'Start authorization is no longer current because aggregate budget attribution is invalid.',
+        );
+        return await deny('Aggregate budget holds are missing, ambiguous, or inconsistent.');
+      }
+      if (Date.parse(String(row.reservation_expires_at)) <= nowMs || Date.parse(String(row.lease_expires_at)) <= nowMs) {
+        if (exactRequest) return await quarantineRetry(
+          'lease or reservation expired after start authorization',
+          'Start authorization expired before the retry.',
+        );
+        const expired = await client.query(
+          `UPDATE swarm_authority_reservations SET state='expired'
+           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (expired.rows.length !== 1) return await deny('Start-redemption expiry transition lost its authority race.');
+        const released = await this.releaseResources(client, row);
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('expired',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, lease_id: request.lease_id,
+            reason: 'lease or reservation expired before start authorization', released_cost_usd: released,
+          })],
+        );
+        await client.query('COMMIT');
+        return startRedemptionDenied('Start lease expired before authorization.');
+      }
+      const refs = revocationRefsSchema.safeParse(row.revocation_refs);
+      if (!refs.success) {
+        if (exactRequest) return await quarantineRetry(
+          'stored revocation binding invalid on start-authorization retry',
+          'Stored revocation binding is invalid on the authorization retry.',
+        );
+        return await deny('Stored revocation binding is invalid.');
+      }
+      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
+      if (revoked.rows.length) {
+        if (exactRequest) return await quarantineRetry(
+          'authority revoked after start authorization',
+          'Start authorization was revoked before the retry.',
+        );
+        const cancelled = await client.query(
+          `UPDATE swarm_authority_reservations SET state='cancelled'
+           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (cancelled.rows.length !== 1) return await deny('Start-redemption revocation race was lost.');
+        const released = await this.releaseResources(client, row);
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, lease_id: request.lease_id,
+            reason: 'authority revoked before start authorization', revocation_ref: revoked.rows[0].ref,
+            released_cost_usd: released,
+          })],
+        );
+        await client.query('COMMIT');
+        return startRedemptionDenied('Reservation authority was revoked before start authorization.');
+      }
+      const prepared = await client.query(
+        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
+        [request.operation_id],
+      );
+      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
+        if (exactRequest) return await quarantineRetry(
+          'prepared operation unavailable after start authorization',
+          'Prepared operation is unavailable or drifted on the authorization retry.',
+        );
+        const cancelled = await client.query(
+          `UPDATE swarm_authority_reservations SET state='cancelled'
+           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (cancelled.rows.length !== 1) return await deny('Prepared-operation cancellation race was lost.');
+        const released = await this.releaseResources(client, row);
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, lease_id: request.lease_id,
+            reason: 'prepared operation unavailable before start authorization', released_cost_usd: released,
+          })],
+        );
+        await client.query('COMMIT');
+        return startRedemptionDenied('Prepared operation is unavailable or drifted at start authorization.');
+      }
+      const hostRow = await client.query(
+        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
+                (reserved_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
+                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','stop-requested'))) AS authorized_reconciles
+         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
+        [row.host_id],
+      );
+      const host = hostEvidence(hostRow.rows[0]);
+      const capacity = Number(hostRow.rows[0]?.capacity_slots);
+      const reserved = Number(hostRow.rows[0]?.reserved_slots);
+      const authorized = Number(hostRow.rows[0]?.authorized_slots);
+      const maxAge = Number(row.max_host_evidence_age_ms);
+      if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host unavailable on start-authorization retry',
+          'Trusted host is unavailable on the authorization retry.',
+        );
+        return await deny('Trusted host is unavailable at start-authorization time.');
+      }
+      if (host.capacity_slots !== capacity) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host capacity evidence drifted on start-authorization retry',
+          'Trusted host capacity evidence and ledger differ on the authorization retry.',
+        );
+        return await deny('Trusted host capacity evidence and ledger differ.');
+      }
+      if (nowMs - Date.parse(host.observed_at) > maxAge || Date.parse(host.observed_at) > nowMs + 60_000) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host evidence stale on start-authorization retry',
+          'Trusted host evidence is stale or from the future on the authorization retry.',
+        );
+        return await deny('Trusted host evidence is stale or from the future at start-authorization time.');
+      }
+      if (Date.parse(host.access_review_expires_at) <= nowMs) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host access review expired on start-authorization retry',
+          'Trusted host access review expired before the authorization retry.',
+        );
+        return await deny('Trusted host access review is expired at start-authorization time.');
+      }
+      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
+        || reserved < 0 || authorized < 0 || reserved + authorized > capacity
+        || hostRow.rows[0]?.reserved_reconciles !== true || hostRow.rows[0]?.authorized_reconciles !== true
+        || (exactRequest ? authorized < 1 : reserved < 1)) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host authorization ledger invalid on retry',
+          'Trusted host capacity ledger cannot honor the authorization retry.',
+        );
+        return await deny('Trusted host capacity ledger cannot honor start authorization.');
+      }
+      const hostCaps = new Set(host.allowed_capabilities);
+      if (binding.data.capabilities.some((item) => !hostCaps.has(item))) {
+        if (exactRequest) return await quarantineRetry(
+          'trusted host capability grant changed on start-authorization retry',
+          'Trusted host no longer allows every capability on the authorization retry.',
+        );
+        return await deny('Trusted host no longer allows every authorized capability.');
+      }
+      const budget = await client.query(
+        `SELECT hard_limit_usd,reserved_usd,committed_usd,
+                (reserved_usd >= $2::numeric) AS funds_reservation,
+                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling,
+                (reserved_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
+                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
+                    AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
+                (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
+                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
+                    AND state IN ('start-authorized-not-observed','stop-requested'))) AS committed_reconciles
+         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
+        [row.budget_receipt_id, binding.data.requested_cost_usd],
+      );
+      if (budget.rows.length !== 1 || budget.rows[0].reserved_reconciles !== true
+        || budget.rows[0].committed_reconciles !== true
+        || (!exactRequest && budget.rows[0].funds_reservation !== true)
+        || budget.rows[0].within_ceiling !== true) {
+        if (exactRequest) return await quarantineRetry(
+          'receipt budget ledger invalid on start-authorization retry',
+          'Receipt budget ledger is invalid on the authorization retry.',
+        );
+        return await deny('Receipt budget ledgers are missing, exhausted, or inconsistent.');
+      }
+      if (exactRequest) {
+        const receipt = receiptFrom(row);
+        await client.query('COMMIT');
+        return { redeemed: true, receipt, blockers: [] };
+      }
+      const duplicateRequest = await client.query(
+        'SELECT reservation_id FROM swarm_authority_reservations WHERE redemption_request_id=$1::uuid LIMIT 1',
+        [request.redemption_request_id],
+      );
+      if (duplicateRequest.rows.length) return await deny('Redemption request id is already bound to another reservation.');
+
+      const redemptionId = randomUUID();
+      const transitioned = await client.query(
+        `UPDATE swarm_authority_reservations
+         SET state='start-authorized-not-observed',redemption_id=$2::uuid,redemption_request_id=$3::uuid,
+             start_authorized_at=$4::timestamptz,committed_cost_usd=reserved_cost_usd
+         WHERE reservation_id=$1::uuid AND state='leased-not-started'
+         RETURNING *`,
+        [request.reservation_id, redemptionId, request.redemption_request_id, at],
+      );
+      if (transitioned.rows.length !== 1) return await deny('Start lease could not be authorized exactly once.');
+      const cost = binding.data.requested_cost_usd;
+      const receiptBudget = await client.query(
+        `UPDATE swarm_authority_budgets
+         SET reserved_usd=reserved_usd-$2::numeric,committed_usd=committed_usd+$2::numeric
+         WHERE receipt_id=$1 AND reserved_usd >= $2::numeric
+           AND reserved_usd+committed_usd <= hard_limit_usd RETURNING receipt_id`,
+        [row.budget_receipt_id, cost],
+      );
+      if (receiptBudget.rows.length !== 1) throw new Error('Receipt budget authorization move would underflow or exceed its ceiling.');
+      for (const window of heldWindows) {
+        const aggregate = await client.query(
+          `UPDATE swarm_authority_budget_windows
+           SET reserved_usd=reserved_usd-$2::numeric,committed_usd=committed_usd+$2::numeric
+           WHERE window_id=$1 AND reserved_usd >= $2::numeric
+             AND reserved_usd+committed_usd <= hard_limit_usd RETURNING window_id`,
+          [window.window_id, cost],
+        );
+        if (aggregate.rows.length !== 1) throw new Error('Aggregate budget authorization move would underflow or exceed its ceiling.');
+      }
+      const hostMoved = await client.query(
+        `UPDATE swarm_authority_hosts
+         SET reserved_slots=reserved_slots-1,authorized_slots=authorized_slots+1
+         WHERE host_id=$1 AND reserved_slots >= 1
+           AND reserved_slots+authorized_slots <= capacity_slots RETURNING host_id`,
+        [row.host_id],
+      );
+      if (hostMoved.rows.length !== 1) throw new Error('Host authorization move would underflow or exceed capacity.');
+      const receipt = receiptFrom(transitioned.rows[0]);
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('start-authority-redeemed',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
+      );
+      await client.query('COMMIT');
+      return { redeemed: true, receipt, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'redeem-start-authorization', reservation_id: request.reservation_id, lease_id: request.lease_id,
+        error: error instanceof Error ? error.message : 'unknown start-redemption failure',
       });
       throw error;
     } finally { client.release?.(); }
@@ -1217,6 +1871,37 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (row.state === 'expired') {
         await client.query('COMMIT');
         return cancellationDenied(request.reservation_id, 'Reservation is already expired.', 'expired', true);
+      }
+      if (row.state === 'stop-requested') {
+        await client.query('COMMIT');
+        return cancellationDenied(
+          request.reservation_id,
+          'Stop was already requested; authenticated terminal evidence is required before resource release.',
+          'stop-requested',
+          true,
+        );
+      }
+      if (row.state === 'start-authorized-not-observed') {
+        const stopped = await client.query(
+          `UPDATE swarm_authority_reservations SET state='stop-requested'
+           WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (stopped.rows.length !== 1) throw new Error('Stop request lost its authority race.');
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [row.operation_id, row.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, reason: request.reason,
+            execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+        await client.query('COMMIT');
+        return cancellationDenied(
+          request.reservation_id,
+          'Start authority was already redeemed; authenticated terminal evidence is required before resource release.',
+          'stop-requested',
+        );
       }
       if (row.state !== 'reserved-not-started' && row.state !== 'consumed-not-started' && row.state !== 'leased-not-started') {
         await client.query(
@@ -1298,7 +1983,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       }
 
       const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
+        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
         [request.binding.host_id],
       );
       const host = hostEvidence(hostRow.rows[0]);
@@ -1311,24 +1996,31 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired.');
       const capacitySlots = Number(hostRow.rows[0]?.capacity_slots);
       const reservedSlots = Number(hostRow.rows[0]?.reserved_slots);
-      if (!Number.isSafeInteger(capacitySlots) || !Number.isSafeInteger(reservedSlots) || capacitySlots < 0 || reservedSlots < 0) {
+      const authorizedSlots = Number(hostRow.rows[0]?.authorized_slots);
+      if (!Number.isSafeInteger(capacitySlots) || !Number.isSafeInteger(reservedSlots)
+        || !Number.isSafeInteger(authorizedSlots) || capacitySlots < 0 || reservedSlots < 0 || authorizedSlots < 0) {
         return await deny('Trusted host capacity ledger is invalid.');
       }
       if (host.capacity_slots !== capacitySlots) return await deny('Trusted host capacity evidence and ledger differ.');
-      if (capacitySlots - reservedSlots < 1) return await deny('Trusted host has no available capacity.');
+      if (capacitySlots - reservedSlots - authorizedSlots < 1) return await deny('Trusted host has no available capacity.');
       const hostCaps = new Set(host.allowed_capabilities);
       if (request.binding.capabilities.some((item) => !hostCaps.has(item))) return await deny('Trusted host does not allow every requested capability.');
 
-      const budgetRow = await client.query('SELECT hard_limit_usd,reserved_usd FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE', [request.budget.receipt_id]);
+      const budgetRow = await client.query(
+        `SELECT hard_limit_usd,reserved_usd,committed_usd,
+                (reserved_usd+committed_usd+$2::numeric <= hard_limit_usd) AS can_reserve
+         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
+        [request.budget.receipt_id, request.binding.requested_cost_usd],
+      );
       if (!budgetRow.rows[0]) return await deny('Durable budget registry entry is missing.');
       const registeredLimit = Number(budgetRow.rows[0].hard_limit_usd);
       const reserved = Number(budgetRow.rows[0].reserved_usd);
       if (registeredLimit !== request.budget.hard_limit_usd) return await deny('Signed and durable budget ceilings differ.');
-      if (reserved + request.binding.requested_cost_usd > registeredLimit) return await deny('Durable budget is exhausted.');
+      if (!Number.isFinite(reserved) || budgetRow.rows[0].can_reserve !== true) return await deny('Durable budget is exhausted.');
 
       const aggregateRows = await client.query(
-        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd,reserved_usd,
-                (reserved_usd+$3::numeric <= hard_limit_usd) AS can_reserve
+        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd,reserved_usd,committed_usd,
+                (reserved_usd+committed_usd+$3::numeric <= hard_limit_usd) AS can_reserve
          FROM swarm_authority_budget_windows
          WHERE policy_id=$1 AND starts_at <= $2::timestamptz AND ends_at > $2::timestamptz
          ORDER BY kind FOR UPDATE`,
@@ -1370,7 +2062,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         );
         const aggregateUpdate = await client.query(
           `UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd+$2
-           WHERE window_id=$1 AND reserved_usd+$2 <= hard_limit_usd RETURNING reserved_usd`,
+           WHERE window_id=$1 AND reserved_usd+committed_usd+$2 <= hard_limit_usd RETURNING reserved_usd`,
           [window.window_id, request.binding.requested_cost_usd],
         );
         if (aggregateUpdate.rows.length !== 1) throw new Error('Aggregate budget reservation lost its authority race.');

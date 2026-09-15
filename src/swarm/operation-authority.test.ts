@@ -24,6 +24,10 @@ const WINDOW_END = new Date(NOW_MS + 15 * 60_000).toISOString();
 const APPROVAL_SECRET = 'approval-secret-at-least-32-bytes-long';
 const BUDGET_SECRET = 'budget-secret-at-least-32-bytes-long';
 const LEASE_CLAIM_TOKEN = 'L'.repeat(43);
+const REDEMPTION_TOKEN = 'R'.repeat(43);
+const CONTROL_TOKEN = 'C'.repeat(43);
+const BROKER_IDENTITY = 'broker-execution-001';
+const BROKER_EVIDENCE = 'broker-attestation-001';
 
 class PGlitePool implements AuthoritySqlPool {
   private readonly db = new PGlite();
@@ -172,7 +176,7 @@ async function harness(
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
-async function reserve(h: Harness, duration = 60_000) {
+async function reserve(h: Harness, duration = 5 * 60_000) {
   const result = await h.authority.admit({
     binding: h.operation,
     approval_receipt: h.approval,
@@ -212,7 +216,33 @@ function startLease(
     execution_identity: h.operation.execution_identity,
     identity_evidence_ref: h.operation.identity_evidence_ref,
     lease_claim_token: LEASE_CLAIM_TOKEN,
+    redemption_token: REDEMPTION_TOKEN,
+    control_token: CONTROL_TOKEN,
+    broker_execution_identity: BROKER_IDENTITY,
+    broker_identity_evidence_ref: BROKER_EVIDENCE,
     lease_duration_ms: 5_000,
+    ...overrides,
+  };
+}
+
+function startRedemption(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  leaseId: string,
+  overrides: Partial<{ redemption_request_id: string; redemption_token: string; broker_execution_identity: string }> = {},
+) {
+  return {
+    reservation_id: reservation.reservation_id,
+    lease_id: leaseId,
+    redemption_request_id: '00000000-0000-4000-8000-000000000301',
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    execution_identity: h.operation.execution_identity,
+    identity_evidence_ref: h.operation.identity_evidence_ref,
+    broker_execution_identity: BROKER_IDENTITY,
+    broker_identity_evidence_ref: BROKER_EVIDENCE,
+    redemption_token: REDEMPTION_TOKEN,
     ...overrides,
   };
 }
@@ -225,7 +255,7 @@ function cancellation(reservation: Awaited<ReturnType<typeof reserve>>, reason: 
   };
 }
 
-async function admitRelated(h: Harness, operation: OperationBinding, suffix: string, duration = 60_000) {
+async function admitRelated(h: Harness, operation: OperationBinding, suffix: string, duration = 5 * 60_000) {
   const bindingDigest = sha256Digest(operation);
   const approval = signApprovalReceipt({
     schema_version: 'starlight.operation_approval.v1', receipt_id: `approval-${suffix}`,
@@ -643,6 +673,7 @@ test('requires server-owned preparation and strictly valid, fresh host evidence'
       reserve: async () => ({ admitted: false, reservation: null, blockers: [] }),
       consume: async () => ({ consumed: false, receipt: null, blockers: [] }),
       leaseStart: async () => ({ leased: false, receipt: null, blockers: [] }),
+      redeemStartAuthorization: async () => ({ redeemed: false, receipt: null, blockers: [] }),
       cancel: async (input) => ({ cancelled: false, reservation_id: input.reservation_id, state: null, already_terminal: false, released_cost_usd: 0, blockers: [] }),
       recordDenial: async () => {},
     }, { approvalIssuers: {}, budgetIssuers: {} }, Number.NaN),
@@ -795,6 +826,12 @@ test('consume binds the durable execution identity and preserves the reservation
   const h = await harness();
   try {
     const reservation = await reserve(h);
+    const aliased = await h.authority.consume({
+      ...consumption(h, reservation),
+      lease_claim_token: reservation.consume_token,
+    });
+    assert.equal(aliased.consumed, false);
+    assert.match(aliased.blockers.join(' '), /invalid|distinct/i);
     const denied = await h.authority.consume({
       ...consumption(h, reservation),
       execution_identity: 'different-execution-identity',
@@ -828,6 +865,27 @@ test('binds a separate lease credential and issues one idempotent, explicitly no
     assert.equal(forged.leased, false);
     assert.match(forged.blockers.join(' '), /does not exist/i);
 
+    const aliased = await h.authority.leaseStart({
+      ...startLease(h, reservation, consumed.receipt.consumption_id),
+      redemption_token: LEASE_CLAIM_TOKEN,
+    });
+    assert.equal(aliased.leased, false);
+    assert.match(aliased.blockers.join(' '), /invalid/i);
+
+    const consumeAsRedemption = await h.authority.leaseStart({
+      ...startLease(h, reservation, consumed.receipt.consumption_id),
+      redemption_token: reservation.consume_token,
+    });
+    assert.equal(consumeAsRedemption.leased, false);
+    assert.match(consumeAsRedemption.blockers.join(' '), /pairwise distinct/i);
+
+    const consumeAsControl = await h.authority.leaseStart({
+      ...startLease(h, reservation, consumed.receipt.consumption_id),
+      control_token: reservation.consume_token,
+    });
+    assert.equal(consumeAsControl.leased, false);
+    assert.match(consumeAsControl.blockers.join(' '), /pairwise distinct/i);
+
     const input = startLease(h, reservation, consumed.receipt.consumption_id);
     const first = await h.authority.leaseStart(input);
     assert.equal(first.leased, true);
@@ -860,6 +918,321 @@ test('binds a separate lease credential and issues one idempotent, explicitly no
     const audit = JSON.stringify(await h.pool.rows('SELECT detail FROM swarm_authority_audit ORDER BY seq'));
     assert.doesNotMatch(audit, new RegExp(reservation.consume_token));
     assert.doesNotMatch(audit, new RegExp(LEASE_CLAIM_TOKEN));
+  } finally { await h.pool.close(); }
+});
+
+test('redeems one start authority, moves reserved ledgers to committed, and quarantines cancellation', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leaseInput = startLease(h, reservation, consumed.receipt.consumption_id);
+    const leased = await h.authority.leaseStart(leaseInput);
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+
+    const forged = await h.authority.redeemStartAuthorization(startRedemption(
+      h, reservation, leased.receipt.lease_id, { redemption_token: 'F'.repeat(43) },
+    ));
+    assert.equal(forged.redeemed, false);
+    assert.match(forged.blockers.join(' '), /credential/i);
+
+    const identityDrift = await h.authority.redeemStartAuthorization(startRedemption(
+      h, reservation, leased.receipt.lease_id, { broker_execution_identity: 'different-broker' },
+    ));
+    assert.equal(identityDrift.redeemed, false);
+    assert.match(identityDrift.blockers.join(' '), /broker identity/i);
+
+    const input = startRedemption(h, reservation, leased.receipt.lease_id);
+    const first = await h.authority.redeemStartAuthorization(input);
+    assert.equal(first.redeemed, true);
+    if (!first.redeemed) return;
+    assert.equal(first.receipt.authorization_state, 'start-authorized');
+    assert.equal(first.receipt.execution_observed, false);
+    assert.equal(first.receipt.state, 'start-authorized-not-observed');
+    assert.equal(first.receipt.committed_cost_usd, h.operation.requested_cost_usd);
+    assert.equal(first.receipt.broker_execution_identity, BROKER_IDENTITY);
+
+    const retry = await h.authority.redeemStartAuthorization(input);
+    assert.equal(retry.redeemed, true);
+    if (retry.redeemed) assert.deepEqual(retry.receipt, first.receipt);
+    const competing = await h.authority.redeemStartAuthorization({
+      ...input,
+      redemption_request_id: '00000000-0000-4000-8000-000000000302',
+    });
+    assert.equal(competing.redeemed, false);
+    assert.match(competing.blockers.join(' '), /different redemption request/i);
+
+    const authorized = await h.pool.rows(`SELECT r.state,b.reserved_usd,b.committed_usd,
+      host.reserved_slots,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(authorized[0].state, 'start-authorized-not-observed');
+    assert.equal(Number(authorized[0].reserved_usd), 0);
+    assert.equal(Number(authorized[0].committed_usd), 0.25);
+    assert.equal(Number(authorized[0].reserved_slots), 0);
+    assert.equal(Number(authorized[0].authorized_slots), 1);
+    const windows = await h.pool.rows('SELECT reserved_usd,committed_usd FROM swarm_authority_budget_windows');
+    assert.ok(windows.every((row) => Number(row.reserved_usd) === 0 && Number(row.committed_usd) === 0.25));
+
+    const stopped = await h.authority.cancel(cancellation(reservation, 'stop after authorization'));
+    assert.equal(stopped.cancelled, false);
+    assert.equal(stopped.state, 'stop-requested');
+    assert.equal(stopped.released_cost_usd, 0);
+    const retained = await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(retained[0].state, 'stop-requested');
+    assert.equal(Number(retained[0].committed_usd), 0.25);
+    assert.equal(Number(retained[0].authorized_slots), 1);
+    const audit = JSON.stringify(await h.pool.rows('SELECT detail FROM swarm_authority_audit ORDER BY seq'));
+    assert.doesNotMatch(audit, new RegExp(REDEMPTION_TOKEN));
+    assert.doesNotMatch(audit, new RegExp(CONTROL_TOKEN));
+    const redemptions = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='start-authority-redeemed'");
+    assert.equal(redemptions.length, 1);
+  } finally { await h.pool.close(); }
+});
+
+test('a late authorization retry requests stop without releasing committed resources', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    const input = startRedemption(h, reservation, leased.receipt.lease_id);
+    assert.equal((await h.authority.redeemStartAuthorization(input)).redeemed, true);
+    await h.pool.execute("UPDATE swarm_authority_reservations SET reservation_expires_at=clock_timestamp()-INTERVAL '1 second'");
+
+    const lateRetry = await h.authority.redeemStartAuthorization(input);
+    assert.equal(lateRetry.redeemed, false);
+    assert.match(lateRetry.blockers.join(' '), /expired/i);
+    const state = await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(state[0].state, 'stop-requested');
+    assert.equal(Number(state[0].committed_usd), 0.25);
+    assert.equal(Number(state[0].authorized_slots), 1);
+  } finally { await h.pool.close(); }
+});
+
+test('redemption rejects host attribution drift from the signed operation binding', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    await h.store.putHostEvidence({
+      host_id: 'trusted-host-002', observed_at: NOW, status: 'ready', capacity_slots: 4,
+      secret_readiness: true, access_review_expires_at: EXPIRES,
+      allowed_capabilities: ['repository.read', 'repository.write'],
+    });
+    await h.pool.execute("UPDATE swarm_authority_reservations SET host_id='trusted-host-002'");
+
+    const denied = await h.authority.redeemStartAuthorization(
+      startRedemption(h, reservation, leased.receipt.lease_id),
+    );
+    assert.equal(denied.redeemed, false);
+    assert.match(denied.blockers.join(' '), /signed operation binding/i);
+    const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+    assert.equal(state[0].state, 'leased-not-started');
+  } finally { await h.pool.close(); }
+});
+
+test('an exact authorization retry quarantines signed host attribution drift', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    const input = startRedemption(h, reservation, leased.receipt.lease_id);
+    assert.equal((await h.authority.redeemStartAuthorization(input)).redeemed, true);
+    await h.store.putHostEvidence({
+      host_id: 'trusted-host-002', observed_at: NOW, status: 'ready', capacity_slots: 4,
+      secret_readiness: true, access_review_expires_at: EXPIRES,
+      allowed_capabilities: ['repository.read', 'repository.write'],
+    });
+    await h.pool.execute("UPDATE swarm_authority_reservations SET host_id='trusted-host-002'");
+
+    const denied = await h.authority.redeemStartAuthorization(input);
+    assert.equal(denied.redeemed, false);
+    assert.match(denied.blockers.join(' '), /signed binding/i);
+    const state = await h.pool.rows(`SELECT r.state,b.committed_usd,h.authorized_slots
+      FROM swarm_authority_reservations r
+      JOIN swarm_authority_budgets b ON b.receipt_id=r.budget_receipt_id
+      JOIN swarm_authority_hosts h ON h.host_id='trusted-host-001'`);
+    assert.equal(state[0].state, 'stop-requested');
+    assert.equal(Number(state[0].committed_usd), 0.25);
+    assert.equal(Number(state[0].authorized_slots), 1);
+  } finally { await h.pool.close(); }
+});
+
+test('migration cancels a pre-redemption lease and releases its reserved ledgers once', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    await h.pool.execute(`
+      ALTER TABLE swarm_authority_reservations DROP CONSTRAINT swarm_authority_reservations_lease_fields_check;
+      UPDATE swarm_authority_reservations
+      SET redemption_token_sha256=NULL,control_token_sha256=NULL,
+          broker_execution_identity=NULL,broker_identity_evidence_ref=NULL;
+    `);
+    await h.store.initialize();
+    await h.store.initialize();
+    const state = await h.pool.rows(`SELECT r.state,b.reserved_usd,b.committed_usd,
+      host.reserved_slots,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(state[0].state, 'cancelled');
+    assert.equal(Number(state[0].reserved_usd), 0);
+    assert.equal(Number(state[0].committed_usd), 0);
+    assert.equal(Number(state[0].reserved_slots), 0);
+    assert.equal(Number(state[0].authorized_slots), 0);
+    const windows = await h.pool.rows('SELECT reserved_usd,committed_usd FROM swarm_authority_budget_windows');
+    assert.ok(windows.every((row) => Number(row.reserved_usd) === 0 && Number(row.committed_usd) === 0));
+    const events = await h.pool.rows(`SELECT event FROM swarm_authority_audit
+      WHERE event='reservation-cancelled' AND detail->>'reason'='lease predated redemption and control credentials'`);
+    assert.equal(events.length, 1);
+  } finally { await h.pool.close(); }
+});
+
+test('legacy-lease migration rejects grouped host underfunding before mutating rows', async () => {
+  const h = await harness();
+  try {
+    const firstReservation = await reserve(h);
+    const firstConsumption = await h.authority.consume(consumption(h, firstReservation));
+    assert.equal(firstConsumption.consumed, true);
+    if (!firstConsumption.consumed) return;
+    assert.equal((await h.authority.leaseStart(startLease(
+      h, firstReservation, firstConsumption.receipt.consumption_id,
+    ))).leased, true);
+
+    const relatedOperation = binding({ operation_id: 'operation-legacy-002', effect_id: 'effect-legacy-002' });
+    const related = await admitRelated(h, relatedOperation, 'legacy-002');
+    assert.equal(related.admitted, true);
+    if (!related.admitted) return;
+    const relatedConsumption = await h.authority.consume({
+      reservation_id: related.reservation.reservation_id,
+      operation_id: relatedOperation.operation_id,
+      effect_id: relatedOperation.effect_id,
+      binding_digest_sha256: related.reservation.binding_digest_sha256,
+      execution_identity: relatedOperation.execution_identity,
+      identity_evidence_ref: relatedOperation.identity_evidence_ref,
+      consume_token: related.reservation.consume_token,
+      lease_claim_token: 'M'.repeat(43),
+    });
+    assert.equal(relatedConsumption.consumed, true);
+    if (!relatedConsumption.consumed) return;
+    const relatedLease = await h.authority.leaseStart({
+      reservation_id: related.reservation.reservation_id,
+      consumption_id: relatedConsumption.receipt.consumption_id,
+      start_request_id: '00000000-0000-4000-8000-000000000109',
+      operation_id: relatedOperation.operation_id,
+      effect_id: relatedOperation.effect_id,
+      binding_digest_sha256: related.reservation.binding_digest_sha256,
+      execution_identity: relatedOperation.execution_identity,
+      identity_evidence_ref: relatedOperation.identity_evidence_ref,
+      lease_claim_token: 'M'.repeat(43),
+      redemption_token: 'S'.repeat(43),
+      control_token: 'T'.repeat(43),
+      broker_execution_identity: BROKER_IDENTITY,
+      broker_identity_evidence_ref: BROKER_EVIDENCE,
+      lease_duration_ms: 5_000,
+    });
+    assert.equal(relatedLease.leased, true);
+
+    await h.pool.execute(`
+      ALTER TABLE swarm_authority_reservations DROP CONSTRAINT swarm_authority_reservations_lease_fields_check;
+      UPDATE swarm_authority_reservations
+      SET redemption_token_sha256=NULL,control_token_sha256=NULL,
+          broker_execution_identity=NULL,broker_identity_evidence_ref=NULL;
+      UPDATE swarm_authority_hosts SET reserved_slots=1;
+    `);
+    await assert.rejects(h.store.initialize(), /legacy start lease host ledger is inconsistent/i);
+    const preserved = await h.pool.rows('SELECT state FROM swarm_authority_reservations ORDER BY operation_id');
+    assert.deepEqual(preserved.map((row) => row.state), ['leased-not-started', 'leased-not-started']);
+
+    await h.pool.execute('UPDATE swarm_authority_hosts SET reserved_slots=2');
+    await h.store.initialize();
+    await h.store.initialize();
+    const terminal = await h.pool.rows('SELECT state FROM swarm_authority_reservations ORDER BY operation_id');
+    assert.deepEqual(terminal.map((row) => row.state), ['cancelled', 'cancelled']);
+    const events = await h.pool.rows(`SELECT event FROM swarm_authority_audit
+      WHERE event='reservation-cancelled' AND detail->>'reason'='lease predated redemption and control credentials'`);
+    assert.equal(events.length, 2);
+  } finally { await h.pool.close(); }
+});
+
+test('admission counts both committed cost and authorized host slots', async (t) => {
+  const authorize = async (h: Harness) => {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    if (!consumed.consumed) assert.fail(consumed.blockers.join(' '));
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    if (!leased.leased) assert.fail(leased.blockers.join(' '));
+    const redeemed = await h.authority.redeemStartAuthorization(startRedemption(h, reservation, leased.receipt.lease_id));
+    if (!redeemed.redeemed) assert.fail(redeemed.blockers.join(' '));
+  };
+
+  await t.test('authorized slot exhausts host capacity', async () => {
+    const h = await harness();
+    try {
+      await h.store.putHostEvidence({
+        host_id: h.operation.host_id, observed_at: NOW, status: 'ready', capacity_slots: 1,
+        secret_readiness: true, access_review_expires_at: EXPIRES,
+        allowed_capabilities: ['repository.read', 'repository.write'],
+      });
+      await authorize(h);
+      const related = binding({ operation_id: 'operation-capacity-002', effect_id: 'effect-capacity-002' });
+      const denied = await admitRelated(h, related, 'capacity-002');
+      assert.equal(denied.admitted, false);
+      assert.match(denied.blockers.join(' '), /no available capacity/i);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('committed cost exhausts aggregate windows', async () => {
+    const h = await harness(binding(), { policyLimit: 0.25, dailyLimit: 0.25 });
+    try {
+      await authorize(h);
+      const related = binding({ operation_id: 'operation-budget-002', effect_id: 'effect-budget-002' });
+      const denied = await admitRelated(h, related, 'budget-002');
+      assert.equal(denied.admitted, false);
+      assert.match(denied.blockers.join(' '), /aggregate budget window is exhausted/i);
+    } finally { await h.pool.close(); }
+  });
+});
+
+test('initialization rejects an authorized row with orphaned budget attribution', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    const redeemed = await h.authority.redeemStartAuthorization(startRedemption(h, reservation, leased.receipt.lease_id));
+    assert.equal(redeemed.redeemed, true);
+    await h.pool.execute("UPDATE swarm_authority_reservations SET budget_receipt_id='missing-budget'");
+    await assert.rejects(h.store.initialize(), /authorized operation attribution is missing, ambiguous, or inconsistent/i);
+    const state = await h.pool.rows('SELECT state,budget_receipt_id FROM swarm_authority_reservations');
+    assert.equal(state[0].state, 'start-authorized-not-observed');
+    assert.equal(state[0].budget_receipt_id, 'missing-budget');
   } finally { await h.pool.close(); }
 });
 
@@ -986,6 +1359,31 @@ test('revocation and expiry deny consumption, release resources once, and retain
     } finally { await h.pool.close(); }
   });
 
+  await t.test('revocation after start authorization quarantines committed resources', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+      assert.equal(leased.leased, true);
+      if (!leased.leased) return;
+      assert.equal((await h.authority.redeemStartAuthorization(
+        startRedemption(h, reservation, leased.receipt.lease_id),
+      )).redeemed, true);
+      await h.store.revoke('key:starlight-approval:approval-key-001', NOW, 'post-authorization rotation');
+      const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,b.committed_usd,
+        host.reserved_slots,host.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+      assert.equal(rows[0].state, 'stop-requested');
+      assert.equal(Number(rows[0].reserved_usd), 0);
+      assert.equal(Number(rows[0].committed_usd), 0.25);
+      assert.equal(Number(rows[0].reserved_slots), 0);
+      assert.equal(Number(rows[0].authorized_slots), 1);
+    } finally { await h.pool.close(); }
+  });
+
   await t.test('expiry', async () => {
     const h = await harness();
     try {
@@ -1032,6 +1430,28 @@ test('revocation and expiry deny consumption, release resources once, and retain
       assert.equal(Number(rows[0].reserved_slots), 0);
       const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
       assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('prepared-operation cancellation after authorization requests stop without release', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+      assert.equal(leased.leased, true);
+      if (!leased.leased) return;
+      assert.equal((await h.authority.redeemStartAuthorization(
+        startRedemption(h, reservation, leased.receipt.lease_id),
+      )).redeemed, true);
+      await h.store.cancelPreparedOperation(h.operation.operation_id);
+      const rows = await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+      assert.equal(rows[0].state, 'stop-requested');
+      assert.equal(Number(rows[0].committed_usd), 0.25);
+      assert.equal(Number(rows[0].authorized_slots), 1);
     } finally { await h.pool.close(); }
   });
 });

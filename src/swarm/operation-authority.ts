@@ -157,7 +157,15 @@ export const consumptionInputSchema = z.object({
   identity_evidence_ref: id,
   consume_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   lease_claim_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.consume_token === value.lease_claim_token) {
+    context.addIssue({
+      code: 'custom',
+      path: ['lease_claim_token'],
+      message: 'Consume and lease-claim credentials must be distinct.',
+    });
+  }
+});
 
 export type ConsumptionInput = z.infer<typeof consumptionInputSchema>;
 
@@ -171,10 +179,39 @@ export const startLeaseInputSchema = z.object({
   execution_identity: id,
   identity_evidence_ref: id,
   lease_claim_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  redemption_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  control_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  broker_execution_identity: id,
+  broker_identity_evidence_ref: id,
   lease_duration_ms: z.number().int().min(1_000).max(15 * 60_000),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const credentials = [value.lease_claim_token, value.redemption_token, value.control_token];
+  if (new Set(credentials).size !== credentials.length) {
+    context.addIssue({
+      code: 'custom',
+      path: ['redemption_token'],
+      message: 'Lease-claim, redemption, and control credentials must be pairwise distinct.',
+    });
+  }
+});
 
 export type StartLeaseInput = z.infer<typeof startLeaseInputSchema>;
+
+export const startRedemptionInputSchema = z.object({
+  reservation_id: z.uuid(),
+  lease_id: z.uuid(),
+  redemption_request_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  execution_identity: id,
+  identity_evidence_ref: id,
+  broker_execution_identity: id,
+  broker_identity_evidence_ref: id,
+  redemption_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
+export type StartRedemptionInput = z.infer<typeof startRedemptionInputSchema>;
 
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
@@ -217,6 +254,10 @@ export interface StartLeaseReceipt {
   execution_identity: string;
   identity_evidence_ref: string;
   lease_claim_token_sha256: string;
+  redemption_token_sha256: string;
+  control_token_sha256: string;
+  broker_execution_identity: string;
+  broker_identity_evidence_ref: string;
   lease_issued_at: string;
   lease_expires_at: string;
   lease_duration_ms: number;
@@ -229,9 +270,36 @@ export type StartLeaseResult =
   | { leased: true; receipt: StartLeaseReceipt; blockers: [] }
   | { leased: false; receipt: null; blockers: string[] };
 
+export interface StartRedemptionReceipt {
+  schema_version: 'starlight.worker_start_redemption.v1';
+  redemption_id: string;
+  redemption_request_id: string;
+  lease_id: string;
+  consumption_id: string;
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  execution_identity: string;
+  identity_evidence_ref: string;
+  broker_execution_identity: string;
+  broker_identity_evidence_ref: string;
+  redemption_token_sha256: string;
+  start_authorized_at: string;
+  committed_cost_usd: number;
+  control_token_sha256: string;
+  authorization_state: 'start-authorized';
+  execution_observed: false;
+  state: 'start-authorized-not-observed';
+}
+
+export type StartRedemptionResult =
+  | { redeemed: true; receipt: StartRedemptionReceipt; blockers: [] }
+  | { redeemed: false; receipt: null; blockers: string[] };
+
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
-  | { cancelled: false; reservation_id: string; state: null | 'expired'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
+  | { cancelled: false; reservation_id: string; state: null | 'expired' | 'stop-requested'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
 
 export type AdmissionResult =
   | { admitted: true; reservation: AdmissionReservation; blockers: [] }
@@ -243,6 +311,7 @@ export interface OperationAuthorityStore {
   reserve(request: AtomicAdmissionRequest): Promise<AdmissionResult>;
   consume(input: ConsumptionInput): Promise<ConsumptionResult>;
   leaseStart(input: StartLeaseInput): Promise<StartLeaseResult>;
+  redeemStartAuthorization(input: StartRedemptionInput): Promise<StartRedemptionResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -367,7 +436,8 @@ export class OperationAuthority {
     const receiptExpiry = Math.min(Date.parse(approval.expires_at), Date.parse(budget.expires_at));
     const reservationExpiry = Math.min(nowMs + input.reservation_duration_ms, receiptExpiry);
     const consumeToken = randomBytes(32).toString('base64url');
-    const cancelToken = randomBytes(32).toString('base64url');
+    let cancelToken = randomBytes(32).toString('base64url');
+    while (cancelToken === consumeToken) cancelToken = randomBytes(32).toString('base64url');
     return this.store.reserve({
       reservation_id: randomUUID(),
       now,
@@ -404,6 +474,17 @@ export class OperationAuthority {
       return { leased: false, receipt: null, blockers: ['Start-lease request is invalid.'] };
     }
     return this.store.leaseStart(parsed.data);
+  }
+
+  async redeemStartAuthorization(input: unknown): Promise<StartRedemptionResult> {
+    if (!this.store.durable) return { redeemed: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    const parsed = startRedemptionInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = this.clock();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', Number.isFinite(Date.parse(at)) ? at : new Date().toISOString(), ['Start-redemption request is invalid.']);
+      return { redeemed: false, receipt: null, blockers: ['Start-redemption request is invalid.'] };
+    }
+    return this.store.redeemStartAuthorization(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {

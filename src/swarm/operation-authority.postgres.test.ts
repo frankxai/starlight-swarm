@@ -11,6 +11,8 @@ const databaseUrl = process.env.TEST_DATABASE_URL;
 const approvalSecret = 'postgres-approval-secret-at-least-32-bytes';
 const budgetSecret = 'postgres-budget-secret-at-least-32-bytes';
 const leaseClaimToken = 'L'.repeat(43);
+const redemptionToken = 'R'.repeat(43);
+const controlToken = 'C'.repeat(43);
 
 function binding(): OperationBinding {
   return {
@@ -174,6 +176,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         execution_identity: h.consume.execution_identity,
         identity_evidence_ref: h.consume.identity_evidence_ref,
         lease_claim_token: leaseClaimToken,
+        redemption_token: redemptionToken,
+        control_token: controlToken,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
         lease_duration_ms: 30_000,
       };
       const [first, second] = await Promise.all([
@@ -192,6 +198,123 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(events.rowCount, 1);
     });
 
+    await t.test('independent authorities redeem one start authorization and commit ledgers once', async () => {
+      const h = await prepare();
+      const consumed = await h.authority.consume(h.consume);
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const lease = await h.authority.leaseStart({
+        reservation_id: h.reservation.reservation_id,
+        consumption_id: consumed.receipt.consumption_id,
+        start_request_id: '00000000-0000-4000-8000-000000000211',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        lease_claim_token: leaseClaimToken,
+        redemption_token: redemptionToken,
+        control_token: controlToken,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+        lease_duration_ms: 30_000,
+      });
+      assert.equal(lease.leased, true);
+      if (!lease.leased) return;
+      const redemption = {
+        reservation_id: h.reservation.reservation_id,
+        lease_id: lease.receipt.lease_id,
+        redemption_request_id: '00000000-0000-4000-8000-000000000311',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+        redemption_token: redemptionToken,
+      };
+      const [first, second] = await Promise.all([
+        h.authority.redeemStartAuthorization(redemption),
+        h.secondAuthority.redeemStartAuthorization({
+          ...redemption,
+          redemption_request_id: '00000000-0000-4000-8000-000000000312',
+        }),
+      ]);
+      assert.equal([first, second].filter((result) => result.redeemed).length, 1);
+      assert.equal([first, second].filter((result) => !result.redeemed).length, 1);
+      const state = await pool.query(`SELECT r.state,b.reserved_usd,b.committed_usd,
+        h.reserved_slots,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'start-authorized-not-observed');
+      assert.equal(Number(state.rows[0].reserved_usd), 0);
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].reserved_slots), 0);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+      const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='start-authority-redeemed'");
+      assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('redemption versus cancellation has only released or quarantined outcomes', async () => {
+      const h = await prepare();
+      const consumed = await h.authority.consume(h.consume);
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const lease = await h.authority.leaseStart({
+        reservation_id: h.reservation.reservation_id,
+        consumption_id: consumed.receipt.consumption_id,
+        start_request_id: '00000000-0000-4000-8000-000000000221',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        lease_claim_token: leaseClaimToken,
+        redemption_token: redemptionToken,
+        control_token: controlToken,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+        lease_duration_ms: 30_000,
+      });
+      assert.equal(lease.leased, true);
+      if (!lease.leased) return;
+      await Promise.all([
+        h.authority.redeemStartAuthorization({
+          reservation_id: h.reservation.reservation_id,
+          lease_id: lease.receipt.lease_id,
+          redemption_request_id: '00000000-0000-4000-8000-000000000321',
+          operation_id: h.consume.operation_id,
+          effect_id: h.consume.effect_id,
+          binding_digest_sha256: h.consume.binding_digest_sha256,
+          execution_identity: h.consume.execution_identity,
+          identity_evidence_ref: h.consume.identity_evidence_ref,
+          broker_execution_identity: 'postgres-broker-001',
+          broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+          redemption_token: redemptionToken,
+        }),
+        h.secondAuthority.cancel({
+          reservation_id: h.reservation.reservation_id,
+          cancel_token: h.reservation.cancel_token,
+          reason: 'concurrent cancellation',
+        }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.reserved_usd,b.committed_usd,
+        h.reserved_slots,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      if (state.rows[0].state === 'cancelled') {
+        assert.deepEqual([
+          Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
+          Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
+        ], [0, 0, 0, 0]);
+      } else {
+        assert.equal(state.rows[0].state, 'stop-requested');
+        assert.deepEqual([
+          Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
+          Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
+        ], [0, 0.25, 0, 1]);
+      }
+    });
+
     await t.test('lease versus prepared cancellation always ends cancelled with one release', async () => {
       const h = await prepare();
       const consumed = await h.authority.consume(h.consume);
@@ -207,6 +330,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         execution_identity: h.consume.execution_identity,
         identity_evidence_ref: h.consume.identity_evidence_ref,
         lease_claim_token: leaseClaimToken,
+        redemption_token: redemptionToken,
+        control_token: controlToken,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
         lease_duration_ms: 30_000,
       };
       await Promise.all([
