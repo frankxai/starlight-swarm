@@ -10,6 +10,7 @@ import { sha256Digest } from './runtime-digest';
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const approvalSecret = 'postgres-approval-secret-at-least-32-bytes';
 const budgetSecret = 'postgres-budget-secret-at-least-32-bytes';
+const leaseClaimToken = 'L'.repeat(43);
 
 function binding(): OperationBinding {
   return {
@@ -121,10 +122,12 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     }, budgetSecret);
     await store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
     await store.putPreparedOperation(operation.operation_id, digest, now.toISOString());
-    const authority = new OperationAuthority(store, {
+    const keyring = {
       approvalIssuers: { [approval.issuer]: { [approval.key_id]: approvalSecret } },
       budgetIssuers: { [budget.issuer]: { [budget.key_id]: budgetSecret } },
-    });
+    };
+    const authority = new OperationAuthority(store, keyring);
+    const secondAuthority = new OperationAuthority(new PostgresOperationAuthorityStore(authorityPool), keyring);
     const admitted = await authority.admit({
       binding: operation,
       approval_receipt: approval,
@@ -140,8 +143,9 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       execution_identity: operation.execution_identity,
       identity_evidence_ref: operation.identity_evidence_ref,
       consume_token: admitted.reservation.consume_token,
+      lease_claim_token: leaseClaimToken,
     };
-    return { authority, reservation: admitted.reservation, consume };
+    return { authority, secondAuthority, reservation: admitted.reservation, consume };
   };
 
   try {
@@ -153,6 +157,71 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(new Set(ids).size, 1);
       const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='consumed'");
       assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('independent authorities issue one pre-start lease under competing request ids', async () => {
+      const h = await prepare();
+      const consumed = await h.authority.consume(h.consume);
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const input = {
+        reservation_id: h.reservation.reservation_id,
+        consumption_id: consumed.receipt.consumption_id,
+        start_request_id: '00000000-0000-4000-8000-000000000201',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        lease_claim_token: leaseClaimToken,
+        lease_duration_ms: 30_000,
+      };
+      const [first, second] = await Promise.all([
+        h.authority.leaseStart(input),
+        h.secondAuthority.leaseStart({
+          ...input,
+          start_request_id: '00000000-0000-4000-8000-000000000202',
+        }),
+      ]);
+      assert.equal([first, second].filter((result) => result.leased).length, 1);
+      assert.equal([first, second].filter((result) => !result.leased).length, 1);
+      const state = await pool.query('SELECT state,lease_id FROM swarm_authority_reservations');
+      assert.equal(state.rows[0].state, 'leased-not-started');
+      assert.ok(state.rows[0].lease_id);
+      const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='start-lease-issued'");
+      assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('lease versus prepared cancellation always ends cancelled with one release', async () => {
+      const h = await prepare();
+      const consumed = await h.authority.consume(h.consume);
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const lease = {
+        reservation_id: h.reservation.reservation_id,
+        consumption_id: consumed.receipt.consumption_id,
+        start_request_id: '00000000-0000-4000-8000-000000000203',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        lease_claim_token: leaseClaimToken,
+        lease_duration_ms: 30_000,
+      };
+      await Promise.all([
+        h.secondAuthority.leaseStart(lease),
+        store.cancelPreparedOperation(h.consume.operation_id),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.reserved_usd,h.reserved_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'cancelled');
+      assert.equal(Number(state.rows[0].reserved_usd), 0);
+      assert.equal(Number(state.rows[0].reserved_slots), 0);
+      const windows = await pool.query('SELECT reserved_usd FROM swarm_authority_budget_windows');
+      assert.ok(windows.rows.every((row) => Number(row.reserved_usd) === 0));
+      const cancellations = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='reservation-cancelled'");
+      assert.equal(cancellations.rowCount, 1);
     });
 
     await t.test('consume versus cancel resolves to a cancelled tombstone with one release', async () => {

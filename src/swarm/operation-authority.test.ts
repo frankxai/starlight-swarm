@@ -23,6 +23,7 @@ const WINDOW_START = new Date(NOW_MS - 60_000).toISOString();
 const WINDOW_END = new Date(NOW_MS + 15 * 60_000).toISOString();
 const APPROVAL_SECRET = 'approval-secret-at-least-32-bytes-long';
 const BUDGET_SECRET = 'budget-secret-at-least-32-bytes-long';
+const LEASE_CLAIM_TOKEN = 'L'.repeat(43);
 
 class PGlitePool implements AuthoritySqlPool {
   private readonly db = new PGlite();
@@ -191,6 +192,28 @@ function consumption(h: Harness, reservation: Awaited<ReturnType<typeof reserve>
     execution_identity: h.operation.execution_identity,
     identity_evidence_ref: h.operation.identity_evidence_ref,
     consume_token: reservation.consume_token,
+    lease_claim_token: LEASE_CLAIM_TOKEN,
+  };
+}
+
+function startLease(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  consumptionId: string,
+  overrides: Partial<{ start_request_id: string; lease_duration_ms: number }> = {},
+) {
+  return {
+    reservation_id: reservation.reservation_id,
+    consumption_id: consumptionId,
+    start_request_id: '00000000-0000-4000-8000-000000000101',
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    execution_identity: h.operation.execution_identity,
+    identity_evidence_ref: h.operation.identity_evidence_ref,
+    lease_claim_token: LEASE_CLAIM_TOKEN,
+    lease_duration_ms: 5_000,
+    ...overrides,
   };
 }
 
@@ -619,6 +642,7 @@ test('requires server-owned preparation and strictly valid, fresh host evidence'
       durable: true,
       reserve: async () => ({ admitted: false, reservation: null, blockers: [] }),
       consume: async () => ({ consumed: false, receipt: null, blockers: [] }),
+      leaseStart: async () => ({ leased: false, receipt: null, blockers: [] }),
       cancel: async (input) => ({ cancelled: false, reservation_id: input.reservation_id, state: null, already_terminal: false, released_cost_usd: 0, blockers: [] }),
       recordDenial: async () => {},
     }, { approvalIssuers: {}, budgetIssuers: {} }, Number.NaN),
@@ -782,6 +806,140 @@ test('consume binds the durable execution identity and preserves the reservation
   } finally { await h.pool.close(); }
 });
 
+test('binds a separate lease credential and issues one idempotent, explicitly non-dispatched start lease', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+
+    const changedCredential = await h.authority.consume({
+      ...consumption(h, reservation),
+      lease_claim_token: 'M'.repeat(43),
+    });
+    assert.equal(changedCredential.consumed, false);
+    assert.match(changedCredential.blockers.join(' '), /changed the lease-claim credential/i);
+
+    const forged = await h.authority.leaseStart({
+      ...startLease(h, reservation, consumed.receipt.consumption_id),
+      lease_claim_token: 'M'.repeat(43),
+    });
+    assert.equal(forged.leased, false);
+    assert.match(forged.blockers.join(' '), /does not exist/i);
+
+    const input = startLease(h, reservation, consumed.receipt.consumption_id);
+    const first = await h.authority.leaseStart(input);
+    assert.equal(first.leased, true);
+    if (!first.leased) return;
+    assert.equal(first.receipt.state, 'leased-not-started');
+    assert.equal(first.receipt.dispatch_state, 'not-dispatched');
+    assert.equal(first.receipt.runner_activation_authorized, false);
+    assert.equal(first.receipt.lease_duration_ms, input.lease_duration_ms);
+    assert.equal(first.receipt.lease_claim_token_sha256, consumed.receipt.lease_claim_token_sha256);
+
+    const retry = await h.authority.leaseStart(input);
+    assert.equal(retry.leased, true);
+    if (!retry.leased) return;
+    assert.deepEqual(retry.receipt, first.receipt);
+
+    const competing = await h.authority.leaseStart({
+      ...input,
+      start_request_id: '00000000-0000-4000-8000-000000000102',
+    });
+    assert.equal(competing.leased, false);
+    assert.match(competing.blockers.join(' '), /different start lease/i);
+
+    const stored = await h.pool.rows(`SELECT state,lease_id,start_request_id,lease_claim_token_sha256
+      FROM swarm_authority_reservations`);
+    assert.equal(stored[0].state, 'leased-not-started');
+    assert.equal(stored[0].lease_id, first.receipt.lease_id);
+    assert.equal(stored[0].start_request_id, input.start_request_id);
+    const issued = await h.pool.rows("SELECT detail FROM swarm_authority_audit WHERE event='start-lease-issued'");
+    assert.equal(issued.length, 1);
+    const audit = JSON.stringify(await h.pool.rows('SELECT detail FROM swarm_authority_audit ORDER BY seq'));
+    assert.doesNotMatch(audit, new RegExp(reservation.consume_token));
+    assert.doesNotMatch(audit, new RegExp(LEASE_CLAIM_TOKEN));
+  } finally { await h.pool.close(); }
+});
+
+test('start leases remain bounded by operation and reservation time', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const denied = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id, {
+      lease_duration_ms: 121_000,
+    }));
+    assert.equal(denied.leased, false);
+    assert.match(denied.blockers.join(' '), /operation timeout/i);
+    const stored = await h.pool.rows('SELECT state,lease_id FROM swarm_authority_reservations');
+    assert.equal(stored[0].state, 'consumed-not-started');
+    assert.equal(stored[0].lease_id, null);
+  } finally { await h.pool.close(); }
+});
+
+test('a migrated consumption without a lease credential remains start-ineligible but cancellable', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    await h.pool.execute('UPDATE swarm_authority_reservations SET lease_claim_token_sha256=NULL');
+    await h.store.initialize();
+    await h.store.initialize();
+
+    const denied = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(denied.leased, false);
+    assert.match(denied.blockers.join(' '), /does not exist/i);
+    const beforeCancel = await h.pool.rows('SELECT state,lease_id FROM swarm_authority_reservations');
+    assert.equal(beforeCancel[0].state, 'consumed-not-started');
+    assert.equal(beforeCancel[0].lease_id, null);
+
+    const cancelled = await h.authority.cancel(cancellation(reservation, 'retire pre-lease consumption'));
+    assert.equal(cancelled.cancelled, true);
+    assert.equal(cancelled.released_cost_usd, h.operation.requested_cost_usd);
+    const afterCancel = await h.pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+    assert.equal(afterCancel[0].state, 'cancelled');
+    assert.equal(Number(afterCancel[0].reserved_usd), 0);
+    assert.equal(Number(afterCancel[0].reserved_slots), 0);
+    const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+    assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
+  } finally { await h.pool.close(); }
+});
+
+test('an unredeemed expired lease releases every reservation exactly once and preserves its tombstone', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const input = startLease(h, reservation, consumed.receipt.consumption_id);
+    assert.equal((await h.authority.leaseStart(input)).leased, true);
+    await h.pool.execute(`UPDATE swarm_authority_reservations SET
+      lease_issued_at=statement_timestamp()-INTERVAL '2 minutes',
+      lease_expires_at=statement_timestamp()-INTERVAL '1 minute',lease_duration_ms=60000`);
+    const expired = await h.authority.leaseStart(input);
+    assert.equal(expired.leased, false);
+    assert.match(expired.blockers.join(' '), /expired before runner connection/i);
+    const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+    assert.equal(rows[0].state, 'expired');
+    assert.equal(Number(rows[0].reserved_usd), 0);
+    assert.equal(Number(rows[0].reserved_slots), 0);
+    const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+    assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
+    const replay = await h.authority.leaseStart(input);
+    assert.equal(replay.leased, false);
+    assert.match(replay.blockers.join(' '), /expired/i);
+  } finally { await h.pool.close(); }
+});
+
 test('revocation and expiry deny consumption, release resources once, and retain replay tombstones', async (t) => {
   await t.test('revocation', async () => {
     const h = await harness();
@@ -798,6 +956,33 @@ test('revocation and expiry deny consumption, release resources once, and retain
       assert.equal(Number(rows[0].reserved_slots), 0);
       const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
       assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('revocation after lease issuance', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leaseInput = startLease(h, reservation, consumed.receipt.consumption_id);
+      assert.equal((await h.authority.leaseStart(leaseInput)).leased, true);
+
+      await h.store.revoke('key:starlight-approval:approval-key-001', NOW, 'operator rotation');
+      await h.store.revoke('key:starlight-approval:approval-key-001', NOW, 'idempotent retry');
+      const replay = await h.authority.leaseStart(leaseInput);
+      assert.equal(replay.leased, false);
+      assert.match(replay.blockers.join(' '), /cancelled/i);
+      const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(rows[0].state, 'cancelled');
+      assert.equal(Number(rows[0].reserved_usd), 0);
+      assert.equal(Number(rows[0].reserved_slots), 0);
+      const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+      assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
+      const cancellations = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='reservation-cancelled'");
+      assert.equal(cancellations.length, 1);
     } finally { await h.pool.close(); }
   });
 
@@ -827,16 +1012,19 @@ test('revocation and expiry deny consumption, release resources once, and retain
     } finally { await h.pool.close(); }
   });
 
-  await t.test('prepared-operation cancellation invalidates an existing consumption receipt before worker start', async () => {
+  await t.test('prepared-operation cancellation proactively invalidates an issued pre-start lease', async () => {
     const h = await harness();
     try {
       const reservation = await reserve(h);
       const consumed = await h.authority.consume(consumption(h, reservation));
       assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leaseInput = startLease(h, reservation, consumed.receipt.consumption_id);
+      assert.equal((await h.authority.leaseStart(leaseInput)).leased, true);
       await h.store.cancelPreparedOperation(h.operation.operation_id);
-      const denied = await h.authority.consume(consumption(h, reservation));
-      assert.equal(denied.consumed, false);
-      assert.match(denied.blockers.join(' '), /cancelled before worker start/i);
+      const denied = await h.authority.leaseStart(leaseInput);
+      assert.equal(denied.leased, false);
+      assert.match(denied.blockers.join(' '), /cancelled/i);
       const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
         FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
       assert.equal(rows[0].state, 'cancelled');
@@ -848,13 +1036,21 @@ test('revocation and expiry deny consumption, release resources once, and retain
   });
 });
 
-test('cancellation releases a reserved or consumed hold exactly once', async (t) => {
-  for (const consumeFirst of [false, true]) {
-    await t.test(consumeFirst ? 'consumed-not-started' : 'reserved-not-started', async () => {
+test('cancellation releases a reserved, consumed, or unredeemed leased hold exactly once', async (t) => {
+  for (const mode of ['reserved-not-started', 'consumed-not-started', 'leased-not-started'] as const) {
+    await t.test(mode, async () => {
       const h = await harness();
       try {
         const reservation = await reserve(h);
-        if (consumeFirst) assert.equal((await h.authority.consume(consumption(h, reservation))).consumed, true);
+        if (mode !== 'reserved-not-started') {
+          const consumed = await h.authority.consume(consumption(h, reservation));
+          assert.equal(consumed.consumed, true);
+          if (consumed.consumed && mode === 'leased-not-started') {
+            assert.equal((await h.authority.leaseStart(
+              startLease(h, reservation, consumed.receipt.consumption_id),
+            )).leased, true);
+          }
+        }
         const spoofed = await h.authority.cancel({
           ...cancellation(reservation, 'unauthorized cancellation'),
           cancel_token: 'A'.repeat(43),

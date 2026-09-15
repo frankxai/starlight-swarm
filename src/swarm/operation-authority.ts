@@ -156,9 +156,25 @@ export const consumptionInputSchema = z.object({
   execution_identity: id,
   identity_evidence_ref: id,
   consume_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  lease_claim_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
 
 export type ConsumptionInput = z.infer<typeof consumptionInputSchema>;
+
+export const startLeaseInputSchema = z.object({
+  reservation_id: z.uuid(),
+  consumption_id: z.uuid(),
+  start_request_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  execution_identity: id,
+  identity_evidence_ref: id,
+  lease_claim_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  lease_duration_ms: z.number().int().min(1_000).max(15 * 60_000),
+}).strict();
+
+export type StartLeaseInput = z.infer<typeof startLeaseInputSchema>;
 
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
@@ -179,6 +195,7 @@ export interface ConsumptionReceipt {
   identity_evidence_ref: string;
   budget_policy_id: string;
   budget_windows: BudgetWindowEvidence[];
+  lease_claim_token_sha256: string;
   consumed_at: string;
   consumption_expires_at: string;
   state: 'consumed-not-started';
@@ -187,6 +204,30 @@ export interface ConsumptionReceipt {
 export type ConsumptionResult =
   | { consumed: true; receipt: ConsumptionReceipt; blockers: [] }
   | { consumed: false; receipt: null; blockers: string[] };
+
+export interface StartLeaseReceipt {
+  schema_version: 'starlight.worker_start_lease.v1';
+  lease_id: string;
+  start_request_id: string;
+  consumption_id: string;
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  execution_identity: string;
+  identity_evidence_ref: string;
+  lease_claim_token_sha256: string;
+  lease_issued_at: string;
+  lease_expires_at: string;
+  lease_duration_ms: number;
+  dispatch_state: 'not-dispatched';
+  runner_activation_authorized: false;
+  state: 'leased-not-started';
+}
+
+export type StartLeaseResult =
+  | { leased: true; receipt: StartLeaseReceipt; blockers: [] }
+  | { leased: false; receipt: null; blockers: string[] };
 
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
@@ -201,6 +242,7 @@ export interface OperationAuthorityStore {
   readonly durable: boolean;
   reserve(request: AtomicAdmissionRequest): Promise<AdmissionResult>;
   consume(input: ConsumptionInput): Promise<ConsumptionResult>;
+  leaseStart(input: StartLeaseInput): Promise<StartLeaseResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -351,6 +393,17 @@ export class OperationAuthority {
       return { consumed: false, receipt: null, blockers: ['Consumption request is invalid.'] };
     }
     return this.store.consume(parsed.data);
+  }
+
+  async leaseStart(input: unknown): Promise<StartLeaseResult> {
+    if (!this.store.durable) return { leased: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    const parsed = startLeaseInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = this.clock();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', Number.isFinite(Date.parse(at)) ? at : new Date().toISOString(), ['Start-lease request is invalid.']);
+      return { leased: false, receipt: null, blockers: ['Start-lease request is invalid.'] };
+    }
+    return this.store.leaseStart(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {
