@@ -6,6 +6,10 @@ import { Pool } from 'pg';
 import { OperationAuthority, signApprovalReceipt, signBudgetReceipt, type OperationBinding } from './operation-authority';
 import { PostgresOperationAuthorityStore, type AuthoritySqlPool } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
+import {
+  BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  type BrokerDatabaseSessionAttestor,
+} from './authority-role-contract';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const approvalSecret = 'postgres-approval-secret-at-least-32-bytes';
@@ -13,6 +17,16 @@ const budgetSecret = 'postgres-budget-secret-at-least-32-bytes';
 const leaseClaimToken = 'L'.repeat(43);
 const redemptionToken = 'R'.repeat(43);
 const controlToken = 'C'.repeat(43);
+const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
+  valid: true,
+  session: {
+    database_role: 'starlight_postgres_test_broker',
+    database_name: 'starlight_postgres_test',
+    contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  },
+  blockers: [],
+});
+const storeOptions = { brokerSessionAttestor };
 
 function binding(): OperationBinding {
   return {
@@ -71,7 +85,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       };
     },
   };
-  const store = new PostgresOperationAuthorityStore(authorityPool);
+  const store = new PostgresOperationAuthorityStore(authorityPool, storeOptions);
   await store.initialize();
 
   const prepare = async () => {
@@ -83,6 +97,19 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     const digest = sha256Digest(operation);
     const now = new Date();
     const expires = new Date(now.getTime() + 10 * 60_000).toISOString();
+    const brokerEvidence = {
+      schema_version: 'starlight.broker_principal_evidence.v1',
+      database_role: 'starlight_postgres_test_broker',
+      database_name: 'starlight_postgres_test',
+      broker_execution_identity: 'postgres-broker-001',
+      broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+      authn_kind: 'postgres-session-role',
+      role_contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+      observed_at: now.toISOString(),
+      access_review_expires_at: expires,
+      state: 'ready',
+    } as const;
+    await store.putBrokerPrincipalEvidence(brokerEvidence);
     await store.registerBudgetWindow({
       window_id: `${operation.budget_policy_id}:policy-window`,
       policy_id: operation.budget_policy_id,
@@ -129,7 +156,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       budgetIssuers: { [budget.issuer]: { [budget.key_id]: budgetSecret } },
     };
     const authority = new OperationAuthority(store, keyring);
-    const secondAuthority = new OperationAuthority(new PostgresOperationAuthorityStore(authorityPool), keyring);
+    const secondAuthority = new OperationAuthority(new PostgresOperationAuthorityStore(authorityPool, storeOptions), keyring);
     const admitted = await authority.admit({
       binding: operation,
       approval_receipt: approval,
@@ -147,7 +174,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       consume_token: admitted.reservation.consume_token,
       lease_claim_token: leaseClaimToken,
     };
-    return { authority, secondAuthority, reservation: admitted.reservation, consume };
+    return { authority, secondAuthority, store, brokerEvidence, reservation: admitted.reservation, consume };
   };
 
   try {
@@ -230,8 +257,6 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         binding_digest_sha256: h.consume.binding_digest_sha256,
         execution_identity: h.consume.execution_identity,
         identity_evidence_ref: h.consume.identity_evidence_ref,
-        broker_execution_identity: 'postgres-broker-001',
-        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
         redemption_token: redemptionToken,
       };
       const [first, second] = await Promise.all([
@@ -288,8 +313,6 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
           binding_digest_sha256: h.consume.binding_digest_sha256,
           execution_identity: h.consume.execution_identity,
           identity_evidence_ref: h.consume.identity_evidence_ref,
-          broker_execution_identity: 'postgres-broker-001',
-          broker_identity_evidence_ref: 'postgres-broker-evidence-001',
           redemption_token: redemptionToken,
         }),
         h.secondAuthority.cancel({
@@ -306,6 +329,60 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
           Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
           Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
         ], [0, 0, 0, 0]);
+      } else {
+        assert.equal(state.rows[0].state, 'stop-requested');
+        assert.deepEqual([
+          Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
+          Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
+        ], [0, 0.25, 0, 1]);
+      }
+    });
+
+    await t.test('broker disable versus redemption has only reserved or quarantined outcomes', async () => {
+      const h = await prepare();
+      const consumed = await h.authority.consume(h.consume);
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const lease = await h.authority.leaseStart({
+        reservation_id: h.reservation.reservation_id,
+        consumption_id: consumed.receipt.consumption_id,
+        start_request_id: '00000000-0000-4000-8000-000000000231',
+        operation_id: h.consume.operation_id,
+        effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256,
+        execution_identity: h.consume.execution_identity,
+        identity_evidence_ref: h.consume.identity_evidence_ref,
+        lease_claim_token: leaseClaimToken,
+        redemption_token: redemptionToken,
+        control_token: controlToken,
+        broker_execution_identity: 'postgres-broker-001',
+        broker_identity_evidence_ref: 'postgres-broker-evidence-001',
+        lease_duration_ms: 30_000,
+      });
+      assert.equal(lease.leased, true);
+      if (!lease.leased) return;
+      await Promise.all([
+        h.authority.redeemStartAuthorization({
+          reservation_id: h.reservation.reservation_id,
+          lease_id: lease.receipt.lease_id,
+          redemption_request_id: '00000000-0000-4000-8000-000000000331',
+          operation_id: h.consume.operation_id,
+          effect_id: h.consume.effect_id,
+          binding_digest_sha256: h.consume.binding_digest_sha256,
+          execution_identity: h.consume.execution_identity,
+          identity_evidence_ref: h.consume.identity_evidence_ref,
+          redemption_token: redemptionToken,
+        }),
+        h.store.putBrokerPrincipalEvidence({ ...h.brokerEvidence, state: 'disabled' }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.reserved_usd,b.committed_usd,
+        host.reserved_slots,host.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+      if (state.rows[0].state === 'leased-not-started') {
+        assert.deepEqual([
+          Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
+          Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
+        ], [0.25, 0, 1, 0]);
       } else {
         assert.equal(state.rows[0].state, 'stop-requested');
         assert.deepEqual([
@@ -409,7 +486,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         secret_readiness: true, access_review_expires_at: expires,
         allowed_capabilities: base.capabilities,
       });
-      const secondStore = new PostgresOperationAuthorityStore(authorityPool);
+      const secondStore = new PostgresOperationAuthorityStore(authorityPool, storeOptions);
       const authorities = [store, secondStore].map((authorityStore) => new OperationAuthority(authorityStore, {
         approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
         budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } },

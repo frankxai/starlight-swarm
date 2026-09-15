@@ -13,8 +13,14 @@ import {
   PostgresOperationAuthorityStore,
   type AuthoritySqlClient,
   type AuthoritySqlPool,
+  type TrustedBrokerPrincipalEvidence,
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
+import {
+  brokerDatabaseRoleGrantSql,
+  BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  type BrokerDatabaseSessionAttestor,
+} from './authority-role-contract';
 
 const NOW_MS = Date.now();
 const NOW = new Date(NOW_MS).toISOString();
@@ -28,6 +34,35 @@ const REDEMPTION_TOKEN = 'R'.repeat(43);
 const CONTROL_TOKEN = 'C'.repeat(43);
 const BROKER_IDENTITY = 'broker-execution-001';
 const BROKER_EVIDENCE = 'broker-attestation-001';
+const BROKER_DATABASE_ROLE = 'starlight_test_broker';
+const BROKER_DATABASE_NAME = 'starlight_test';
+const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
+  valid: true,
+  session: {
+    database_role: BROKER_DATABASE_ROLE,
+    database_name: BROKER_DATABASE_NAME,
+    contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  },
+  blockers: [],
+});
+
+function brokerEvidence(
+  overrides: Partial<TrustedBrokerPrincipalEvidence> = {},
+): TrustedBrokerPrincipalEvidence {
+  return {
+    schema_version: 'starlight.broker_principal_evidence.v1',
+    database_role: BROKER_DATABASE_ROLE,
+    database_name: BROKER_DATABASE_NAME,
+    broker_execution_identity: BROKER_IDENTITY,
+    broker_identity_evidence_ref: BROKER_EVIDENCE,
+    authn_kind: 'postgres-session-role',
+    role_contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+    observed_at: NOW,
+    access_review_expires_at: EXPIRES,
+    state: 'ready',
+    ...overrides,
+  };
+}
 
 class PGlitePool implements AuthoritySqlPool {
   private readonly db = new PGlite();
@@ -113,8 +148,9 @@ async function harness(
   windows: { policyLimit?: number; dailyLimit?: number; endsAt?: string } = {},
 ) {
   const pool = new PGlitePool();
-  const store = new PostgresOperationAuthorityStore(pool);
+  const store = new PostgresOperationAuthorityStore(pool, { brokerSessionAttestor });
   await store.initialize();
+  await store.putBrokerPrincipalEvidence(brokerEvidence());
   await store.putHostEvidence({
     host_id: operation.host_id,
     observed_at: NOW,
@@ -229,7 +265,7 @@ function startRedemption(
   h: Harness,
   reservation: Awaited<ReturnType<typeof reserve>>,
   leaseId: string,
-  overrides: Partial<{ redemption_request_id: string; redemption_token: string; broker_execution_identity: string }> = {},
+  overrides: Partial<{ redemption_request_id: string; redemption_token: string }> = {},
 ) {
   return {
     reservation_id: reservation.reservation_id,
@@ -240,8 +276,6 @@ function startRedemption(
     binding_digest_sha256: reservation.binding_digest_sha256,
     execution_identity: h.operation.execution_identity,
     identity_evidence_ref: h.operation.identity_evidence_ref,
-    broker_execution_identity: BROKER_IDENTITY,
-    broker_identity_evidence_ref: BROKER_EVIDENCE,
     redemption_token: REDEMPTION_TOKEN,
     ...overrides,
   };
@@ -489,7 +523,8 @@ test('issues a durable reserved-not-started reservation and atomically denies re
     ]);
     const audits = await h.pool.rows('SELECT event FROM swarm_authority_audit ORDER BY seq');
     assert.deepEqual(audits.map((row) => row.event), [
-      'budget-window-registered', 'budget-window-registered', 'reserved', 'denied', 'denied',
+      'broker-principal-registered', 'budget-window-registered', 'budget-window-registered',
+      'reserved', 'denied', 'denied',
     ]);
   } finally { await h.pool.close(); }
 });
@@ -816,7 +851,8 @@ test('consumes once, returns an idempotent receipt, and never persists or audits
     assert.notEqual(stored[0].consume_token_sha256, reservation.consume_token);
     const audit = await h.pool.rows('SELECT event,detail FROM swarm_authority_audit ORDER BY seq');
     assert.deepEqual(audit.map((row) => row.event), [
-      'budget-window-registered', 'budget-window-registered', 'reserved', 'consume-denied', 'consumed',
+      'broker-principal-registered', 'budget-window-registered', 'budget-window-registered',
+      'reserved', 'consume-denied', 'consumed',
     ]);
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(reservation.consume_token));
   } finally { await h.pool.close(); }
@@ -939,11 +975,12 @@ test('redeems one start authority, moves reserved ledgers to committed, and quar
     assert.equal(forged.redeemed, false);
     assert.match(forged.blockers.join(' '), /credential/i);
 
-    const identityDrift = await h.authority.redeemStartAuthorization(startRedemption(
-      h, reservation, leased.receipt.lease_id, { broker_execution_identity: 'different-broker' },
-    ));
+    const identityDrift = await h.authority.redeemStartAuthorization({
+      ...startRedemption(h, reservation, leased.receipt.lease_id),
+      broker_execution_identity: 'caller-forged-broker',
+    });
     assert.equal(identityDrift.redeemed, false);
-    assert.match(identityDrift.blockers.join(' '), /broker identity/i);
+    assert.match(identityDrift.blockers.join(' '), /invalid/i);
 
     const input = startRedemption(h, reservation, leased.receipt.lease_id);
     const first = await h.authority.redeemStartAuthorization(input);
@@ -954,6 +991,8 @@ test('redeems one start authority, moves reserved ledgers to committed, and quar
     assert.equal(first.receipt.state, 'start-authorized-not-observed');
     assert.equal(first.receipt.committed_cost_usd, h.operation.requested_cost_usd);
     assert.equal(first.receipt.broker_execution_identity, BROKER_IDENTITY);
+    assert.equal(first.receipt.broker_database_role, BROKER_DATABASE_ROLE);
+    assert.equal(first.receipt.broker_role_contract_sha256, BROKER_DATABASE_ROLE_CONTRACT_SHA256);
 
     const retry = await h.authority.redeemStartAuthorization(input);
     assert.equal(retry.redeemed, true);
@@ -993,6 +1032,36 @@ test('redeems one start authority, moves reserved ledgers to committed, and quar
   } finally { await h.pool.close(); }
 });
 
+test('redeems through the exact restricted database role and ignores a temp-shadowed authority table', async () => {
+  const h = await harness();
+  try {
+    const databaseName = String((await h.pool.rows('SELECT current_database() AS name'))[0].name);
+    await h.pool.execute('DELETE FROM swarm_authority_broker_principals');
+    await h.store.putBrokerPrincipalEvidence(brokerEvidence({ database_name: databaseName }));
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+
+    await h.pool.execute(`CREATE ROLE ${BROKER_DATABASE_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+      ${brokerDatabaseRoleGrantSql(BROKER_DATABASE_ROLE)}
+      SET SESSION AUTHORIZATION ${BROKER_DATABASE_ROLE};
+      CREATE TEMP TABLE swarm_authority_broker_principals (database_role TEXT);`);
+    const restrictedStore = new PostgresOperationAuthorityStore(h.pool);
+    const redeemed = await restrictedStore.redeemStartAuthorization(
+      startRedemption(h, reservation, leased.receipt.lease_id),
+    );
+    assert.equal(redeemed.redeemed, true, redeemed.blockers.join(' '));
+    if (redeemed.redeemed) {
+      assert.equal(redeemed.receipt.broker_database_role, BROKER_DATABASE_ROLE);
+      assert.equal(redeemed.receipt.broker_database_name, databaseName);
+    }
+  } finally { await h.pool.close(); }
+});
+
 test('a late authorization retry requests stop without releasing committed resources', async () => {
   const h = await harness();
   try {
@@ -1016,6 +1085,93 @@ test('a late authorization retry requests stop without releasing committed resou
     assert.equal(Number(state[0].committed_usd), 0.25);
     assert.equal(Number(state[0].authorized_slots), 1);
   } finally { await h.pool.close(); }
+});
+
+test('redemption derives broker identity from fresh server-owned database principal evidence', async (t) => {
+  await t.test('unregistered database role is denied without consuming the lease', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+      assert.equal(leased.leased, true);
+      if (!leased.leased) return;
+      const otherAttestor: BrokerDatabaseSessionAttestor = async () => ({
+        valid: true,
+        session: {
+          database_role: 'unregistered_broker_role', database_name: BROKER_DATABASE_NAME,
+          contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+        },
+        blockers: [],
+      });
+      const otherAuthority = new OperationAuthority(
+        new PostgresOperationAuthorityStore(h.pool, { brokerSessionAttestor: otherAttestor }),
+        {
+          approvalIssuers: { [h.approval.issuer]: { [h.approval.key_id]: APPROVAL_SECRET } },
+          budgetIssuers: { [h.budget.issuer]: { [h.budget.key_id]: BUDGET_SECRET } },
+        },
+      );
+      const denied = await otherAuthority.redeemStartAuthorization(
+        startRedemption(h, reservation, leased.receipt.lease_id),
+      );
+      assert.equal(denied.redeemed, false);
+      assert.match(denied.blockers.join(' '), /broker principal/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'leased-not-started');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('stale principal evidence is denied without moving reserved ledgers', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+      assert.equal(leased.leased, true);
+      if (!leased.leased) return;
+      await h.store.putBrokerPrincipalEvidence(brokerEvidence({
+        observed_at: new Date(NOW_MS - 10 * 60_000).toISOString(),
+      }));
+      const denied = await h.authority.redeemStartAuthorization(
+        startRedemption(h, reservation, leased.receipt.lease_id),
+      );
+      assert.equal(denied.redeemed, false);
+      assert.match(denied.blockers.join(' '), /stale/i);
+      const state = await h.pool.rows(`SELECT r.state,b.reserved_usd,b.committed_usd,h.reserved_slots,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state[0].state, 'leased-not-started');
+      assert.deepEqual([
+        Number(state[0].reserved_usd), Number(state[0].committed_usd),
+        Number(state[0].reserved_slots), Number(state[0].authorized_slots),
+      ], [0.25, 0, 1, 0]);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('disabling the authenticated principal quarantines existing start authority', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      const consumed = await h.authority.consume(consumption(h, reservation));
+      assert.equal(consumed.consumed, true);
+      if (!consumed.consumed) return;
+      const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+      assert.equal(leased.leased, true);
+      if (!leased.leased) return;
+      assert.equal((await h.authority.redeemStartAuthorization(
+        startRedemption(h, reservation, leased.receipt.lease_id),
+      )).redeemed, true);
+      await h.store.putBrokerPrincipalEvidence(brokerEvidence({ state: 'disabled' }));
+      const state = await h.pool.rows(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state[0].state, 'stop-requested');
+      assert.equal(Number(state[0].committed_usd), 0.25);
+      assert.equal(Number(state[0].authorized_slots), 1);
+    } finally { await h.pool.close(); }
+  });
 });
 
 test('redemption rejects host attribution drift from the signed operation binding', async () => {

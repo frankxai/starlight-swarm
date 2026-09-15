@@ -8,6 +8,11 @@ import {
   startRedemptionInputSchema,
 } from './operation-authority';
 import { sha256Digest } from './runtime-digest';
+import {
+  attestBrokerDatabaseSession,
+  BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  type BrokerDatabaseSessionAttestor,
+} from './authority-role-contract';
 import type {
   AdmissionReservation,
   AdmissionResult,
@@ -60,6 +65,24 @@ const hostEvidenceSchema = z.object({
   }
 });
 
+const databaseRole = z.string().min(3).max(63).regex(/^[a-z][a-z0-9_]*$/);
+const databaseName = z.string().min(1).max(63).regex(/^[A-Za-z0-9_.-]+$/);
+export const brokerPrincipalEvidenceSchema = z.object({
+  schema_version: z.literal('starlight.broker_principal_evidence.v1'),
+  database_role: databaseRole,
+  database_name: databaseName,
+  broker_execution_identity: controlId,
+  broker_identity_evidence_ref: controlId,
+  authn_kind: z.literal('postgres-session-role'),
+  role_contract_digest_sha256: z.literal(BROKER_DATABASE_ROLE_CONTRACT_SHA256),
+  observed_at: controlTime,
+  access_review_expires_at: controlTime,
+  state: z.enum(['ready', 'disabled']),
+}).strict().refine((value) => Date.parse(value.observed_at) < Date.parse(value.access_review_expires_at), {
+  message: 'Broker access review must expire after evidence observation.', path: ['access_review_expires_at'],
+});
+export type TrustedBrokerPrincipalEvidence = z.infer<typeof brokerPrincipalEvidenceSchema>;
+
 export const OPERATION_AUTHORITY_MIGRATION_SQL = `
 CREATE TABLE IF NOT EXISTS swarm_authority_revocations (
   ref TEXT PRIMARY KEY, revoked_at TIMESTAMPTZ NOT NULL, reason TEXT NOT NULL
@@ -68,6 +91,15 @@ CREATE TABLE IF NOT EXISTS swarm_authority_control (
   singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 INSERT INTO swarm_authority_control (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING;
+CREATE OR REPLACE FUNCTION starlight_authority_lock() RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $authority_lock$
+DECLARE locked BOOLEAN;
+BEGIN
+  SELECT singleton INTO locked FROM public.swarm_authority_control WHERE singleton=TRUE FOR UPDATE;
+  RETURN COALESCE(locked,FALSE);
+END
+$authority_lock$;
+REVOKE ALL ON FUNCTION starlight_authority_lock() FROM PUBLIC;
 CREATE TABLE IF NOT EXISTS swarm_authority_hosts (
   host_id TEXT PRIMARY KEY, evidence JSONB NOT NULL, observed_at TIMESTAMPTZ NOT NULL,
   capacity_slots INTEGER NOT NULL CHECK (capacity_slots >= 0),
@@ -96,6 +128,15 @@ CREATE TABLE IF NOT EXISTS swarm_authority_prepared_operations (
   operation_id TEXT PRIMARY KEY, binding_digest_sha256 CHAR(64) NOT NULL,
   registered_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL CHECK (state IN ('ready','cancelled'))
 );
+CREATE TABLE IF NOT EXISTS swarm_authority_broker_principals (
+  database_role TEXT NOT NULL, database_name TEXT NOT NULL,
+  broker_execution_identity TEXT NOT NULL UNIQUE, broker_identity_evidence_ref TEXT NOT NULL UNIQUE,
+  authn_kind TEXT NOT NULL CHECK (authn_kind='postgres-session-role'),
+  role_contract_digest_sha256 CHAR(64) NOT NULL,
+  observed_at TIMESTAMPTZ NOT NULL, access_review_expires_at TIMESTAMPTZ NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('ready','disabled')), evidence JSONB NOT NULL,
+  PRIMARY KEY (database_role,database_name), CHECK (access_review_expires_at > observed_at)
+);
 CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   reservation_id UUID PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, effect_id TEXT NOT NULL UNIQUE,
   binding_digest_sha256 CHAR(64) NOT NULL, binding JSONB NOT NULL, revocation_refs JSONB NOT NULL,
@@ -109,6 +150,7 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   lease_expires_at TIMESTAMPTZ, lease_duration_ms INTEGER,
   redemption_token_sha256 CHAR(64), control_token_sha256 CHAR(64),
   broker_execution_identity TEXT, broker_identity_evidence_ref TEXT,
+  broker_database_role TEXT, broker_database_name TEXT, broker_role_contract_sha256 CHAR(64),
   redemption_id UUID, redemption_request_id UUID, start_authorized_at TIMESTAMPTZ,
   committed_cost_usd NUMERIC,
   state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'))
@@ -118,7 +160,7 @@ CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
   PRIMARY KEY (reservation_id,window_id)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -148,6 +190,9 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_tok
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS control_token_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_execution_identity TEXT;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_identity_evidence_ref TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_database_role TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_database_name TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_role_contract_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_id UUID;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_request_id UUID;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_authorized_at TIMESTAMPTZ;
@@ -338,6 +383,21 @@ WHERE state='leased-not-started'
   AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
     OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL);
 
+-- Earlier start-authorized rows did not bind the authenticated database
+-- principal. Preserve their conservative committed ledgers, but quarantine
+-- them so they can never be returned as current positive authority.
+INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+SELECT 'stop-requested',operation_id,binding_digest_sha256,clock_timestamp(),
+  jsonb_build_object('reservation_id',reservation_id,
+    'reason','start authorization predated authenticated broker database principal',
+    'execution_state','unknown','released_cost_usd',0)
+FROM swarm_authority_reservations
+WHERE state='start-authorized-not-observed'
+  AND num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3;
+UPDATE swarm_authority_reservations SET state='stop-requested'
+WHERE state='start-authorized-not-observed'
+  AND num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3;
+
 -- Any attributed active reservation must be bound to exactly one policy and one
 -- daily window for its signed policy, and every aggregate ledger must reconcile
 -- exactly to the active holds. Partial or fabricated attribution fails migration.
@@ -527,12 +587,16 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND num_nonnulls(redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd)=4
     AND committed_cost_usd=reserved_cost_usd
   ))
+  AND (state <> 'start-authorized-not-observed' OR (
+    num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256)=3
+    AND broker_role_contract_sha256='${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
+  ))
 );
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
   CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -541,6 +605,11 @@ export interface AuthoritySqlClient {
   release?(): void;
 }
 export interface AuthoritySqlPool { connect(): Promise<AuthoritySqlClient> }
+
+export interface PostgresOperationAuthorityOptions {
+  maxBrokerEvidenceAgeMs?: number;
+  brokerSessionAttestor?: BrokerDatabaseSessionAttestor;
+}
 
 function denial(blocker: string): AdmissionResult {
   return { admitted: false, reservation: null, blockers: [blocker] };
@@ -586,10 +655,8 @@ function hostEvidence(row: Record<string, unknown> | undefined): TrustedHostEvid
 }
 
 async function lockAuthority(client: AuthoritySqlClient): Promise<boolean> {
-  const control = await client.query(
-    'SELECT singleton FROM swarm_authority_control WHERE singleton=TRUE FOR UPDATE',
-  );
-  return control.rows.length === 1;
+  const control = await client.query('SELECT starlight_authority_lock() AS locked');
+  return control.rows.length === 1 && control.rows[0]?.locked === true;
 }
 
 async function wallClock(client: AuthoritySqlClient): Promise<string> {
@@ -601,7 +668,20 @@ async function wallClock(client: AuthoritySqlClient): Promise<string> {
 /** PostgreSQL is the concurrency boundary; every mutable admission check runs in one transaction. */
 export class PostgresOperationAuthorityStore implements OperationAuthorityStore {
   readonly durable = true;
-  constructor(private readonly pool: AuthoritySqlPool) {}
+  private readonly maxBrokerEvidenceAgeMs: number;
+  private readonly brokerSessionAttestor: BrokerDatabaseSessionAttestor;
+
+  constructor(
+    private readonly pool: AuthoritySqlPool,
+    options: PostgresOperationAuthorityOptions = {},
+  ) {
+    this.maxBrokerEvidenceAgeMs = options.maxBrokerEvidenceAgeMs ?? 5 * 60_000;
+    if (!Number.isInteger(this.maxBrokerEvidenceAgeMs)
+      || this.maxBrokerEvidenceAgeMs < 1_000 || this.maxBrokerEvidenceAgeMs > 60 * 60_000) {
+      throw new Error('Broker evidence age ceiling must be between 1 second and 1 hour.');
+    }
+    this.brokerSessionAttestor = options.brokerSessionAttestor ?? attestBrokerDatabaseSession;
+  }
 
   async initialize(): Promise<void> {
     const client = await this.pool.connect();
@@ -652,6 +732,64 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
          observed_at=EXCLUDED.observed_at, capacity_slots=EXCLUDED.capacity_slots`,
         [trusted.host_id, JSON.stringify(trusted), trusted.observed_at, trusted.capacity_slots],
       );
+    } finally { client.release?.(); }
+  }
+
+  async putBrokerPrincipalEvidence(evidence: TrustedBrokerPrincipalEvidence): Promise<void> {
+    const trusted = brokerPrincipalEvidenceSchema.parse(evidence);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
+      const transactionAt = await wallClock(client);
+      await client.query(
+        `INSERT INTO swarm_authority_broker_principals
+         (database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
+          authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8::timestamptz,$9,$10::jsonb)
+         ON CONFLICT (database_role,database_name) DO UPDATE SET
+           broker_execution_identity=EXCLUDED.broker_execution_identity,
+           broker_identity_evidence_ref=EXCLUDED.broker_identity_evidence_ref,
+           authn_kind=EXCLUDED.authn_kind,
+           role_contract_digest_sha256=EXCLUDED.role_contract_digest_sha256,
+           observed_at=EXCLUDED.observed_at,
+           access_review_expires_at=EXCLUDED.access_review_expires_at,
+           state=EXCLUDED.state,evidence=EXCLUDED.evidence`,
+        [trusted.database_role, trusted.database_name, trusted.broker_execution_identity,
+          trusted.broker_identity_evidence_ref, trusted.authn_kind, trusted.role_contract_digest_sha256,
+          trusted.observed_at, trusted.access_review_expires_at, trusted.state, JSON.stringify(trusted)],
+      );
+      const quarantined = await client.query(
+        `UPDATE swarm_authority_reservations SET state='stop-requested'
+         WHERE broker_database_role=$1 AND broker_database_name=$2
+           AND state='start-authorized-not-observed'
+           AND ($3 <> 'ready' OR broker_execution_identity <> $4 OR broker_identity_evidence_ref <> $5
+             OR broker_role_contract_sha256 <> $6)
+         RETURNING reservation_id,operation_id,binding_digest_sha256`,
+        [trusted.database_role, trusted.database_name, trusted.state, trusted.broker_execution_identity,
+          trusted.broker_identity_evidence_ref, trusted.role_contract_digest_sha256],
+      );
+      for (const row of quarantined.rows) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
+            reservation_id: row.reservation_id, reason: 'authenticated broker principal disabled or changed',
+            database_role: trusted.database_role, execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+      }
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ($1,$2,$3,$4::timestamptz,$5::jsonb)`,
+        [trusted.state === 'ready' ? 'broker-principal-registered' : 'broker-principal-disabled',
+          `broker-principal:${trusted.database_role}`, sha256Digest(trusted), transactionAt,
+          JSON.stringify({ ...trusted, registered_at: transactionAt })],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
     } finally { client.release?.(); }
   }
 
@@ -1028,6 +1166,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     };
     try {
       await client.query('BEGIN');
+      // Explicit pg_temp placement prevents PostgreSQL's implicit temp-first
+      // lookup from shadowing unqualified authority relations in this transaction.
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
       if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
       at = await wallClock(client);
       const nowMs = Date.parse(at);
@@ -1501,6 +1642,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       identity_evidence_ref: request.identity_evidence_ref,
       broker_execution_identity: String(row.broker_execution_identity),
       broker_identity_evidence_ref: String(row.broker_identity_evidence_ref),
+      broker_database_role: String(row.broker_database_role),
+      broker_database_name: String(row.broker_database_name),
+      broker_role_contract_sha256: String(row.broker_role_contract_sha256),
       redemption_token_sha256: String(row.redemption_token_sha256),
       control_token_sha256: String(row.control_token_sha256),
       start_authorized_at: sqlInstant(row.start_authorized_at),
@@ -1511,9 +1655,26 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     });
     try {
       await client.query('BEGIN');
+      // Explicit pg_temp placement prevents PostgreSQL's implicit temp-first
+      // lookup from shadowing unqualified authority relations in this transaction.
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
       if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
       at = await wallClock(client);
       const nowMs = Date.parse(at);
+      const sessionAttestation = await this.brokerSessionAttestor(client);
+      if (!sessionAttestation.valid) {
+        return await deny(`Broker database session is not authorized: ${sessionAttestation.blockers.join(' ')}`);
+      }
+      const brokerSession = sessionAttestation.session;
+      const principalResult = await client.query(
+        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
+                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
+         FROM swarm_authority_broker_principals
+         WHERE database_role=$1 AND database_name=$2`,
+        [brokerSession.database_role, brokerSession.database_name],
+      );
+      const principalRow = principalResult.rows[0];
+      const parsedPrincipal = brokerPrincipalEvidenceSchema.safeParse(principalRow?.evidence);
       const redemptionDigest = createHash('sha256').update(request.redemption_token, 'utf8').digest('hex');
       const found = await client.query(
         `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
@@ -1521,6 +1682,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                 state,consumption_id,lease_id,start_request_id,lease_expires_at,
                 lease_claim_token_sha256,redemption_token_sha256,control_token_sha256,
                 broker_execution_identity,broker_identity_evidence_ref,
+                broker_database_role,broker_database_name,broker_role_contract_sha256,
                 redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd,
                 (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
          FROM swarm_authority_reservations
@@ -1556,6 +1718,28 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (authorizedState && !exactRequest) {
         return await deny('A different redemption request already authorized this start lease.');
       }
+      const principal = parsedPrincipal.success ? parsedPrincipal.data : null;
+      const principalCurrent = principalResult.rows.length === 1 && principal !== null
+        && principal.database_role === principalRow.database_role
+        && principal.database_name === principalRow.database_name
+        && principal.broker_execution_identity === principalRow.broker_execution_identity
+        && principal.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
+        && principal.authn_kind === principalRow.authn_kind
+        && principal.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
+        && principal.role_contract_digest_sha256 === brokerSession.contract_digest_sha256
+        && principal.state === principalRow.state && principal.state === 'ready'
+        && sqlInstant(principal.observed_at) === sqlInstant(principalRow.observed_at)
+        && sqlInstant(principal.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
+        && Date.parse(principal.observed_at) <= nowMs + 60_000
+        && nowMs - Date.parse(principal.observed_at) <= this.maxBrokerEvidenceAgeMs
+        && Date.parse(principal.access_review_expires_at) > nowMs;
+      if (!principalCurrent || !principal) {
+        if (exactRequest) return await quarantineRetry(
+          'authenticated broker principal unavailable or stale on authorization retry',
+          'Authenticated broker principal is unavailable or stale on the authorization retry.',
+        );
+        return await deny('Authenticated broker principal is unavailable, stale, disabled, or drifted.');
+      }
       const binding = operationBindingSchema.safeParse(row.binding);
       if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
         if (exactRequest) return await quarantineRetry(
@@ -1568,9 +1752,21 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
         return await deny('Start-redemption worker identity does not match the operation binding.');
       }
-      if (row.broker_execution_identity !== request.broker_execution_identity
-        || row.broker_identity_evidence_ref !== request.broker_identity_evidence_ref) {
-        return await deny('Start-redemption broker identity does not match the start lease.');
+      if (row.broker_execution_identity !== principal.broker_execution_identity
+        || row.broker_identity_evidence_ref !== principal.broker_identity_evidence_ref) {
+        if (exactRequest) return await quarantineRetry(
+          'authenticated broker identity drifted from the lease on authorization retry',
+          'Authenticated broker identity drifted from the start lease on the authorization retry.',
+        );
+        return await deny('Authenticated broker identity does not match the start lease.');
+      }
+      if (exactRequest && (row.broker_database_role !== brokerSession.database_role
+        || row.broker_database_name !== brokerSession.database_name
+        || row.broker_role_contract_sha256 !== brokerSession.contract_digest_sha256)) {
+        return await quarantineRetry(
+          'stored broker database principal drifted on authorization retry',
+          'Stored broker database principal drifted on the authorization retry.',
+        );
       }
       if (row.host_id !== binding.data.host_id) {
         if (exactRequest) return await quarantineRetry(
@@ -1659,7 +1855,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return startRedemptionDenied('Reservation authority was revoked before start authorization.');
       }
       const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
+        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
         [request.operation_id],
       );
       if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
@@ -1783,10 +1979,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const transitioned = await client.query(
         `UPDATE swarm_authority_reservations
          SET state='start-authorized-not-observed',redemption_id=$2::uuid,redemption_request_id=$3::uuid,
-             start_authorized_at=$4::timestamptz,committed_cost_usd=reserved_cost_usd
+             start_authorized_at=$4::timestamptz,committed_cost_usd=reserved_cost_usd,
+             broker_database_role=$5,broker_database_name=$6,broker_role_contract_sha256=$7
          WHERE reservation_id=$1::uuid AND state='leased-not-started'
          RETURNING *`,
-        [request.reservation_id, redemptionId, request.redemption_request_id, at],
+        [request.reservation_id, redemptionId, request.redemption_request_id, at,
+          brokerSession.database_role, brokerSession.database_name, brokerSession.contract_digest_sha256],
       );
       if (transitioned.rows.length !== 1) return await deny('Start lease could not be authorized exactly once.');
       const cost = binding.data.requested_cost_usd;

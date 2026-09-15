@@ -206,8 +206,6 @@ export const startRedemptionInputSchema = z.object({
   binding_digest_sha256: digest,
   execution_identity: id,
   identity_evidence_ref: id,
-  broker_execution_identity: id,
-  broker_identity_evidence_ref: id,
   redemption_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
 
@@ -284,6 +282,9 @@ export interface StartRedemptionReceipt {
   identity_evidence_ref: string;
   broker_execution_identity: string;
   broker_identity_evidence_ref: string;
+  broker_database_role: string;
+  broker_database_name: string;
+  broker_role_contract_sha256: string;
   redemption_token_sha256: string;
   start_authorized_at: string;
   committed_cost_usd: number;
