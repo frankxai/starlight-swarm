@@ -26,8 +26,10 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^20.12.7",
+    "@types/pg": "^8.23.1",
     "@types/react": "^18.2.79",
     "@types/react-dom": "^18.2.25",
+    "pg": "^8.23.0",
     "tsx": "^4.19.2",
     "typescript": "^5.4.5"
   }
