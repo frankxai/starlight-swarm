@@ -1,0 +1,274 @@
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+
+import { z } from 'zod';
+
+import { canonicalJson, sha256Digest } from './runtime-digest';
+
+const id = z.string().min(3).max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
+const digest = z.string().regex(/^[a-f0-9]{64}$/);
+const iso = z.iso.datetime({ offset: true });
+const capability = z.string().min(3).max(160).regex(/^[a-z0-9][a-z0-9._:-]*$/);
+
+export const operationBindingSchema = z.object({
+  schema_version: z.literal('starlight.operation_binding.v1'),
+  operation_id: id,
+  effect_id: id,
+  mission_id: id,
+  call_id: id,
+  role: z.enum(['maker', 'checker']),
+  actor_id: id,
+  execution_identity: id,
+  identity_evidence_ref: id,
+  context_digest_sha256: digest,
+  prompt_sha256: digest,
+  timeout_ms: z.number().int().min(1_000).max(60 * 60_000),
+  requested_operation: id,
+  effect: z.object({
+    kind: id,
+    resource: z.string().min(3).max(1_000).regex(/^\S+$/),
+    parameters_digest_sha256: digest,
+  }).strict(),
+  source_profile: z.object({
+    repository: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    commit_sha: z.string().regex(/^[a-f0-9]{40}$/),
+    path: z.string().min(1).max(500).refine((value) => !value.startsWith('/') && !value.split('/').includes('..')),
+    digest_sha256: digest,
+  }).strict(),
+  policy_digest_sha256: digest,
+  plan_digest_sha256: digest,
+  pack_digest_sha256: digest,
+  compiler_version: id,
+  lane_id: id,
+  workload_id: id,
+  runtime_id: id,
+  host_id: id,
+  capabilities: z.array(capability).min(1).max(32),
+  budget_policy_id: id,
+  requested_cost_usd: z.number().finite().nonnegative().max(10_000),
+}).strict().superRefine((value, context) => {
+  if (new Set(value.capabilities).size !== value.capabilities.length) {
+    context.addIssue({ code: 'custom', path: ['capabilities'], message: 'Capabilities must be unique.' });
+  }
+  if (value.effect.kind !== value.requested_operation) {
+    context.addIssue({ code: 'custom', path: ['effect', 'kind'], message: 'Effect kind must match the requested operation.' });
+  }
+});
+
+const signedReceiptBase = {
+  receipt_id: id,
+  issuer: id,
+  key_id: id,
+  issued_at: iso,
+  expires_at: iso,
+  binding_digest_sha256: digest,
+};
+
+export const approvalReceiptSchema = z.object({
+  schema_version: z.literal('starlight.operation_approval.v1'),
+  ...signedReceiptBase,
+  scope: z.literal('admit-bounded-operation'),
+  allowed_capabilities: z.array(capability).min(1).max(32),
+  signature: digest,
+}).strict().superRefine((value, context) => {
+  if (new Set(value.allowed_capabilities).size !== value.allowed_capabilities.length) {
+    context.addIssue({ code: 'custom', path: ['allowed_capabilities'], message: 'Allowed capabilities must be unique.' });
+  }
+  if (Date.parse(value.issued_at) >= Date.parse(value.expires_at)) {
+    context.addIssue({ code: 'custom', path: ['expires_at'], message: 'Receipt must expire after it is issued.' });
+  }
+});
+
+export const budgetReceiptSchema = z.object({
+  schema_version: z.literal('starlight.operation_budget.v1'),
+  ...signedReceiptBase,
+  budget_policy_id: id,
+  hard_limit_usd: z.number().finite().nonnegative().max(10_000),
+  signature: digest,
+}).strict().superRefine((value, context) => {
+  if (Date.parse(value.issued_at) >= Date.parse(value.expires_at)) {
+    context.addIssue({ code: 'custom', path: ['expires_at'], message: 'Receipt must expire after it is issued.' });
+  }
+});
+
+export type OperationBinding = z.infer<typeof operationBindingSchema>;
+export type ApprovalReceipt = z.infer<typeof approvalReceiptSchema>;
+export type BudgetReceipt = z.infer<typeof budgetReceiptSchema>;
+
+export interface TrustedHostEvidence {
+  host_id: string;
+  observed_at: string;
+  status: 'ready' | 'degraded' | 'offline';
+  available_slots: number;
+  secret_readiness: boolean;
+  access_review_expires_at: string;
+  allowed_capabilities: string[];
+}
+
+export interface AtomicAdmissionRequest {
+  reservation_id: string;
+  now: string;
+  reservation_expires_at: string;
+  binding: OperationBinding;
+  binding_digest_sha256: string;
+  approval: Pick<ApprovalReceipt, 'receipt_id' | 'issuer' | 'key_id' | 'expires_at'>;
+  budget: Pick<BudgetReceipt, 'receipt_id' | 'issuer' | 'key_id' | 'expires_at' | 'hard_limit_usd'>;
+  max_host_evidence_age_ms: number;
+}
+
+export interface AdmissionReservation {
+  schema_version: 'starlight.operation_admission.v1';
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  approval_receipt_id: string;
+  budget_receipt_id: string;
+  host_id: string;
+  reserved_cost_usd: number;
+  reserved_at: string;
+  reservation_expires_at: string;
+  state: 'reserved-not-started';
+}
+
+export type AdmissionResult =
+  | { admitted: true; reservation: AdmissionReservation; blockers: [] }
+  | { admitted: false; reservation: null; blockers: string[] };
+
+/** The implementation must transact revocation, health, budget and replay checks with the reservation insert. */
+export interface OperationAuthorityStore {
+  readonly durable: boolean;
+  reserve(request: AtomicAdmissionRequest): Promise<AdmissionResult>;
+  recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
+}
+
+export interface AuthorityKeyring {
+  approvalIssuers: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  budgetIssuers: Readonly<Record<string, Readonly<Record<string, string>>>>;
+}
+
+export interface AdmissionInput {
+  binding: unknown;
+  approval_receipt: unknown;
+  budget_receipt: unknown;
+  reservation_duration_ms: number;
+}
+
+function unsigned<T extends { signature: string }>(receipt: T): Omit<T, 'signature'> {
+  const { signature: _signature, ...body } = receipt;
+  return body;
+}
+
+function receiptSignature(body: object, secret: string): string {
+  return createHmac('sha256', secret)
+    .update(canonicalJson({ domain: 'starlight.operation-authority.v1', receipt: body }))
+    .digest('hex');
+}
+
+export function signApprovalReceipt(
+  body: Omit<ApprovalReceipt, 'signature'>,
+  secret: string,
+): ApprovalReceipt {
+  return approvalReceiptSchema.parse({ ...body, signature: receiptSignature(body, secret) });
+}
+
+export function signBudgetReceipt(
+  body: Omit<BudgetReceipt, 'signature'>,
+  secret: string,
+): BudgetReceipt {
+  return budgetReceiptSchema.parse({ ...body, signature: receiptSignature(body, secret) });
+}
+
+function verifyReceipt(
+  receipt: ApprovalReceipt | BudgetReceipt,
+  issuers: AuthorityKeyring['approvalIssuers'],
+): boolean {
+  const secret = issuers[receipt.issuer]?.[receipt.key_id];
+  if (!secret || secret.length < 32) return false;
+  const expected = Buffer.from(receiptSignature(unsigned(receipt), secret), 'hex');
+  const actual = Buffer.from(receipt.signature, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function invalid(blockers: string[]): AdmissionResult {
+  return { admitted: false, reservation: null, blockers };
+}
+
+/**
+ * Cryptographic admission front door. It can issue a single reservation but never starts a worker.
+ * The durable store remains the operation-time authority for revocation, capacity and budget.
+ */
+export class OperationAuthority {
+  private readonly maxHostEvidenceAgeMs: number;
+
+  constructor(
+    private readonly store: OperationAuthorityStore,
+    private readonly keyring: AuthorityKeyring,
+    maxHostEvidenceAgeMs = 5 * 60_000,
+    private readonly clock: () => string = () => new Date().toISOString(),
+  ) {
+    if (!Number.isInteger(maxHostEvidenceAgeMs) || maxHostEvidenceAgeMs < 1_000 || maxHostEvidenceAgeMs > 60 * 60_000) {
+      throw new Error('Host evidence age ceiling must be between 1 second and 1 hour.');
+    }
+    this.maxHostEvidenceAgeMs = maxHostEvidenceAgeMs;
+  }
+
+  async admit(input: AdmissionInput): Promise<AdmissionResult> {
+    const blockers: string[] = [];
+    const now = this.clock();
+    const parsedBinding = operationBindingSchema.safeParse(input.binding);
+    const parsedApproval = approvalReceiptSchema.safeParse(input.approval_receipt);
+    const parsedBudget = budgetReceiptSchema.safeParse(input.budget_receipt);
+    let fallbackDigest = '0'.repeat(64);
+    try { fallbackDigest = sha256Digest(input.binding); } catch { blockers.push('Operation binding cannot be digested.'); }
+    const fallbackOperation = parsedBinding.success ? parsedBinding.data.operation_id : 'invalid-operation';
+
+    if (!this.store.durable) blockers.push('A durable authority store is required.');
+    if (!parsedBinding.success) blockers.push('Operation binding is invalid.');
+    if (!parsedApproval.success) blockers.push('Approval receipt is invalid.');
+    if (!parsedBudget.success) blockers.push('Budget receipt is invalid.');
+    if (!Number.isInteger(input.reservation_duration_ms) || input.reservation_duration_ms < 1_000 || input.reservation_duration_ms > 15 * 60_000) {
+      blockers.push('Reservation duration must be between 1 second and 15 minutes.');
+    }
+    const nowMs = Date.parse(now);
+    if (!Number.isFinite(nowMs)) blockers.push('Admission time is invalid.');
+    if (blockers.length || !parsedBinding.success || !parsedApproval.success || !parsedBudget.success) {
+      const auditAt = Number.isFinite(nowMs) ? now : new Date().toISOString();
+      await this.store.recordDenial(fallbackDigest, fallbackOperation, auditAt, blockers);
+      return invalid(blockers);
+    }
+
+    const binding = parsedBinding.data;
+    const approval = parsedApproval.data;
+    const budget = parsedBudget.data;
+    const bindingDigest = sha256Digest(binding);
+
+    if (!verifyReceipt(approval, this.keyring.approvalIssuers)) blockers.push('Approval signature or issuer is not trusted.');
+    if (!verifyReceipt(budget, this.keyring.budgetIssuers)) blockers.push('Budget signature or issuer is not trusted.');
+    for (const [label, receipt] of [['Approval', approval], ['Budget', budget]] as const) {
+      if (receipt.binding_digest_sha256 !== bindingDigest) blockers.push(`${label} receipt is bound to another operation.`);
+      if (Date.parse(receipt.issued_at) > nowMs + 60_000) blockers.push(`${label} receipt was issued in the future.`);
+      if (Date.parse(receipt.expires_at) <= nowMs) blockers.push(`${label} receipt is expired.`);
+    }
+    if (budget.budget_policy_id !== binding.budget_policy_id) blockers.push('Budget policy does not match the operation.');
+    if (binding.requested_cost_usd > budget.hard_limit_usd) blockers.push('Requested cost exceeds the signed budget ceiling.');
+    const allowed = new Set(approval.allowed_capabilities);
+    if (binding.capabilities.some((item) => !allowed.has(item))) blockers.push('Requested capabilities exceed the signed approval.');
+    if (blockers.length) {
+      await this.store.recordDenial(bindingDigest, binding.operation_id, now, blockers);
+      return invalid(blockers);
+    }
+
+    const receiptExpiry = Math.min(Date.parse(approval.expires_at), Date.parse(budget.expires_at));
+    const reservationExpiry = Math.min(nowMs + input.reservation_duration_ms, receiptExpiry);
+    return this.store.reserve({
+      reservation_id: randomUUID(),
+      now,
+      reservation_expires_at: new Date(reservationExpiry).toISOString(),
+      binding,
+      binding_digest_sha256: bindingDigest,
+      approval,
+      budget,
+      max_host_evidence_age_ms: this.maxHostEvidenceAgeMs,
+    });
+  }
+}
