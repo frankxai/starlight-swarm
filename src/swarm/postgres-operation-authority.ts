@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { cancellationInputSchema, consumptionInputSchema, operationBindingSchema } from './operation-authority';
+import { sha256Digest } from './runtime-digest';
 import type {
   AdmissionReservation,
   AdmissionResult,
   AtomicAdmissionRequest,
+  BudgetWindowEvidence,
   CancellationInput,
   CancellationResult,
   ConsumptionInput,
@@ -17,6 +19,20 @@ import { z } from 'zod';
 
 const controlId = z.string().min(3).max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
 const controlTime = z.iso.datetime({ offset: true });
+const budgetWindowSchema = z.object({
+  window_id: controlId,
+  policy_id: controlId,
+  kind: z.enum(['policy', 'daily']),
+  starts_at: controlTime,
+  ends_at: controlTime,
+  currency: z.literal('USD'),
+  hard_limit_usd: z.number().finite().nonnegative().max(10_000_000),
+}).strict().refine((value) => Date.parse(value.starts_at) < Date.parse(value.ends_at), {
+  message: 'Budget window must end after it starts.', path: ['ends_at'],
+});
+export type BudgetWindowRegistrationResult =
+  | { registered: true; already_registered: boolean; blockers: [] }
+  | { registered: false; already_registered: false; blockers: string[] };
 const revocationRefsSchema = z.array(z.string().min(5).max(500)).min(1).max(12);
 const hostEvidenceSchema = z.object({
   host_id: controlId,
@@ -49,6 +65,15 @@ CREATE TABLE IF NOT EXISTS swarm_authority_budgets (
   receipt_id TEXT PRIMARY KEY, hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
   reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0)
 );
+CREATE TABLE IF NOT EXISTS swarm_authority_budget_windows (
+  window_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('policy','daily')),
+  starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL,
+  currency CHAR(3) NOT NULL CHECK (currency='USD'),
+  hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
+  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
+  CHECK (ends_at > starts_at)
+);
 CREATE TABLE IF NOT EXISTS swarm_authority_prepared_operations (
   operation_id TEXT PRIMARY KEY, binding_digest_sha256 CHAR(64) NOT NULL,
   registered_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL CHECK (state IN ('ready','cancelled'))
@@ -64,8 +89,12 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   consumption_id UUID UNIQUE, consumed_at TIMESTAMPTZ,
   state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','cancelled','expired'))
 );
+CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
+  reservation_id UUID NOT NULL, window_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL CHECK (reserved_cost_usd >= 0),
+  PRIMARY KEY (reservation_id,window_id)
+);
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','reservation-cancelled','expired')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','reservation-cancelled','expired','budget-window-registered','budget-window-denied')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -138,6 +167,112 @@ UPDATE swarm_authority_reservations SET state='cancelled',binding='{}'::jsonb,re
   consume_token_sha256=repeat('0',64),cancel_token_sha256=repeat('0',64),max_host_evidence_age_ms=300000
 WHERE consume_token_sha256 IS NULL;
 
+-- A lifecycle reservation created before aggregate-window binding cannot be
+-- grandfathered safely. Cancel the non-started hold and reconcile it exactly.
+DO $aggregate_migration$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM (
+      SELECT r.budget_receipt_id,SUM(r.reserved_cost_usd) AS cost
+      FROM swarm_authority_reservations r
+      WHERE r.state IN ('reserved-not-started','consumed-not-started')
+        AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id)
+      GROUP BY budget_receipt_id
+    ) pending LEFT JOIN swarm_authority_budgets b ON b.receipt_id=pending.budget_receipt_id
+    WHERE b.receipt_id IS NULL OR pending.cost < 0 OR b.reserved_usd < pending.cost
+  ) THEN
+    RAISE EXCEPTION 'pre-aggregate reservation budget ledger is inconsistent';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM (
+      SELECT r.host_id,COUNT(*)::INTEGER AS slots
+      FROM swarm_authority_reservations r
+      WHERE r.state IN ('reserved-not-started','consumed-not-started')
+        AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds b WHERE b.reservation_id=r.reservation_id)
+      GROUP BY host_id
+    ) pending LEFT JOIN swarm_authority_hosts h ON h.host_id=pending.host_id
+    WHERE h.host_id IS NULL OR h.reserved_slots < pending.slots
+  ) THEN
+    RAISE EXCEPTION 'pre-aggregate reservation host ledger is inconsistent';
+  END IF;
+END
+$aggregate_migration$;
+UPDATE swarm_authority_budgets b SET reserved_usd=b.reserved_usd-pending.cost
+FROM (
+  SELECT r.budget_receipt_id,SUM(r.reserved_cost_usd) AS cost
+  FROM swarm_authority_reservations r
+  WHERE r.state IN ('reserved-not-started','consumed-not-started')
+    AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id)
+  GROUP BY budget_receipt_id
+) pending WHERE b.receipt_id=pending.budget_receipt_id;
+UPDATE swarm_authority_hosts h SET reserved_slots=reserved_slots-pending.slots
+FROM (
+  SELECT r.host_id,COUNT(*)::INTEGER AS slots
+  FROM swarm_authority_reservations r
+  WHERE r.state IN ('reserved-not-started','consumed-not-started')
+    AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds b WHERE b.reservation_id=r.reservation_id)
+  GROUP BY host_id
+) pending WHERE h.host_id=pending.host_id;
+INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+SELECT 'reservation-cancelled',operation_id,binding_digest_sha256,clock_timestamp(),
+  jsonb_build_object('reservation_id',reservation_id,'reason','reservation predated aggregate budget binding','released_cost_usd',reserved_cost_usd)
+FROM swarm_authority_reservations r
+WHERE r.state IN ('reserved-not-started','consumed-not-started')
+  AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id);
+UPDATE swarm_authority_reservations r SET state='cancelled'
+WHERE r.state IN ('reserved-not-started','consumed-not-started')
+  AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id);
+
+-- Any attributed active reservation must be bound to exactly one policy and one
+-- daily window for its signed policy, and every aggregate ledger must reconcile
+-- exactly to the active holds. Partial or fabricated attribution fails migration.
+DO $aggregate_integrity$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_reservations r
+    LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
+    LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
+    WHERE r.state IN ('reserved-not-started','consumed-not-started')
+    GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd
+    HAVING COUNT(h.window_id) <> 2
+      OR r.reserved_cost_usd IS DISTINCT FROM (r.binding->>'requested_cost_usd')::numeric
+      OR COUNT(DISTINCT w.kind) <> 2
+      OR COUNT(*) FILTER (WHERE w.kind='policy') <> 1
+      OR COUNT(*) FILTER (WHERE w.kind='daily') <> 1
+      OR COUNT(*) FILTER (WHERE w.policy_id IS DISTINCT FROM r.binding->>'budget_policy_id'
+        OR w.currency IS DISTINCT FROM 'USD' OR h.reserved_cost_usd IS DISTINCT FROM r.reserved_cost_usd) > 0
+  ) THEN
+    RAISE EXCEPTION 'active aggregate budget attribution is inconsistent';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_budget_windows w
+    LEFT JOIN (
+      SELECT h.window_id,SUM(h.reserved_cost_usd) AS held
+      FROM swarm_authority_budget_holds h
+      JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
+      WHERE r.state IN ('reserved-not-started','consumed-not-started')
+      GROUP BY h.window_id
+    ) active ON active.window_id=w.window_id
+    WHERE w.reserved_usd IS DISTINCT FROM COALESCE(active.held,0)
+  ) THEN
+    RAISE EXCEPTION 'aggregate budget window ledger does not reconcile to active holds';
+  END IF;
+END
+$aggregate_integrity$;
+
+DO $aggregate_constraints$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_budget_holds_reservation_fk') THEN
+    ALTER TABLE swarm_authority_budget_holds ADD CONSTRAINT swarm_authority_budget_holds_reservation_fk
+      FOREIGN KEY (reservation_id) REFERENCES swarm_authority_reservations(reservation_id);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_budget_holds_window_fk') THEN
+    ALTER TABLE swarm_authority_budget_holds ADD CONSTRAINT swarm_authority_budget_holds_window_fk
+      FOREIGN KEY (window_id) REFERENCES swarm_authority_budget_windows(window_id);
+  END IF;
+END
+$aggregate_constraints$;
+
 ALTER TABLE swarm_authority_hosts ALTER COLUMN capacity_slots SET NOT NULL;
 ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET DEFAULT 0;
 ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET NOT NULL;
@@ -154,7 +289,7 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
   CHECK (state IN ('reserved-not-started','consumed-not-started','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','reservation-cancelled','expired'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','reservation-cancelled','expired','budget-window-registered','budget-window-denied'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -225,8 +360,34 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, 'control-plane', '0'.repeat(64), {
+        action: 'initialize', error: error instanceof Error ? error.message : 'unknown initialization failure',
+      });
       throw error;
     } finally { client.release?.(); }
+  }
+
+  private async recordIntegrityRefusal(
+    client: AuthoritySqlClient,
+    operationId: string,
+    bindingDigestSha256: string,
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) {
+        await client.query('ROLLBACK');
+        return;
+      }
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [operationId, bindingDigestSha256, await wallClock(client), JSON.stringify({ integrity_refusal: detail })],
+      );
+      await client.query('COMMIT');
+    } catch {
+      try { await client.query('ROLLBACK'); } catch { /* primary failure remains authoritative */ }
+    }
   }
 
   async putHostEvidence(evidence: TrustedHostEvidence): Promise<void> {
@@ -253,6 +414,81 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
          ON CONFLICT (receipt_id) DO NOTHING`,
         [receiptId, hardLimitUsd],
       );
+    } finally { client.release?.(); }
+  }
+
+  async registerBudgetWindow(input: {
+    window_id: string;
+    policy_id: string;
+    kind: 'policy' | 'daily';
+    starts_at: string;
+    ends_at: string;
+    currency: 'USD';
+    hard_limit_usd: number;
+  }): Promise<BudgetWindowRegistrationResult> {
+    const window = budgetWindowSchema.parse(input);
+    const client = await this.pool.connect();
+    const deny = async (registeredAt: string, blocker: string): Promise<BudgetWindowRegistrationResult> => {
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('budget-window-denied','control-plane',$1,$2::timestamptz,$3::jsonb)`,
+        ['0'.repeat(64), registeredAt, JSON.stringify({
+          window_id: window.window_id, policy_id: window.policy_id, kind: window.kind, blockers: [blocker],
+        })],
+      );
+      await client.query('COMMIT');
+      return { registered: false, already_registered: false, blockers: [blocker] };
+    };
+    try {
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
+      const registeredAt = await wallClock(client);
+      const sameId = await client.query(
+        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd
+         FROM swarm_authority_budget_windows WHERE window_id=$1 FOR UPDATE`,
+        [window.window_id],
+      );
+      if (sameId.rows.length > 1) return await deny(registeredAt, 'Budget window identity is ambiguous.');
+      if (sameId.rows.length === 1) {
+        const existing = sameId.rows[0];
+        if (existing.policy_id !== window.policy_id || existing.kind !== window.kind
+          || sqlInstant(existing.starts_at) !== new Date(window.starts_at).toISOString()
+          || sqlInstant(existing.ends_at) !== new Date(window.ends_at).toISOString()
+          || existing.currency !== window.currency
+          || Number(existing.hard_limit_usd) !== window.hard_limit_usd) {
+          return await deny(registeredAt, 'Budget window identity is immutable once registered.');
+        }
+        await client.query('COMMIT');
+        return { registered: true, already_registered: true, blockers: [] };
+      }
+      const overlap = await client.query(
+        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd
+         FROM swarm_authority_budget_windows
+         WHERE policy_id=$1 AND kind=$2
+           AND NOT (ends_at <= $3::timestamptz OR starts_at >= $4::timestamptz)
+         FOR UPDATE`,
+        [window.policy_id, window.kind, window.starts_at, window.ends_at],
+      );
+      if (overlap.rows.length > 0) {
+        return await deny(registeredAt, 'Budget policy window overlaps an immutable registered window.');
+      }
+      await client.query(
+        `INSERT INTO swarm_authority_budget_windows
+         (window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd)
+         VALUES ($1,$2,$3,$4::timestamptz,$5::timestamptz,$6,$7)`,
+        [window.window_id, window.policy_id, window.kind, window.starts_at, window.ends_at,
+          window.currency, window.hard_limit_usd],
+      );
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('budget-window-registered','control-plane',$1,$2::timestamptz,$3::jsonb)`,
+        ['0'.repeat(64), registeredAt, JSON.stringify(window)],
+      );
+      await client.query('COMMIT');
+      return { registered: true, already_registered: false, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
     } finally { client.release?.(); }
   }
 
@@ -300,6 +536,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     controlTime.parse(at);
     z.string().min(1).max(1_000).parse(reason);
     const client = await this.pool.connect();
+    let affectedOperation = 'control-plane';
+    let affectedDigest = '0'.repeat(64);
     try {
       await client.query('BEGIN');
       if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
@@ -309,7 +547,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
          ON CONFLICT (ref) DO NOTHING`, [ref, transactionAt, reason],
       );
       const affected = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,budget_receipt_id,host_id,reserved_cost_usd,state
+        `SELECT reservation_id,operation_id,binding_digest_sha256,binding,budget_receipt_id,host_id,reserved_cost_usd,state,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
          FROM swarm_authority_reservations
          WHERE state IN ('reserved-not-started','consumed-not-started')
            AND revocation_refs @> jsonb_build_array($1::text)
@@ -317,6 +556,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         [ref],
       );
       for (const row of affected.rows) {
+        affectedOperation = String(row.operation_id);
+        affectedDigest = String(row.binding_digest_sha256);
         const transitioned = await client.query(
           `UPDATE swarm_authority_reservations SET state='cancelled'
            WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started')
@@ -337,7 +578,13 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         ['0'.repeat(64), transactionAt, JSON.stringify({ ref, requested_at: at, reason })],
       );
       await client.query('COMMIT');
-    } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release?.(); }
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, affectedOperation, affectedDigest, {
+        action: 'revoke', ref, error: error instanceof Error ? error.message : 'unknown revocation failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
   }
 
   async recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void> {
@@ -351,18 +598,85 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     } finally { client.release?.(); }
   }
 
+  private async readBudgetWindows(
+    client: AuthoritySqlClient,
+    reservationId: string,
+    expectedPolicyId: string,
+    expectedCost: number,
+  ): Promise<BudgetWindowEvidence[] | null> {
+    const result = await client.query(
+      `SELECT w.window_id,w.policy_id,w.kind,w.starts_at,w.ends_at,w.currency,
+              (h.reserved_cost_usd IS NOT DISTINCT FROM $2::numeric) AS hold_cost_matches,
+              (w.reserved_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(h2.reserved_cost_usd),0)
+               FROM swarm_authority_budget_holds h2
+               JOIN swarm_authority_reservations r2 ON r2.reservation_id=h2.reservation_id
+               WHERE h2.window_id=w.window_id
+                 AND r2.state IN ('reserved-not-started','consumed-not-started'))) AS ledger_reconciles
+       FROM swarm_authority_budget_holds h JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
+       WHERE h.reservation_id=$1::uuid ORDER BY w.kind`,
+      [reservationId, expectedCost],
+    );
+    const kinds = new Set(result.rows.map((row) => row.kind));
+    if (result.rows.length !== 2
+      || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')
+      || result.rows.some((row) => row.policy_id !== expectedPolicyId
+        || row.currency !== 'USD' || row.hold_cost_matches !== true || row.ledger_reconciles !== true)) return null;
+    try {
+      return result.rows.map((row) => ({
+        window_id: String(row.window_id),
+        kind: row.kind as 'policy' | 'daily',
+        starts_at: sqlInstant(row.starts_at),
+        ends_at: sqlInstant(row.ends_at),
+        currency: 'USD',
+      }));
+    } catch { return null; }
+  }
+
   private async releaseResources(
     client: AuthoritySqlClient,
     row: Record<string, unknown>,
   ): Promise<number> {
-    const cost = Number(row.reserved_cost_usd);
-    if (!Number.isFinite(cost) || cost < 0) throw new Error('Reservation cost ledger is invalid.');
+    const binding = operationBindingSchema.safeParse(row.binding);
+    if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
+      || row.cost_matches_binding !== true) {
+      throw new Error('Reservation binding is invalid or digest-drifted during resource release.');
+    }
+    const cost = binding.data.requested_cost_usd;
+    const durableCost = row.reserved_cost_usd;
     const budget = await client.query(
-      `UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd-$2
-       WHERE receipt_id=$1 AND reserved_usd >= $2 RETURNING reserved_usd`,
-      [row.budget_receipt_id, cost],
+      `UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd-$2::numeric
+       WHERE receipt_id=$1 AND reserved_usd >= $2::numeric RETURNING reserved_usd`,
+      [row.budget_receipt_id, durableCost],
     );
     if (budget.rows.length !== 1) throw new Error('Budget release would underflow or references a missing receipt.');
+    const holds = await client.query(
+      `SELECT h.window_id,w.policy_id,w.kind,w.currency,
+              (h.reserved_cost_usd IS NOT DISTINCT FROM $2::numeric) AS hold_cost_matches,
+              (w.reserved_usd IS NOT DISTINCT FROM ((SELECT COALESCE(SUM(h2.reserved_cost_usd),0)
+               FROM swarm_authority_budget_holds h2
+               JOIN swarm_authority_reservations r2 ON r2.reservation_id=h2.reservation_id
+               WHERE h2.window_id=w.window_id
+                 AND r2.state IN ('reserved-not-started','consumed-not-started')) + $2::numeric)) AS ledger_reconciles
+       FROM swarm_authority_budget_holds h
+       JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
+       WHERE h.reservation_id=$1::uuid ORDER BY w.kind FOR UPDATE`,
+      [row.reservation_id, durableCost],
+    );
+    const kinds = new Set(holds.rows.map((hold) => hold.kind));
+    if (holds.rows.length !== 2 || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')
+      || holds.rows.some((hold) => hold.hold_cost_matches !== true
+        || hold.policy_id !== binding.data.budget_policy_id || hold.currency !== 'USD'
+        || hold.ledger_reconciles !== true)) {
+      throw new Error('Aggregate budget holds are missing, ambiguous, or inconsistent.');
+    }
+    for (const hold of holds.rows) {
+      const aggregate = await client.query(
+        `UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd-$2::numeric
+         WHERE window_id=$1 AND reserved_usd >= $2::numeric RETURNING reserved_usd`,
+        [hold.window_id, durableCost],
+      );
+      if (aggregate.rows.length !== 1) throw new Error('Aggregate budget release would underflow or references a missing window.');
+    }
     const host = await client.query(
       `UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots-1
        WHERE host_id=$1 AND reserved_slots >= 1 RETURNING reserved_slots`,
@@ -395,6 +709,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const found = await client.query(
         `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
                 approval_receipt_id,budget_receipt_id,host_id,reserved_cost_usd,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding,
                 reservation_expires_at,max_host_evidence_age_ms,state,consumption_id,consumed_at
          FROM swarm_authority_reservations
          WHERE reservation_id=$1::uuid AND consume_token_sha256=$2 FOR UPDATE`,
@@ -406,11 +721,19 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return await deny('Consumption request does not match the reserved operation and effect.');
       }
       const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || binding.data.execution_identity !== request.execution_identity || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
+      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
+        || row.cost_matches_binding !== true) {
+        return await deny('Stored reservation binding or signed cost is invalid.');
+      }
+      if (binding.data.execution_identity !== request.execution_identity || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
         return await deny('Consumption identity does not match the reserved binding.');
       }
       if (row.state === 'cancelled' || row.state === 'expired') return await deny(`Reservation is ${row.state}.`);
       if (row.state !== 'reserved-not-started' && row.state !== 'consumed-not-started') return await deny('Reservation state is invalid.');
+      const heldWindows = await this.readBudgetWindows(
+        client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd,
+      );
+      if (!heldWindows) return await deny('Aggregate budget holds are missing, ambiguous, or inconsistent.');
 
       if (Date.parse(String(row.reservation_expires_at)) <= nowMs) {
         const expired = await client.query(
@@ -486,6 +809,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           binding_digest_sha256: request.binding_digest_sha256,
           execution_identity: request.execution_identity,
           identity_evidence_ref: request.identity_evidence_ref,
+          budget_policy_id: binding.data.budget_policy_id,
+          budget_windows: heldWindows,
           consumed_at: sqlInstant(row.consumed_at),
           consumption_expires_at: sqlInstant(row.reservation_expires_at),
           state: 'consumed-not-started',
@@ -525,6 +850,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         binding_digest_sha256: request.binding_digest_sha256,
         execution_identity: request.execution_identity,
         identity_evidence_ref: request.identity_evidence_ref,
+        budget_policy_id: binding.data.budget_policy_id,
+        budget_windows: heldWindows,
         consumed_at: at,
         consumption_expires_at: sqlInstant(row.reservation_expires_at),
         state: 'consumed-not-started',
@@ -544,6 +871,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       return { consumed: true, receipt, blockers: [] };
     } catch (error) {
       await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'consume', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown consumption failure',
+      });
       throw error;
     } finally { client.release?.(); }
   }
@@ -553,12 +884,15 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     if (!parsed.success) return cancellationDenied(String(input?.reservation_id ?? 'invalid-reservation'), 'Cancellation request is invalid.');
     const request = parsed.data;
     const client = await this.pool.connect();
+    let affectedOperation = 'invalid-operation';
+    let affectedDigest = '0'.repeat(64);
     try {
       await client.query('BEGIN');
       if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
       const at = await wallClock(client);
       const found = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,budget_receipt_id,host_id,reserved_cost_usd,state
+        `SELECT reservation_id,operation_id,binding_digest_sha256,binding,budget_receipt_id,host_id,reserved_cost_usd,state,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
          FROM swarm_authority_reservations
          WHERE reservation_id=$1::uuid AND cancel_token_sha256=$2 FOR UPDATE`,
         [request.reservation_id, createHash('sha256').update(request.cancel_token, 'utf8').digest('hex')],
@@ -573,6 +907,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         await client.query('COMMIT');
         return cancellationDenied(request.reservation_id, 'Reservation does not exist.');
       }
+      affectedOperation = String(row.operation_id);
+      affectedDigest = String(row.binding_digest_sha256);
       if (row.state === 'cancelled') {
         await client.query('COMMIT');
         return { cancelled: true, reservation_id: request.reservation_id, state: 'cancelled', already_terminal: true, released_cost_usd: 0, blockers: [] };
@@ -606,6 +942,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       return { cancelled: true, reservation_id: request.reservation_id, state: 'cancelled', already_terminal: false, released_cost_usd: released, blockers: [] };
     } catch (error) {
       await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, affectedOperation, affectedDigest, {
+        action: 'cancel', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown cancellation failure',
+      });
       throw error;
     } finally { client.release?.(); }
   }
@@ -685,6 +1025,28 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (registeredLimit !== request.budget.hard_limit_usd) return await deny('Signed and durable budget ceilings differ.');
       if (reserved + request.binding.requested_cost_usd > registeredLimit) return await deny('Durable budget is exhausted.');
 
+      const aggregateRows = await client.query(
+        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd,reserved_usd,
+                (reserved_usd+$3::numeric <= hard_limit_usd) AS can_reserve
+         FROM swarm_authority_budget_windows
+         WHERE policy_id=$1 AND starts_at <= $2::timestamptz AND ends_at > $2::timestamptz
+         ORDER BY kind FOR UPDATE`,
+        [request.binding.budget_policy_id, transactionNow, request.binding.requested_cost_usd],
+      );
+      const kinds = new Set(aggregateRows.rows.map((row) => row.kind));
+      if (aggregateRows.rows.length !== 2 || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')) {
+        return await deny('Exactly one active policy and daily aggregate budget window are required.');
+      }
+      if (aggregateRows.rows.some((row) => row.currency !== 'USD')) return await deny('Aggregate budget currency must be USD.');
+      if (aggregateRows.rows.some((row) => Date.parse(request.reservation_expires_at) > Date.parse(String(row.ends_at)))) {
+        return await deny('Reservation expiry crosses an aggregate budget window boundary.');
+      }
+      if (aggregateRows.rows.some((row) => row.can_reserve !== true)) return await deny('Aggregate budget window is exhausted.');
+      const selectedWindows: BudgetWindowEvidence[] = aggregateRows.rows.map((row) => ({
+        window_id: String(row.window_id), kind: row.kind as 'policy' | 'daily',
+        starts_at: sqlInstant(row.starts_at), ends_at: sqlInstant(row.ends_at), currency: 'USD',
+      }));
+
       const inserted = await client.query(
         `INSERT INTO swarm_authority_reservations
          (reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
@@ -699,13 +1061,28 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           request.max_host_evidence_age_ms],
       );
       if (!inserted.rows[0]) return await deny('Operation or external effect was already reserved.');
+      for (const window of selectedWindows) {
+        await client.query(
+          `INSERT INTO swarm_authority_budget_holds (reservation_id,window_id,reserved_cost_usd)
+           VALUES ($1::uuid,$2,$3)`,
+          [request.reservation_id, window.window_id, request.binding.requested_cost_usd],
+        );
+        const aggregateUpdate = await client.query(
+          `UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd+$2
+           WHERE window_id=$1 AND reserved_usd+$2 <= hard_limit_usd RETURNING reserved_usd`,
+          [window.window_id, request.binding.requested_cost_usd],
+        );
+        if (aggregateUpdate.rows.length !== 1) throw new Error('Aggregate budget reservation lost its authority race.');
+      }
       await client.query('UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd+$2 WHERE receipt_id=$1', [request.budget.receipt_id, request.binding.requested_cost_usd]);
       await client.query('UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots+1 WHERE host_id=$1', [host.host_id]);
       const reservation: AdmissionReservation = {
         schema_version: 'starlight.operation_admission.v1', reservation_id: request.reservation_id,
         operation_id: request.binding.operation_id, effect_id: request.binding.effect_id,
         binding_digest_sha256: request.binding_digest_sha256, approval_receipt_id: request.approval.receipt_id,
-        budget_receipt_id: request.budget.receipt_id, host_id: request.binding.host_id,
+        budget_receipt_id: request.budget.receipt_id, budget_policy_id: request.binding.budget_policy_id,
+        budget_windows: selectedWindows,
+        host_id: request.binding.host_id,
         reserved_cost_usd: request.binding.requested_cost_usd, reserved_at: transactionNow,
         reservation_expires_at: request.reservation_expires_at,
         consume_token: request.consume_token,

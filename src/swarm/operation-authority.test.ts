@@ -19,6 +19,8 @@ import { sha256Digest } from './runtime-digest';
 const NOW_MS = Date.now();
 const NOW = new Date(NOW_MS).toISOString();
 const EXPIRES = new Date(NOW_MS + 10 * 60_000).toISOString();
+const WINDOW_START = new Date(NOW_MS - 60_000).toISOString();
+const WINDOW_END = new Date(NOW_MS + 15 * 60_000).toISOString();
 const APPROVAL_SECRET = 'approval-secret-at-least-32-bytes-long';
 const BUDGET_SECRET = 'budget-secret-at-least-32-bytes-long';
 
@@ -101,7 +103,10 @@ function binding(overrides: Partial<OperationBinding> = {}): OperationBinding {
   };
 }
 
-async function harness(operation = binding()) {
+async function harness(
+  operation = binding(),
+  windows: { policyLimit?: number; dailyLimit?: number; endsAt?: string } = {},
+) {
   const pool = new PGlitePool();
   const store = new PostgresOperationAuthorityStore(pool);
   await store.initialize();
@@ -109,10 +114,28 @@ async function harness(operation = binding()) {
     host_id: operation.host_id,
     observed_at: NOW,
     status: 'ready',
-    capacity_slots: 2,
+    capacity_slots: 4,
     secret_readiness: true,
     access_review_expires_at: EXPIRES,
     allowed_capabilities: ['repository.read', 'repository.write'],
+  });
+  await store.registerBudgetWindow({
+    window_id: `${operation.budget_policy_id}:policy-window`,
+    policy_id: operation.budget_policy_id,
+    kind: 'policy',
+    starts_at: WINDOW_START,
+    ends_at: windows.endsAt ?? WINDOW_END,
+    currency: 'USD',
+    hard_limit_usd: windows.policyLimit ?? 0.5,
+  });
+  await store.registerBudgetWindow({
+    window_id: `${operation.budget_policy_id}:daily-window`,
+    policy_id: operation.budget_policy_id,
+    kind: 'daily',
+    starts_at: WINDOW_START,
+    ends_at: windows.endsAt ?? WINDOW_END,
+    currency: 'USD',
+    hard_limit_usd: windows.dailyLimit ?? 0.5,
   });
   const digest = sha256Digest(operation);
   const approval = signApprovalReceipt({
@@ -179,6 +202,28 @@ function cancellation(reservation: Awaited<ReturnType<typeof reserve>>, reason: 
   };
 }
 
+async function admitRelated(h: Harness, operation: OperationBinding, suffix: string, duration = 60_000) {
+  const bindingDigest = sha256Digest(operation);
+  const approval = signApprovalReceipt({
+    schema_version: 'starlight.operation_approval.v1', receipt_id: `approval-${suffix}`,
+    issuer: h.approval.issuer, key_id: h.approval.key_id, issued_at: NOW, expires_at: EXPIRES,
+    binding_digest_sha256: bindingDigest, scope: 'admit-bounded-operation',
+    allowed_capabilities: h.approval.allowed_capabilities,
+  }, APPROVAL_SECRET);
+  const budget = signBudgetReceipt({
+    schema_version: 'starlight.operation_budget.v1', receipt_id: `budget-${suffix}`,
+    issuer: h.budget.issuer, key_id: h.budget.key_id, issued_at: NOW, expires_at: EXPIRES,
+    binding_digest_sha256: bindingDigest, budget_policy_id: operation.budget_policy_id,
+    hard_limit_usd: 0.5,
+  }, BUDGET_SECRET);
+  await h.store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
+  await h.store.putPreparedOperation(operation.operation_id, bindingDigest, NOW);
+  return h.authority.admit({
+    binding: operation, approval_receipt: approval, budget_receipt: budget,
+    reservation_duration_ms: duration,
+  });
+}
+
 const LEGACY_RESERVATION_SCHEMA_SQL = `
 CREATE TABLE swarm_authority_revocations (ref TEXT PRIMARY KEY, revoked_at TIMESTAMPTZ NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE swarm_authority_control (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
@@ -197,6 +242,37 @@ CREATE TABLE swarm_authority_audit (
   seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','denied','revoked','cancelled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
+);`;
+
+const PRE_AGGREGATE_SCHEMA_SQL = `
+CREATE TABLE swarm_authority_revocations (ref TEXT PRIMARY KEY, revoked_at TIMESTAMPTZ NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE swarm_authority_control (singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+INSERT INTO swarm_authority_control (singleton) VALUES (TRUE);
+CREATE TABLE swarm_authority_hosts (
+  host_id TEXT PRIMARY KEY,evidence JSONB NOT NULL,observed_at TIMESTAMPTZ NOT NULL,
+  capacity_slots INTEGER NOT NULL CHECK (capacity_slots >= 0),reserved_slots INTEGER NOT NULL DEFAULT 0 CHECK (reserved_slots >= 0)
+);
+CREATE TABLE swarm_authority_budgets (
+  receipt_id TEXT PRIMARY KEY,hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
+  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0)
+);
+CREATE TABLE swarm_authority_prepared_operations (
+  operation_id TEXT PRIMARY KEY,binding_digest_sha256 CHAR(64) NOT NULL,registered_at TIMESTAMPTZ NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('ready','cancelled'))
+);
+CREATE TABLE swarm_authority_reservations (
+  reservation_id UUID PRIMARY KEY,operation_id TEXT NOT NULL UNIQUE,effect_id TEXT NOT NULL UNIQUE,
+  binding_digest_sha256 CHAR(64) NOT NULL,binding JSONB NOT NULL,revocation_refs JSONB NOT NULL,
+  consume_token_sha256 CHAR(64) NOT NULL,cancel_token_sha256 CHAR(64) NOT NULL,approval_receipt_id TEXT NOT NULL,
+  budget_receipt_id TEXT NOT NULL,host_id TEXT NOT NULL,reserved_cost_usd NUMERIC NOT NULL,
+  reserved_at TIMESTAMPTZ NOT NULL,reservation_expires_at TIMESTAMPTZ NOT NULL,
+  max_host_evidence_age_ms INTEGER NOT NULL CHECK (max_host_evidence_age_ms BETWEEN 1000 AND 3600000),
+  consumption_id UUID UNIQUE,consumed_at TIMESTAMPTZ,
+  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','cancelled','expired'))
+);
+CREATE TABLE swarm_authority_audit (
+  seq BIGSERIAL PRIMARY KEY,event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','reservation-cancelled','expired')),
+  operation_id TEXT NOT NULL,binding_digest_sha256 CHAR(64) NOT NULL,at TIMESTAMPTZ NOT NULL,detail JSONB NOT NULL
 );`;
 
 test('upgrades the reservation-only schema by cancelling unsafe legacy holds exactly once', async () => {
@@ -266,6 +342,46 @@ test('legacy upgrade fails closed instead of clamping an inconsistent budget hol
   } finally { await pool.close(); }
 });
 
+test('upgrade cancels lifecycle reservations that predate trusted aggregate-window attribution', async () => {
+  const pool = new PGlitePool();
+  try {
+    await pool.execute(PRE_AGGREGATE_SCHEMA_SQL);
+    const operation = binding();
+    const digest = sha256Digest(operation);
+    const evidence = {
+      host_id: operation.host_id, observed_at: NOW, status: 'ready', capacity_slots: 4,
+      secret_readiness: true, access_review_expires_at: EXPIRES,
+      allowed_capabilities: operation.capabilities,
+    };
+    await pool.execute(`
+      INSERT INTO swarm_authority_hosts VALUES ('${operation.host_id}','${JSON.stringify(evidence)}'::jsonb,'${NOW}',4,1);
+      INSERT INTO swarm_authority_budgets VALUES ('budget-pre-aggregate',1,0.25);
+      INSERT INTO swarm_authority_prepared_operations VALUES ('${operation.operation_id}','${digest}','${NOW}','ready');
+      INSERT INTO swarm_authority_reservations (
+        reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
+        consume_token_sha256,cancel_token_sha256,approval_receipt_id,budget_receipt_id,host_id,
+        reserved_cost_usd,reserved_at,reservation_expires_at,max_host_evidence_age_ms,state
+      ) VALUES (
+        '00000000-0000-4000-8000-000000000003','${operation.operation_id}','${operation.effect_id}','${digest}',
+        '${JSON.stringify(operation)}'::jsonb,'["key:approval:key"]'::jsonb,'${'1'.repeat(64)}','${'2'.repeat(64)}',
+        'approval-pre-aggregate','budget-pre-aggregate','${operation.host_id}',0.25,'${NOW}','${EXPIRES}',300000,'reserved-not-started'
+      );
+    `);
+    const store = new PostgresOperationAuthorityStore(pool);
+    await store.initialize();
+    await store.initialize();
+    const rows = await pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+    assert.equal(rows[0].state, 'cancelled');
+    assert.equal(Number(rows[0].reserved_usd), 0);
+    assert.equal(Number(rows[0].reserved_slots), 0);
+    assert.equal((await pool.rows('SELECT * FROM swarm_authority_budget_holds')).length, 0);
+    const events = await pool.rows("SELECT event,detail FROM swarm_authority_audit WHERE event='reservation-cancelled'");
+    assert.equal(events.length, 1);
+    assert.match(JSON.stringify(events[0].detail), /predated aggregate budget binding/i);
+  } finally { await pool.close(); }
+});
+
 test('issues a durable reserved-not-started reservation and atomically denies replay', async () => {
   const h = await harness();
   try {
@@ -319,8 +435,107 @@ test('issues a durable reserved-not-started reservation and atomically denies re
       ['budget-001', 0.25], ['budget-002', 0],
     ]);
     const audits = await h.pool.rows('SELECT event FROM swarm_authority_audit ORDER BY seq');
-    assert.deepEqual(audits.map((row) => row.event), ['reserved', 'denied', 'denied']);
+    assert.deepEqual(audits.map((row) => row.event), [
+      'budget-window-registered', 'budget-window-registered', 'reserved', 'denied', 'denied',
+    ]);
   } finally { await h.pool.close(); }
+});
+
+test('enforces immutable policy and daily windows across independent signed receipts', async () => {
+  const h = await harness();
+  try {
+    const idempotent = await h.store.registerBudgetWindow({
+      window_id: `${h.operation.budget_policy_id}:daily-window`,
+      policy_id: h.operation.budget_policy_id,
+      kind: 'daily',
+      starts_at: WINDOW_START,
+      ends_at: WINDOW_END,
+      currency: 'USD',
+      hard_limit_usd: 0.5,
+    });
+    assert.deepEqual(idempotent, { registered: true, already_registered: true, blockers: [] });
+    const changedIdentity = await h.store.registerBudgetWindow({
+      window_id: `${h.operation.budget_policy_id}:daily-window`,
+      policy_id: h.operation.budget_policy_id,
+      kind: 'daily',
+      starts_at: WINDOW_START,
+      ends_at: WINDOW_END,
+      currency: 'USD',
+      hard_limit_usd: 1,
+    });
+    assert.equal(changedIdentity.registered, false);
+    assert.match(changedIdentity.blockers.join(' '), /identity is immutable/i);
+    const overlap = await h.store.registerBudgetWindow({
+      window_id: 'overlapping-daily-window',
+      policy_id: h.operation.budget_policy_id,
+      kind: 'daily',
+      starts_at: new Date(NOW_MS).toISOString(),
+      ends_at: new Date(NOW_MS + 20 * 60_000).toISOString(),
+      currency: 'USD',
+      hard_limit_usd: 1,
+    });
+    assert.equal(overlap.registered, false);
+    assert.match(overlap.blockers.join(' '), /overlaps an immutable/i);
+    const windowAudits = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event LIKE 'budget-window-%' ORDER BY seq");
+    assert.deepEqual(windowAudits.map((row) => row.event), [
+      'budget-window-registered', 'budget-window-registered', 'budget-window-denied', 'budget-window-denied',
+    ]);
+
+    const first = await reserve(h);
+    assert.equal(first.budget_policy_id, h.operation.budget_policy_id);
+    assert.deepEqual(first.budget_windows.map((window) => window.kind).sort(), ['daily', 'policy']);
+    assert.ok(first.budget_windows.every((window) => window.starts_at === WINDOW_START && window.ends_at === WINDOW_END));
+    const secondOperation = binding({ operation_id: 'operation-aggregate-002', effect_id: 'effect-aggregate-002', call_id: 'call-aggregate-002' });
+    const second = await admitRelated(h, secondOperation, 'aggregate-002');
+    assert.equal(second.admitted, true);
+    const thirdOperation = binding({
+      operation_id: 'operation-aggregate-003', effect_id: 'effect-aggregate-003',
+      call_id: 'call-aggregate-003', requested_cost_usd: 0.1,
+    });
+    const exhausted = await admitRelated(h, thirdOperation, 'aggregate-003');
+    assert.equal(exhausted.admitted, false);
+    assert.match(exhausted.blockers.join(' '), /aggregate budget window is exhausted/i);
+
+    const beforeRelease = await h.pool.rows('SELECT kind,reserved_usd FROM swarm_authority_budget_windows ORDER BY kind');
+    assert.deepEqual(beforeRelease.map((row) => [row.kind, Number(row.reserved_usd)]), [['daily', 0.5], ['policy', 0.5]]);
+    const cancelled = await h.authority.cancel(cancellation(first, 'release aggregate hold'));
+    assert.equal(cancelled.cancelled, true);
+    const retry = await admitRelated(h, thirdOperation, 'aggregate-003');
+    assert.equal(retry.admitted, true);
+    const afterRelease = await h.pool.rows('SELECT kind,reserved_usd FROM swarm_authority_budget_windows ORDER BY kind');
+    assert.deepEqual(afterRelease.map((row) => [row.kind, Number(row.reserved_usd)]), [['daily', 0.35], ['policy', 0.35]]);
+  } finally { await h.pool.close(); }
+});
+
+test('the tighter daily window wins and a reservation cannot cross either window boundary', async (t) => {
+  await t.test('daily ceiling', async () => {
+    const operation = binding({ budget_policy_id: 'tight-daily-policy' });
+    const h = await harness(operation, { policyLimit: 1, dailyLimit: 0.3 });
+    try {
+      await reserve(h);
+      const second = await admitRelated(h, binding({
+        budget_policy_id: operation.budget_policy_id, operation_id: 'tight-operation-002',
+        effect_id: 'tight-effect-002', call_id: 'tight-call-002', requested_cost_usd: 0.1,
+      }), 'tight-002');
+      assert.equal(second.admitted, false);
+      assert.match(second.blockers.join(' '), /aggregate budget window is exhausted/i);
+      const rows = await h.pool.rows('SELECT kind,reserved_usd FROM swarm_authority_budget_windows ORDER BY kind');
+      assert.deepEqual(rows.map((row) => [row.kind, Number(row.reserved_usd)]), [['daily', 0.25], ['policy', 0.25]]);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('half-open boundary', async () => {
+    const operation = binding({ budget_policy_id: 'boundary-policy' });
+    const h = await harness(operation, { endsAt: new Date(NOW_MS + 30_000).toISOString() });
+    try {
+      const denied = await h.authority.admit({
+        binding: h.operation, approval_receipt: h.approval, budget_receipt: h.budget,
+        reservation_duration_ms: 60_000,
+      });
+      assert.equal(denied.admitted, false);
+      assert.match(denied.blockers.join(' '), /crosses an aggregate budget window boundary/i);
+    } finally { await h.pool.close(); }
+  });
 });
 
 test('fails closed for forged, drifted, escalated, revoked and cancelled authority', async (t) => {
@@ -532,6 +747,7 @@ test('consumes once, returns an idempotent receipt, and never persists or audits
     if (!first.consumed) return;
     assert.equal(first.receipt.state, 'consumed-not-started');
     assert.equal(first.receipt.consumption_expires_at, reservation.reservation_expires_at);
+    assert.deepEqual(first.receipt.budget_windows, reservation.budget_windows);
 
     const retry = await h.authority.consume(consumption(h, reservation));
     assert.equal(retry.consumed, true);
@@ -544,7 +760,9 @@ test('consumes once, returns an idempotent receipt, and never persists or audits
     assert.equal(stored[0].consumption_id, first.receipt.consumption_id);
     assert.notEqual(stored[0].consume_token_sha256, reservation.consume_token);
     const audit = await h.pool.rows('SELECT event,detail FROM swarm_authority_audit ORDER BY seq');
-    assert.deepEqual(audit.map((row) => row.event), ['reserved', 'consume-denied', 'consumed']);
+    assert.deepEqual(audit.map((row) => row.event), [
+      'budget-window-registered', 'budget-window-registered', 'reserved', 'consume-denied', 'consumed',
+    ]);
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(reservation.consume_token));
   } finally { await h.pool.close(); }
 });
@@ -578,6 +796,8 @@ test('revocation and expiry deny consumption, release resources once, and retain
       assert.equal(rows[0].state, 'cancelled');
       assert.equal(Number(rows[0].reserved_usd), 0);
       assert.equal(Number(rows[0].reserved_slots), 0);
+      const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+      assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
     } finally { await h.pool.close(); }
   });
 
@@ -594,6 +814,8 @@ test('revocation and expiry deny consumption, release resources once, and retain
       assert.equal(rows[0].state, 'expired');
       assert.equal(Number(rows[0].reserved_usd), 0);
       assert.equal(Number(rows[0].reserved_slots), 0);
+      const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+      assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
       const replay = await h.authority.admit({
         binding: h.operation,
         approval_receipt: h.approval,
@@ -620,6 +842,8 @@ test('revocation and expiry deny consumption, release resources once, and retain
       assert.equal(rows[0].state, 'cancelled');
       assert.equal(Number(rows[0].reserved_usd), 0);
       assert.equal(Number(rows[0].reserved_slots), 0);
+      const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+      assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
     } finally { await h.pool.close(); }
   });
 });
@@ -651,9 +875,94 @@ test('cancellation releases a reserved or consumed hold exactly once', async (t)
         const hosts = await h.pool.rows('SELECT reserved_slots FROM swarm_authority_hosts');
         assert.equal(Number(rows[0].reserved_usd), 0);
         assert.equal(Number(hosts[0].reserved_slots), 0);
+        const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+        assert.ok(windows.every((row) => Number(row.reserved_usd) === 0));
         const audit = await h.pool.rows('SELECT detail FROM swarm_authority_audit ORDER BY seq');
         assert.doesNotMatch(JSON.stringify(audit), new RegExp(reservation.cancel_token));
       } finally { await h.pool.close(); }
     });
   }
+});
+
+test('a missing aggregate hold rolls back cancellation and preserves every remaining ledger', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    await h.pool.execute(`DELETE FROM swarm_authority_budget_holds
+      WHERE reservation_id='${reservation.reservation_id}'::uuid AND window_id='${reservation.budget_windows[0].window_id}'`);
+    await assert.rejects(
+      () => h.authority.cancel(cancellation(reservation, 'must fail closed')),
+      /aggregate budget holds are missing/i,
+    );
+    const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,h.reserved_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+    assert.equal(rows[0].state, 'reserved-not-started');
+    assert.equal(Number(rows[0].reserved_usd), 0.25);
+    assert.equal(Number(rows[0].reserved_slots), 1);
+    const windows = await h.pool.rows('SELECT reserved_usd FROM swarm_authority_budget_windows');
+    assert.ok(windows.every((row) => Number(row.reserved_usd) === 0.25));
+  } finally { await h.pool.close(); }
+});
+
+test('aggregate attribution corruption fails closed and leaves durable refusal evidence', async (t) => {
+  await t.test('initialization rejects a partial active hold set', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      await h.pool.execute(`DELETE FROM swarm_authority_budget_holds
+        WHERE reservation_id='${reservation.reservation_id}'::uuid AND window_id='${reservation.budget_windows[0].window_id}'`);
+      await assert.rejects(() => h.store.initialize(), /active aggregate budget attribution is inconsistent/i);
+      const audits = await h.pool.rows("SELECT detail FROM swarm_authority_audit WHERE event='denied' ORDER BY seq DESC LIMIT 1");
+      assert.match(JSON.stringify(audits[0]?.detail), /integrity_refusal.*initialize/i);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('consumption rejects an aggregate ledger that no longer funds its active holds', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      // This difference collapses to equality as a JavaScript Number; PostgreSQL
+      // NUMERIC must remain the authority for the comparison.
+      await h.pool.execute(`UPDATE swarm_authority_budget_windows SET reserved_usd=0.24999999999999999
+        WHERE window_id='${reservation.budget_windows[0].window_id}'`);
+      const result = await h.authority.consume(consumption(h, reservation));
+      assert.equal(result.consumed, false);
+      assert.match(result.blockers.join(' '), /aggregate budget holds are missing, ambiguous, or inconsistent/i);
+      const stored = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(stored[0].state, 'reserved-not-started');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('stored cost and every ledger cannot drift together from the signed binding', async () => {
+    const h = await harness();
+    try {
+      const reservation = await reserve(h);
+      await h.pool.execute(`
+        UPDATE swarm_authority_reservations SET reserved_cost_usd=0.10 WHERE reservation_id='${reservation.reservation_id}'::uuid;
+        UPDATE swarm_authority_budget_holds SET reserved_cost_usd=0.10 WHERE reservation_id='${reservation.reservation_id}'::uuid;
+        UPDATE swarm_authority_budget_windows SET reserved_usd=0.10;
+        UPDATE swarm_authority_budgets SET reserved_usd=0.10;
+      `);
+      const result = await h.authority.consume(consumption(h, reservation));
+      assert.equal(result.consumed, false);
+      assert.match(result.blockers.join(' '), /signed cost is invalid/i);
+      await assert.rejects(() => h.store.initialize(), /active aggregate budget attribution is inconsistent/i);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('revocation cannot release holds attributed to the wrong signed policy', async () => {
+    const h = await harness();
+    try {
+      await reserve(h);
+      await h.pool.execute("UPDATE swarm_authority_budget_windows SET policy_id='corrupt-policy' WHERE kind='daily'");
+      await assert.rejects(
+        () => h.store.revoke('key:starlight-approval:approval-key-001', NOW, 'integrity exercise'),
+        /aggregate budget holds are missing, ambiguous, or inconsistent/i,
+      );
+      const stored = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(stored[0].state, 'reserved-not-started');
+      const audits = await h.pool.rows("SELECT detail FROM swarm_authority_audit WHERE event='denied' ORDER BY seq DESC LIMIT 1");
+      assert.match(JSON.stringify(audits[0]?.detail), /integrity_refusal.*revoke/i);
+    } finally { await h.pool.close(); }
+  });
 });

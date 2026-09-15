@@ -74,11 +74,30 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   const prepare = async () => {
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
       swarm_authority_budgets,swarm_authority_prepared_operations,
+      swarm_authority_budget_holds,swarm_authority_budget_windows,
       swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
     const operation = binding();
     const digest = sha256Digest(operation);
     const now = new Date();
     const expires = new Date(now.getTime() + 10 * 60_000).toISOString();
+    await store.registerBudgetWindow({
+      window_id: `${operation.budget_policy_id}:policy-window`,
+      policy_id: operation.budget_policy_id,
+      kind: 'policy',
+      starts_at: new Date(now.getTime() - 60_000).toISOString(),
+      ends_at: new Date(now.getTime() + 15 * 60_000).toISOString(),
+      currency: 'USD',
+      hard_limit_usd: 0.5,
+    });
+    await store.registerBudgetWindow({
+      window_id: `${operation.budget_policy_id}:daily-window`,
+      policy_id: operation.budget_policy_id,
+      kind: 'daily',
+      starts_at: new Date(now.getTime() - 60_000).toISOString(),
+      ends_at: new Date(now.getTime() + 15 * 60_000).toISOString(),
+      currency: 'USD',
+      hard_limit_usd: 0.5,
+    });
     await store.putHostEvidence({
       host_id: operation.host_id,
       observed_at: now.toISOString(),
@@ -168,6 +187,86 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(Number(state.rows[0].reserved_slots), 0);
       const cancellations = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='reservation-cancelled'");
       assert.equal(cancellations.rowCount, 1);
+    });
+
+    await t.test('independent authorities cannot oversubscribe shared policy and daily windows', async () => {
+      await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
+        swarm_authority_budgets,swarm_authority_prepared_operations,
+        swarm_authority_budget_holds,swarm_authority_budget_windows,
+        swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
+      const now = new Date();
+      const issuedAt = now.toISOString();
+      const expires = new Date(now.getTime() + 10 * 60_000).toISOString();
+      const startsAt = new Date(now.getTime() - 60_000).toISOString();
+      const endsAt = new Date(now.getTime() + 15 * 60_000).toISOString();
+      const base = binding();
+      await store.registerBudgetWindow({
+        window_id: 'postgres-policy-window', policy_id: base.budget_policy_id, kind: 'policy',
+        starts_at: startsAt, ends_at: endsAt, currency: 'USD', hard_limit_usd: 0.75,
+      });
+      await store.registerBudgetWindow({
+        window_id: 'postgres-daily-window', policy_id: base.budget_policy_id, kind: 'daily',
+        starts_at: startsAt, ends_at: endsAt, currency: 'USD', hard_limit_usd: 0.5,
+      });
+      await store.putHostEvidence({
+        host_id: base.host_id, observed_at: issuedAt, status: 'ready', capacity_slots: 4,
+        secret_readiness: true, access_review_expires_at: expires,
+        allowed_capabilities: base.capabilities,
+      });
+      const secondStore = new PostgresOperationAuthorityStore(authorityPool);
+      const authorities = [store, secondStore].map((authorityStore) => new OperationAuthority(authorityStore, {
+        approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
+        budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } },
+      }));
+      const inputs = [];
+      for (let index = 1; index <= 3; index += 1) {
+        const operation: OperationBinding = {
+          ...base,
+          operation_id: `postgres-aggregate-operation-00${index}`,
+          effect_id: `postgres-aggregate-effect-00${index}`,
+          call_id: `postgres-aggregate-call-00${index}`,
+          effect: { ...base.effect, resource: `repo://frankxai/starlight-swarm/race-fixture-${index}` },
+        };
+        const digest = sha256Digest(operation);
+        const approval = signApprovalReceipt({
+          schema_version: 'starlight.operation_approval.v1', receipt_id: `postgres-aggregate-approval-00${index}`,
+          issuer: 'postgres-approval', key_id: 'postgres-approval-key', issued_at: issuedAt,
+          expires_at: expires, binding_digest_sha256: digest, scope: 'admit-bounded-operation',
+          allowed_capabilities: operation.capabilities,
+        }, approvalSecret);
+        const budget = signBudgetReceipt({
+          schema_version: 'starlight.operation_budget.v1', receipt_id: `postgres-aggregate-budget-00${index}`,
+          issuer: 'postgres-budget', key_id: 'postgres-budget-key', issued_at: issuedAt,
+          expires_at: expires, binding_digest_sha256: digest, budget_policy_id: operation.budget_policy_id,
+          hard_limit_usd: 0.5,
+        }, budgetSecret);
+        await store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
+        await store.putPreparedOperation(operation.operation_id, digest, issuedAt);
+        inputs.push({
+          binding: operation, approval_receipt: approval, budget_receipt: budget,
+          reservation_duration_ms: 5 * 60_000,
+        });
+      }
+      const results = await Promise.all(inputs.map((input, index) => authorities[index % 2].admit(input)));
+      assert.equal(results.filter((result) => result.admitted).length, 2);
+      const denied = results.filter((result) => !result.admitted);
+      assert.equal(denied.length, 1);
+      assert.match(denied[0].blockers.join(' '), /aggregate budget window is exhausted/i);
+      const ledgers = await pool.query(`SELECT kind,reserved_usd FROM swarm_authority_budget_windows ORDER BY kind`);
+      assert.deepEqual(ledgers.rows.map((row) => [row.kind, Number(row.reserved_usd)]), [['daily', 0.5], ['policy', 0.5]]);
+      const host = await pool.query('SELECT reserved_slots FROM swarm_authority_hosts');
+      assert.equal(Number(host.rows[0].reserved_slots), 2);
+
+      const admitted = results.flatMap((result) => result.admitted ? [result.reservation] : []);
+      await Promise.all(admitted.map((reservation, index) => authorities[index % 2].cancel({
+        reservation_id: reservation.reservation_id,
+        cancel_token: reservation.cancel_token,
+        reason: 'aggregate race cleanup',
+      })));
+      const released = await pool.query('SELECT kind,reserved_usd FROM swarm_authority_budget_windows ORDER BY kind');
+      assert.deepEqual(released.rows.map((row) => [row.kind, Number(row.reserved_usd)]), [['daily', 0], ['policy', 0]]);
+      const releasedHost = await pool.query('SELECT reserved_slots FROM swarm_authority_hosts');
+      assert.equal(Number(releasedHost.rows[0].reserved_slots), 0);
     });
   } finally {
     await pool.end();

@@ -119,6 +119,14 @@ export interface AtomicAdmissionRequest {
   max_host_evidence_age_ms: number;
 }
 
+export interface BudgetWindowEvidence {
+  window_id: string;
+  kind: 'policy' | 'daily';
+  starts_at: string;
+  ends_at: string;
+  currency: 'USD';
+}
+
 export interface AdmissionReservation {
   schema_version: 'starlight.operation_admission.v1';
   reservation_id: string;
@@ -127,6 +135,8 @@ export interface AdmissionReservation {
   binding_digest_sha256: string;
   approval_receipt_id: string;
   budget_receipt_id: string;
+  budget_policy_id: string;
+  budget_windows: BudgetWindowEvidence[];
   host_id: string;
   reserved_cost_usd: number;
   reserved_at: string;
@@ -167,6 +177,8 @@ export interface ConsumptionReceipt {
   binding_digest_sha256: string;
   execution_identity: string;
   identity_evidence_ref: string;
+  budget_policy_id: string;
+  budget_windows: BudgetWindowEvidence[];
   consumed_at: string;
   consumption_expires_at: string;
   state: 'consumed-not-started';
