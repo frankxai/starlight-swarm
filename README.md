@@ -81,6 +81,20 @@ This hardens the model; it does **not** make the swarm autonomously act.
 
 ## Governed team runtime planner
 
+The estate topology follows the September 2 ruling: one Queen, shared functional stewards,
+and twelve business units. The older per-stream Queen examples below are historical runtime
+models, not permission to create additional standing estate orchestrators.
+
+The new read-only workforce projection joins the twelve-unit plan to measured estate evidence:
+
+```bash
+npm run workforce:check -- /path/to/starlight/graph/systems.graph.json --markdown
+npm run workforce:test
+```
+
+It reports stale sources and activation blockers without granting runtime authority or spend.
+See [the current inspection and activation sequence](docs/AUTONOMOUS-WORKFORCE-2026-09-05.md).
+
 The dry-run team planner compiles existing `starlight.team_profile.v2` definitions into
 bounded runtime plans across Railway Temporal, Vercel Eve, local Hermes, n8n, and the
 deferred Cloudflare edge route. Plans include independent verification, provider routing,
