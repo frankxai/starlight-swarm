@@ -8,6 +8,8 @@ import {
   PostgresOperationAuthorityStore,
   type AuthoritySqlPool,
   type RunnerSessionAttestor,
+  type RunnerOutcomeEvidence,
+  type RunnerOutcomeEvidenceAttestor,
   type RunnerStartEvidence,
   type RunnerStartEvidenceAttestor,
 } from './postgres-operation-authority';
@@ -25,6 +27,7 @@ const redemptionToken = 'R'.repeat(43);
 const controlToken = 'C'.repeat(43);
 const heartbeatToken = 'H'.repeat(43);
 const startObservationToken = 'S'.repeat(43);
+const outcomeToken = 'O'.repeat(43);
 const nextHeartbeatToken = 'N'.repeat(43);
 const competingHeartbeatToken = 'M'.repeat(43);
 const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
@@ -47,6 +50,8 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => {
       runtime_id: 'postgres-test-runtime',
       host_id: 'postgres-test-host',
       channel_binding_sha256: '9'.repeat(64),
+      launch_attempt_id: 'postgres-launch-attempt-001',
+      fencing_generation: 1,
       observed_at: new Date(now).toISOString(),
       access_review_expires_at: new Date(now + 10 * 60_000).toISOString(),
     },
@@ -54,10 +59,16 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => {
   };
 };
 let currentStartEvidence: RunnerStartEvidence | undefined;
+let currentOutcomeEvidence: RunnerOutcomeEvidence | undefined;
 const runnerStartEvidenceAttestor: RunnerStartEvidenceAttestor = async () => currentStartEvidence
   ? { valid: true, evidence: currentStartEvidence, blockers: [] }
   : { valid: false, evidence: null, blockers: ['No server-owned process evidence exists.'] };
-const storeOptions = { brokerSessionAttestor, runnerSessionAttestor, runnerStartEvidenceAttestor };
+const runnerOutcomeEvidenceAttestor: RunnerOutcomeEvidenceAttestor = async () => currentOutcomeEvidence
+  ? { valid: true, evidence: currentOutcomeEvidence, blockers: [] }
+  : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+const storeOptions = {
+  brokerSessionAttestor, runnerSessionAttestor, runnerStartEvidenceAttestor, runnerOutcomeEvidenceAttestor,
+};
 
 function binding(): OperationBinding {
   return {
@@ -121,6 +132,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
 
   const prepare = async () => {
     currentStartEvidence = undefined;
+    currentOutcomeEvidence = undefined;
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
       swarm_authority_budgets,swarm_authority_prepared_operations,
       swarm_authority_budget_holds,swarm_authority_budget_windows,
@@ -255,6 +267,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       control_token: controlToken,
       heartbeat_token: heartbeatToken,
       start_observation_token: startObservationToken,
+      outcome_token: outcomeToken,
     };
   };
 
@@ -295,6 +308,8 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       runtime_id: 'postgres-test-runtime',
       host_id: 'postgres-test-host',
       channel_binding_sha256: '9'.repeat(64),
+      launch_attempt_id: 'postgres-launch-attempt-001',
+      fencing_generation: 1,
       process_instance_sha256: 'b'.repeat(64),
       evidence_ref: 'postgres-runtime-start-evidence-001',
       evidence_sha256: 'c'.repeat(64),
@@ -311,6 +326,57 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
       start_observation_token: startObservationToken,
+      outcome_token: outcomeToken,
+    };
+  };
+
+  const claimForNeverStartedOutcome = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    const claimInput = await authorize(h, suffix);
+    const claimed = await h.authority.claimRunnerStart(claimInput);
+    assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
+    if (!claimed.claimed) throw new Error('runner claim failed');
+    const observedAt = new Date().toISOString();
+    currentOutcomeEvidence = {
+      schema_version: 'starlight.runner_outcome_evidence.v1',
+      outcome_event_id: `00000000-0000-4000-8000-0000000007${suffix}`,
+      outcome_kind: 'never-started',
+      reservation_id: h.reservation.reservation_id,
+      claim_id: claimed.receipt.claim_id,
+      operation_id: h.consume.operation_id,
+      effect_id: h.consume.effect_id,
+      binding_digest_sha256: h.consume.binding_digest_sha256,
+      runner_id: 'postgres-execution-001',
+      runner_identity_evidence_ref: 'postgres-identity-evidence-001',
+      runner_instance_id: 'postgres-runner-instance-001',
+      runtime_id: 'postgres-test-runtime',
+      host_id: 'postgres-test-host',
+      channel_binding_sha256: '9'.repeat(64),
+      launch_attempt_id: 'postgres-launch-attempt-001',
+      fencing_generation: 1,
+      process_instance_sha256: null,
+      start_observation_id: null,
+      start_evidence_ref: null,
+      start_evidence_sha256: null,
+      process_started_at: null,
+      exit_disposition: null,
+      evidence_ref: `postgres-outcome-evidence-${suffix}`,
+      evidence_sha256: suffix.padStart(64, 'd').slice(-64),
+      outcome_at: observedAt,
+      observed_at: observedAt,
+      access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+      restart_fenced: true,
+      launch_queue_closed: true,
+      descendants_quiesced: true,
+      remote_stop_confirmed: false,
+    };
+    return {
+      outcome_request_id: `00000000-0000-4000-8000-0000000008${suffix}`,
+      reservation_id: h.reservation.reservation_id,
+      claim_id: claimed.receipt.claim_id,
+      operation_id: h.consume.operation_id,
+      effect_id: h.consume.effect_id,
+      binding_digest_sha256: h.consume.binding_digest_sha256,
+      outcome_token: outcomeToken,
     };
   };
 
@@ -791,6 +857,83 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
         FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
       assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('duplicate never-started settlement retains capacity and committed spend', async () => {
+      const h = await prepare();
+      const outcome = await claimForNeverStartedOutcome(h, '71');
+      const results = await Promise.all([
+        h.authority.settleRunnerOutcome(outcome),
+        h.secondAuthority.settleRunnerOutcome(outcome),
+      ]);
+      assert.ok(results.every((result) => result.settled));
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'runner-never-started-observed');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+      const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='runner-outcome-observed'");
+      assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('never-started outcome versus delayed start observation never double-releases', async () => {
+      const h = await prepare();
+      const outcome = await claimForNeverStartedOutcome(h, '72');
+      const observedAt = new Date().toISOString();
+      currentStartEvidence = {
+        schema_version: 'starlight.runner_start_evidence.v1',
+        reservation_id: h.reservation.reservation_id,
+        claim_id: outcome.claim_id,
+        operation_id: outcome.operation_id,
+        effect_id: outcome.effect_id,
+        binding_digest_sha256: outcome.binding_digest_sha256,
+        runner_id: 'postgres-execution-001',
+        runner_identity_evidence_ref: 'postgres-identity-evidence-001',
+        runner_instance_id: 'postgres-runner-instance-001',
+        runtime_id: 'postgres-test-runtime',
+        host_id: 'postgres-test-host',
+        channel_binding_sha256: '9'.repeat(64),
+        launch_attempt_id: 'postgres-launch-attempt-001',
+        fencing_generation: 1,
+        process_instance_sha256: 'b'.repeat(64),
+        evidence_ref: 'postgres-runtime-start-evidence-72',
+        evidence_sha256: 'e'.repeat(64),
+        process_started_at: observedAt,
+        observed_at: observedAt,
+        access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+        state: 'start-observed',
+      };
+      await Promise.all([
+        h.authority.settleRunnerOutcome(outcome),
+        h.secondAuthority.observeRunnerStart({
+          observation_request_id: '00000000-0000-4000-8000-000000000672',
+          reservation_id: outcome.reservation_id,
+          claim_id: outcome.claim_id,
+          operation_id: outcome.operation_id,
+          effect_id: outcome.effect_id,
+          binding_digest_sha256: outcome.binding_digest_sha256,
+          start_observation_token: startObservationToken,
+        }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.ok(['stop-requested', 'runner-start-observed'].includes(String(state.rows[0].state)));
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('outcome settlement versus broker disable retains conservative resources', async () => {
+      const h = await prepare();
+      const outcome = await claimForNeverStartedOutcome(h, '73');
+      await Promise.all([
+        h.authority.settleRunnerOutcome(outcome),
+        h.store.putBrokerPrincipalEvidence({ ...h.brokerEvidence, state: 'disabled' as const }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.ok(['runner-never-started-observed', 'stop-requested'].includes(String(state.rows[0].state)));
       assert.equal(Number(state.rows[0].committed_usd), 0.25);
       assert.equal(Number(state.rows[0].authorized_slots), 1);
     });

@@ -221,13 +221,14 @@ export const runnerClaimInputSchema = z.object({
   control_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   start_observation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  outcome_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict().superRefine((value, context) => {
-  const credentials = [value.control_token, value.heartbeat_token, value.start_observation_token];
+  const credentials = [value.control_token, value.heartbeat_token, value.start_observation_token, value.outcome_token];
   if (new Set(credentials).size !== credentials.length) {
     context.addIssue({
       code: 'custom',
-      path: ['start_observation_token'],
-      message: 'Runner control, heartbeat, and start-observation credentials must be pairwise distinct.',
+      path: ['outcome_token'],
+      message: 'Runner control, heartbeat, start-observation, and outcome credentials must be pairwise distinct.',
     });
   }
 });
@@ -276,6 +277,18 @@ export const runnerStartObservationInputSchema = z.object({
 }).strict();
 
 export type RunnerStartObservationInput = z.infer<typeof runnerStartObservationInputSchema>;
+
+export const runnerOutcomeInputSchema = z.object({
+  outcome_request_id: z.uuid(),
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  outcome_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
+export type RunnerOutcomeInput = z.infer<typeof runnerOutcomeInputSchema>;
 
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
@@ -383,6 +396,9 @@ export interface RunnerClaimReceipt {
   claim_expires_at: string;
   heartbeat_token_sha256: string;
   start_observation_token_sha256: string;
+  outcome_token_sha256: string;
+  launch_attempt_id: string;
+  fencing_generation: number;
   transport_state: 'attested-not-deployed';
   dispatch_state: 'not-dispatched';
   execution_observed: false;
@@ -457,6 +473,52 @@ export type RunnerStartObservationResult =
   | { observed: true; receipt: RunnerStartObservationReceipt; blockers: [] }
   | { observed: false; receipt: null; blockers: string[] };
 
+export interface RunnerOutcomeReceipt {
+  schema_version: 'starlight.runner_outcome.v1';
+  outcome_id: string;
+  outcome_request_id: string;
+  outcome_event_id: string;
+  outcome_kind: 'never-started' | 'process-terminal';
+  claim_id: string;
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  runner_id: string;
+  runner_instance_id: string;
+  runtime_id: string;
+  host_id: string;
+  channel_binding_sha256: string;
+  launch_attempt_id: string;
+  fencing_generation: number;
+  process_instance_sha256: string | null;
+  exit_disposition: 'exited-zero' | 'exited-nonzero' | 'signal' | 'supervisor-killed' | 'unknown' | null;
+  evidence_ref: string;
+  evidence_sha256: string;
+  outcome_at: string;
+  evidence_observed_at: string;
+  accepted_at: string;
+  remote_stop_confirmed: boolean;
+  restart_fenced: true;
+  launch_queue_closed: true;
+  descendants_quiesced: true;
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  execution_observed: boolean;
+  workload_effect_observed: false;
+  actual_usage_reconciled: false;
+  host_capacity_released: boolean;
+  budget_commitment_released: false;
+  released_host_slots: 0 | 1;
+  released_cost_usd: 0;
+  retained_committed_cost_usd: number;
+  state: 'runner-never-started-observed' | 'runner-terminal-observed';
+}
+
+export type RunnerOutcomeResult =
+  | { settled: true; receipt: RunnerOutcomeReceipt; blockers: [] }
+  | { settled: false; receipt: null; blockers: string[] };
+
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
   | { cancelled: false; reservation_id: string; state: null | 'expired' | 'stop-requested'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
@@ -476,6 +538,7 @@ export interface OperationAuthorityStore {
   acceptRunnerHeartbeat(input: RunnerHeartbeatInput): Promise<RunnerHeartbeatResult>;
   reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult>;
   observeRunnerStart(input: RunnerStartObservationInput): Promise<RunnerStartObservationResult>;
+  settleRunnerOutcome(input: RunnerOutcomeInput): Promise<RunnerOutcomeResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -695,6 +758,19 @@ export class OperationAuthority {
       return { observed: false, receipt: null, blockers: ['A durable authority store is required.'] };
     }
     return this.store.observeRunnerStart(parsed.data);
+  }
+
+  async settleRunnerOutcome(input: unknown): Promise<RunnerOutcomeResult> {
+    const parsed = runnerOutcomeInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = new Date().toISOString();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', at, ['Runner outcome request is invalid.']);
+      return { settled: false, receipt: null, blockers: ['Runner outcome request is invalid.'] };
+    }
+    if (!this.store.durable) {
+      return { settled: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    }
+    return this.store.settleRunnerOutcome(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {

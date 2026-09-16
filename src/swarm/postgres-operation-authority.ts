@@ -7,6 +7,7 @@ import {
   runnerClaimInputSchema,
   runnerHeartbeatExpiryInputSchema,
   runnerHeartbeatInputSchema,
+  runnerOutcomeInputSchema,
   runnerStartObservationInputSchema,
   startLeaseInputSchema,
   startRedemptionInputSchema,
@@ -36,6 +37,9 @@ import type {
   RunnerHeartbeatExpiryResult,
   RunnerHeartbeatReceipt,
   RunnerHeartbeatResult,
+  RunnerOutcomeInput,
+  RunnerOutcomeReceipt,
+  RunnerOutcomeResult,
   RunnerStartObservationInput,
   RunnerStartObservationReceipt,
   RunnerStartObservationResult,
@@ -105,6 +109,8 @@ export interface AttestedRunnerSession {
   runtime_id: string;
   host_id: string;
   channel_binding_sha256: string;
+  launch_attempt_id: string;
+  fencing_generation: number;
   observed_at: string;
   access_review_expires_at: string;
 }
@@ -116,6 +122,8 @@ const runnerSessionSchema = z.object({
   runtime_id: controlId,
   host_id: controlId,
   channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  launch_attempt_id: controlId,
+  fencing_generation: z.number().int().min(1).max(1_000_000_000),
   observed_at: controlTime,
   access_review_expires_at: controlTime,
 }).strict().refine((value) => Date.parse(value.observed_at) < Date.parse(value.access_review_expires_at), {
@@ -147,6 +155,8 @@ export const runnerStartEvidenceSchema = z.object({
   runtime_id: controlId,
   host_id: controlId,
   channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  launch_attempt_id: controlId,
+  fencing_generation: z.number().int().min(1).max(1_000_000_000),
   process_instance_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   evidence_ref: controlId,
   evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -173,6 +183,75 @@ const denyUnconfiguredRunnerStartEvidence: RunnerStartEvidenceAttestor = async (
   valid: false,
   evidence: null,
   blockers: ['Runner start-evidence attestor is not configured.'],
+});
+
+const runnerOutcomeCommon = {
+  schema_version: z.literal('starlight.runner_outcome_evidence.v1'),
+  outcome_event_id: z.uuid(),
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  operation_id: controlId,
+  effect_id: controlId,
+  binding_digest_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  runner_id: controlId,
+  runner_identity_evidence_ref: controlId,
+  runner_instance_id: controlId,
+  runtime_id: controlId,
+  host_id: controlId,
+  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  launch_attempt_id: controlId,
+  fencing_generation: z.number().int().min(1).max(1_000_000_000),
+  evidence_ref: controlId,
+  evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  outcome_at: controlTime,
+  observed_at: controlTime,
+  access_review_expires_at: controlTime,
+  restart_fenced: z.literal(true),
+  launch_queue_closed: z.literal(true),
+  descendants_quiesced: z.literal(true),
+  remote_stop_confirmed: z.boolean(),
+};
+
+export const runnerOutcomeEvidenceSchema = z.discriminatedUnion('outcome_kind', [
+  z.object({
+    ...runnerOutcomeCommon,
+    outcome_kind: z.literal('never-started'),
+    process_instance_sha256: z.null(),
+    start_observation_id: z.null(),
+    start_evidence_ref: z.null(),
+    start_evidence_sha256: z.null(),
+    process_started_at: z.null(),
+    exit_disposition: z.null(),
+  }).strict(),
+  z.object({
+    ...runnerOutcomeCommon,
+    outcome_kind: z.literal('process-terminal'),
+    process_instance_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    start_observation_id: z.uuid(),
+    start_evidence_ref: controlId,
+    start_evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    process_started_at: controlTime,
+    exit_disposition: z.enum(['exited-zero', 'exited-nonzero', 'signal', 'supervisor-killed', 'unknown']),
+  }).strict(),
+]).superRefine((value, context) => {
+  if (Date.parse(value.outcome_at) > Date.parse(value.observed_at)) {
+    context.addIssue({ code: 'custom', path: ['outcome_at'], message: 'Runner outcome cannot follow its observation.' });
+  }
+  if (Date.parse(value.observed_at) >= Date.parse(value.access_review_expires_at)) {
+    context.addIssue({ code: 'custom', path: ['access_review_expires_at'], message: 'Outcome-evidence access review must remain live after observation.' });
+  }
+});
+
+export type RunnerOutcomeEvidence = z.infer<typeof runnerOutcomeEvidenceSchema>;
+export type RunnerOutcomeEvidenceAttestation =
+  | { valid: true; evidence: RunnerOutcomeEvidence; blockers: [] }
+  | { valid: false; evidence: null; blockers: string[] };
+export type RunnerOutcomeEvidenceAttestor = (client: AuthoritySqlClient) => Promise<RunnerOutcomeEvidenceAttestation>;
+
+const denyUnconfiguredRunnerOutcomeEvidence: RunnerOutcomeEvidenceAttestor = async () => ({
+  valid: false,
+  evidence: null,
+  blockers: ['Runner outcome-evidence attestor is not configured.'],
 });
 
 export const OPERATION_AUTHORITY_MIGRATION_SQL = `
@@ -250,7 +329,8 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   runner_access_review_expires_at TIMESTAMPTZ, runner_id TEXT, runner_identity_evidence_ref TEXT,
   runner_instance_id TEXT, runner_runtime_id TEXT, runner_host_id TEXT,
   runner_channel_binding_sha256 CHAR(64), heartbeat_token_sha256 CHAR(64),
-  start_observation_token_sha256 CHAR(64),
+  start_observation_token_sha256 CHAR(64), outcome_token_sha256 CHAR(64),
+  runner_launch_attempt_id TEXT, runner_fencing_generation INTEGER,
   runner_revocation_refs JSONB,
   runner_heartbeat_id UUID, runner_heartbeat_request_id UUID UNIQUE,
   runner_heartbeat_sequence INTEGER, runner_heartbeat_accepted_at TIMESTAMPTZ,
@@ -261,7 +341,13 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   runner_process_instance_sha256 CHAR(64) UNIQUE, runner_start_evidence_ref TEXT UNIQUE,
   runner_start_evidence_sha256 CHAR(64) UNIQUE,
   runner_start_presented_token_sha256 CHAR(64),
-  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','cancelled','expired'))
+  runner_outcome_id UUID, runner_outcome_request_id UUID UNIQUE, runner_outcome_event_id UUID UNIQUE,
+  runner_outcome_kind TEXT, runner_outcome_accepted_at TIMESTAMPTZ,
+  runner_outcome_at TIMESTAMPTZ, runner_outcome_evidence_observed_at TIMESTAMPTZ,
+  runner_outcome_evidence_ref TEXT UNIQUE, runner_outcome_evidence_sha256 CHAR(64) UNIQUE,
+  runner_outcome_presented_token_sha256 CHAR(64), runner_exit_disposition TEXT,
+  runner_remote_stop_confirmed BOOLEAN,
+  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'))
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_heartbeat_tokens (
   token_sha256 CHAR(64) PRIMARY KEY, reservation_id UUID NOT NULL,
@@ -275,7 +361,7 @@ CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
   PRIMARY KEY (reservation_id,window_id)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -326,6 +412,9 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_host_id
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_channel_binding_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS heartbeat_token_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_observation_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS outcome_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_launch_attempt_id TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_fencing_generation INTEGER;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_revocation_refs JSONB;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_id UUID;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_request_id UUID;
@@ -341,6 +430,32 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_process
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_evidence_ref TEXT;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_evidence_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_presented_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_request_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_event_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_kind TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_accepted_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_observed_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_ref TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_presented_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_exit_disposition TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_remote_stop_confirmed BOOLEAN;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_request_unique
+  ON swarm_authority_reservations (runner_outcome_request_id) WHERE runner_outcome_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_event_unique
+  ON swarm_authority_reservations (runner_outcome_event_id) WHERE runner_outcome_event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_evidence_ref_unique
+  ON swarm_authority_reservations (runner_outcome_evidence_ref) WHERE runner_outcome_evidence_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_evidence_sha_unique
+  ON swarm_authority_reservations (runner_outcome_evidence_sha256) WHERE runner_outcome_evidence_sha256 IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_token_unique
+  ON swarm_authority_reservations (outcome_token_sha256) WHERE outcome_token_sha256 IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_launch_attempt_unique
+  ON swarm_authority_reservations (runner_launch_attempt_id) WHERE runner_launch_attempt_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_id_unique
+  ON swarm_authority_reservations (runner_outcome_id) WHERE runner_outcome_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_heartbeat_request_unique
   ON swarm_authority_reservations (runner_heartbeat_request_id)
   WHERE runner_heartbeat_request_id IS NOT NULL;
@@ -648,7 +763,7 @@ BEGIN
     LEFT JOIN swarm_authority_hosts host ON host.host_id=r.host_id
     LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
     LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-    WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested')
+    WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
     GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd,r.committed_cost_usd,
       b.receipt_id,host.host_id
     HAVING b.receipt_id IS NULL OR host.host_id IS NULL
@@ -669,7 +784,7 @@ BEGIN
     LEFT JOIN (
       SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
       FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested')
+      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
       GROUP BY budget_receipt_id
     ) committed ON committed.budget_receipt_id=b.receipt_id
     WHERE b.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
@@ -682,7 +797,7 @@ BEGIN
       SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
       FROM swarm_authority_budget_holds h
       JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
-      WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested')
+      WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
       GROUP BY h.window_id
     ) committed ON committed.window_id=w.window_id
     WHERE w.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
@@ -694,7 +809,7 @@ BEGIN
     LEFT JOIN (
       SELECT host_id,COUNT(*)::INTEGER AS slots
       FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested')
+      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed')
       GROUP BY host_id
     ) authorized ON authorized.host_id=h.host_id
     WHERE h.authorized_slots IS DISTINCT FROM COALESCE(authorized.slots,0)
@@ -781,7 +896,7 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND lease_claim_token_sha256 <> control_token_sha256
     AND redemption_token_sha256 <> control_token_sha256
   ))
-  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested') OR (
+  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed') OR (
     lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
     AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
     AND cancel_token_sha256 <> lease_claim_token_sha256
@@ -800,11 +915,12 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256)=3
     AND broker_role_contract_sha256='${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
   ))
-  AND (state NOT IN ('runner-claimed-not-started','runner-start-observed') OR (
+  AND (state NOT IN ('runner-claimed-not-started','runner-start-observed','runner-never-started-observed','runner-terminal-observed') OR (
     num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
       runner_evidence_observed_at,runner_access_review_expires_at,
       runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
-      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,runner_revocation_refs)=15
+      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,outcome_token_sha256,
+      runner_launch_attempt_id,runner_fencing_generation,runner_revocation_refs)=18
     AND runner_claim_expires_at > runner_claim_accepted_at
     AND runner_access_review_expires_at > runner_evidence_observed_at
     AND runner_claim_expires_at <= runner_access_review_expires_at
@@ -823,6 +939,14 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND start_observation_token_sha256 <> redemption_token_sha256
     AND start_observation_token_sha256 <> control_token_sha256
     AND start_observation_token_sha256 <> heartbeat_token_sha256
+    AND outcome_token_sha256 <> consume_token_sha256
+    AND outcome_token_sha256 <> cancel_token_sha256
+    AND outcome_token_sha256 <> lease_claim_token_sha256
+    AND outcome_token_sha256 <> redemption_token_sha256
+    AND outcome_token_sha256 <> control_token_sha256
+    AND outcome_token_sha256 <> heartbeat_token_sha256
+    AND outcome_token_sha256 <> start_observation_token_sha256
+    AND runner_fencing_generation >= 1
     AND jsonb_typeof(runner_revocation_refs) = 'array'
     AND (num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
       runner_heartbeat_sequence,runner_heartbeat_accepted_at,
@@ -840,9 +964,10 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
       AND runner_heartbeat_presented_token_sha256 <> redemption_token_sha256
       AND runner_heartbeat_presented_token_sha256 <> control_token_sha256
       AND runner_heartbeat_presented_token_sha256 <> start_observation_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> outcome_token_sha256
     ))
   ))
-  AND (state <> 'runner-start-observed' OR (
+  AND (state NOT IN ('runner-start-observed','runner-terminal-observed') OR (
     num_nonnulls(runner_start_observation_id,runner_start_observation_request_id,
       runner_start_observation_accepted_at,runner_start_evidence_observed_at,
       runner_process_started_at,runner_process_instance_sha256,runner_start_evidence_ref,
@@ -857,22 +982,59 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
       runner_evidence_observed_at,runner_access_review_expires_at,
       runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
-      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,runner_revocation_refs)=0)
-  AND (state IN ('runner-claimed-not-started','runner-start-observed','stop-requested') OR
+      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,outcome_token_sha256,
+      runner_launch_attempt_id,runner_fencing_generation,runner_revocation_refs)=0)
+  AND (state IN ('runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed') OR
     num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
       runner_heartbeat_sequence,runner_heartbeat_accepted_at,
       runner_heartbeat_presented_token_sha256)=0)
-  AND (state IN ('runner-start-observed','stop-requested') OR
+  AND (state IN ('runner-start-observed','runner-terminal-observed','stop-requested') OR
     num_nonnulls(runner_start_observation_id,runner_start_observation_request_id,
       runner_start_observation_accepted_at,runner_start_evidence_observed_at,
       runner_process_started_at,runner_process_instance_sha256,runner_start_evidence_ref,
       runner_start_evidence_sha256,runner_start_presented_token_sha256)=0)
+  AND (state NOT IN ('runner-never-started-observed','runner-terminal-observed') OR (
+    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
+      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
+      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
+      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
+      runner_remote_stop_confirmed)=11
+    AND runner_outcome_at >= runner_claim_accepted_at
+    AND runner_outcome_at <= runner_outcome_evidence_observed_at
+    AND runner_outcome_evidence_observed_at <= runner_outcome_accepted_at
+    AND runner_outcome_presented_token_sha256=outcome_token_sha256
+    AND ((state='runner-never-started-observed' AND runner_outcome_kind='never-started'
+      AND runner_process_instance_sha256 IS NULL AND runner_exit_disposition IS NULL)
+      OR (state='runner-terminal-observed' AND runner_outcome_kind='process-terminal'
+        AND runner_process_instance_sha256 IS NOT NULL AND runner_exit_disposition IS NOT NULL))
+  ))
+  AND (state IN ('runner-never-started-observed','runner-terminal-observed','stop-requested') OR
+    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
+      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
+      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
+      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
+      runner_exit_disposition,runner_remote_stop_confirmed)=0)
+  AND (state <> 'stop-requested' OR
+    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
+      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
+      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
+      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
+      runner_remote_stop_confirmed) IN (0,11))
+  AND (state <> 'stop-requested' OR runner_outcome_id IS NULL
+    OR (runner_outcome_kind='never-started' AND runner_exit_disposition IS NULL))
+);
+ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_outcome_values_check;
+ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_outcome_values_check CHECK (
+  (runner_fencing_generation IS NULL OR runner_fencing_generation >= 1)
+  AND (runner_outcome_kind IS NULL OR runner_outcome_kind IN ('never-started','process-terminal'))
+  AND (runner_exit_disposition IS NULL OR runner_exit_disposition IN
+    ('exited-zero','exited-nonzero','signal','supervisor-killed','unknown'))
 );
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
-  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','cancelled','expired'));
+  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -889,6 +1051,7 @@ export interface PostgresOperationAuthorityOptions {
   minRunnerHeartbeatIntervalMs?: number;
   runnerSessionAttestor?: RunnerSessionAttestor;
   runnerStartEvidenceAttestor?: RunnerStartEvidenceAttestor;
+  runnerOutcomeEvidenceAttestor?: RunnerOutcomeEvidenceAttestor;
 }
 
 function denial(blocker: string): AdmissionResult {
@@ -917,6 +1080,10 @@ function runnerHeartbeatDenied(blocker: string): RunnerHeartbeatResult {
 
 function runnerStartObservationDenied(blocker: string): RunnerStartObservationResult {
   return { observed: false, receipt: null, blockers: [blocker] };
+}
+
+function runnerOutcomeDenied(blocker: string): RunnerOutcomeResult {
+  return { settled: false, receipt: null, blockers: [blocker] };
 }
 
 function cancellationDenied(
@@ -966,6 +1133,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   private readonly minRunnerHeartbeatIntervalMs: number;
   private readonly runnerSessionAttestor: RunnerSessionAttestor;
   private readonly runnerStartEvidenceAttestor: RunnerStartEvidenceAttestor;
+  private readonly runnerOutcomeEvidenceAttestor: RunnerOutcomeEvidenceAttestor;
 
   constructor(
     private readonly pool: AuthoritySqlPool,
@@ -989,6 +1157,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     }
     this.runnerSessionAttestor = options.runnerSessionAttestor ?? denyUnconfiguredRunnerSession;
     this.runnerStartEvidenceAttestor = options.runnerStartEvidenceAttestor ?? denyUnconfiguredRunnerStartEvidence;
+    this.runnerOutcomeEvidenceAttestor = options.runnerOutcomeEvidenceAttestor ?? denyUnconfiguredRunnerOutcomeEvidence;
   }
 
   async initialize(): Promise<void> {
@@ -1414,7 +1583,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                FROM swarm_authority_budget_holds h3
                JOIN swarm_authority_reservations r3 ON r3.reservation_id=h3.reservation_id
                WHERE h3.window_id=w.window_id
-                 AND r3.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS committed_reconciles
+                 AND r3.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS committed_reconciles
        FROM swarm_authority_budget_holds h JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
        WHERE h.reservation_id=$1::uuid ORDER BY w.kind`,
       [reservationId, expectedCost],
@@ -2227,7 +2396,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                 (reserved_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
                   WHERE host_id=$1 AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
                 (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS authorized_reconciles
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS authorized_reconciles
          FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
         [row.host_id],
       );
@@ -2291,7 +2460,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                     AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
                 (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
                   FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS committed_reconciles
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS committed_reconciles
          FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
         [row.budget_receipt_id, binding.data.requested_cost_usd],
       );
@@ -2410,6 +2579,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       claim_expires_at: sqlInstant(row.runner_claim_expires_at),
       heartbeat_token_sha256: String(row.heartbeat_token_sha256),
       start_observation_token_sha256: String(row.start_observation_token_sha256),
+      outcome_token_sha256: String(row.outcome_token_sha256),
+      launch_attempt_id: String(row.runner_launch_attempt_id),
+      fencing_generation: Number(row.runner_fencing_generation),
       transport_state: 'attested-not-deployed',
       dispatch_state: 'not-dispatched',
       execution_observed: false,
@@ -2444,6 +2616,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const controlDigest = createHash('sha256').update(request.control_token, 'utf8').digest('hex');
       const heartbeatDigest = createHash('sha256').update(request.heartbeat_token, 'utf8').digest('hex');
       const startObservationDigest = createHash('sha256').update(request.start_observation_token, 'utf8').digest('hex');
+      const outcomeDigest = createHash('sha256').update(request.outcome_token, 'utf8').digest('hex');
       const found = await client.query(
         `SELECT *,
                 (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
@@ -2599,7 +2772,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const hostResult = await client.query(
         `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
                 (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
          FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
       );
       const host = hostEvidence(hostResult.rows[0]);
@@ -2624,7 +2797,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const budget = await client.query(
         `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
                   FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles,
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
                 (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
          FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
       );
@@ -2661,11 +2834,14 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         );
         if (row.heartbeat_token_sha256 !== heartbeatDigest
           || row.start_observation_token_sha256 !== startObservationDigest
+          || row.outcome_token_sha256 !== outcomeDigest
           || row.runner_id !== runner.runner_id
           || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
           || row.runner_instance_id !== runner.runner_instance_id
           || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
           || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
+          || row.runner_launch_attempt_id !== runner.launch_attempt_id
+          || Number(row.runner_fencing_generation) !== runner.fencing_generation
           || !Number.isFinite(storedAuthorityCapMs)
           || storedClaimExpiryMs !== storedAuthorityCapMs
           || storedClaimExpiryMs > claimExpiryMs
@@ -2681,21 +2857,31 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         [request.claim_request_id],
       );
       if (duplicate.rows.length) return await deny('Runner claim request id is already bound to another reservation.');
-      const duplicateHeartbeatToken = await client.query(
-        'SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1 LIMIT 1',
-        [heartbeatDigest],
-      );
-      if (duplicateHeartbeatToken.rows.length) return await deny('Heartbeat credential was already issued.');
-      const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, heartbeatDigest];
-      if (lifecycleDigests.includes(startObservationDigest)) {
-        return await deny('Start-observation credential aliases an existing lifecycle credential.');
+      const newCredentialDigests = [heartbeatDigest, startObservationDigest, outcomeDigest];
+      if (new Set(newCredentialDigests).size !== newCredentialDigests.length) {
+        return await deny('Runner claim credentials alias each other.');
       }
-      const duplicateStartToken = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE start_observation_token_sha256=$1 LIMIT 1',
-        [startObservationDigest],
+      const findIssuedCredential = async (digest: string) => client.query(
+        `SELECT reservation_id FROM swarm_authority_reservations
+         WHERE consume_token_sha256=$1 OR cancel_token_sha256=$1 OR lease_claim_token_sha256=$1
+           OR redemption_token_sha256=$1 OR control_token_sha256=$1 OR heartbeat_token_sha256=$1
+           OR start_observation_token_sha256=$1 OR outcome_token_sha256=$1
+           OR runner_heartbeat_presented_token_sha256=$1 OR runner_start_presented_token_sha256=$1
+           OR runner_outcome_presented_token_sha256=$1
+         UNION ALL
+         SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1
+         LIMIT 1`,
+        [digest],
       );
-      if (duplicateStartToken.rows.length) return await deny('Start-observation credential was already issued.');
+      for (const [label, digest] of [
+        ['Heartbeat', heartbeatDigest],
+        ['Start-observation', startObservationDigest],
+        ['Outcome', outcomeDigest],
+      ] as const) {
+        if ((await findIssuedCredential(digest)).rows.length) {
+          return await deny(`${label} credential aliases an issued lifecycle credential.`);
+        }
+      }
       const claimId = randomUUID();
       const transitioned = await client.query(
         `UPDATE swarm_authority_reservations SET state='runner-claimed-not-started',
@@ -2703,12 +2889,14 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
            runner_claim_expires_at=$5::timestamptz,runner_evidence_observed_at=$6::timestamptz,
            runner_access_review_expires_at=$7::timestamptz,runner_id=$8,runner_identity_evidence_ref=$9,
            runner_instance_id=$10,runner_runtime_id=$11,runner_host_id=$12,runner_channel_binding_sha256=$13,
-           heartbeat_token_sha256=$14,start_observation_token_sha256=$15,runner_revocation_refs=$16::jsonb
+           heartbeat_token_sha256=$14,start_observation_token_sha256=$15,outcome_token_sha256=$16,
+           runner_launch_attempt_id=$17,runner_fencing_generation=$18,runner_revocation_refs=$19::jsonb
          WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING *`,
         [request.reservation_id, claimId, request.claim_request_id, at, new Date(claimExpiryMs).toISOString(),
           runner.observed_at, runner.access_review_expires_at, runner.runner_id, runner.runner_identity_evidence_ref,
           runner.runner_instance_id, runner.runtime_id, runner.host_id, runner.channel_binding_sha256,
-          heartbeatDigest, startObservationDigest, JSON.stringify(refs.data)],
+          heartbeatDigest, startObservationDigest, outcomeDigest, runner.launch_attempt_id,
+          runner.fencing_generation, JSON.stringify(refs.data)],
       );
       if (transitioned.rows.length !== 1) return await deny('Runner claim could not be accepted exactly once.');
       await client.query(
@@ -2870,7 +3058,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const storedCredentialDigests = [
         row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
         row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
-        row.start_observation_token_sha256,
+        row.start_observation_token_sha256, row.outcome_token_sha256,
       ];
       if (storedCredentialDigests.some((digest) => typeof digest !== 'string')
         || new Set(storedCredentialDigests).size !== storedCredentialDigests.length
@@ -2897,7 +3085,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
         || row.runner_instance_id !== runner.runner_instance_id
         || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
-        || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256) {
+        || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
+        || row.runner_launch_attempt_id !== runner.launch_attempt_id
+        || Number(row.runner_fencing_generation) !== runner.fencing_generation) {
         return await quarantine('runner identity or channel drifted before heartbeat', 'Runner identity, placement, or channel drifted before heartbeat.');
       }
       if (row.broker_database_role !== brokerAttestation.session.database_role
@@ -2965,7 +3155,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const hostResult = await client.query(
         `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
                 (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
          FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
       );
       const host = hostEvidence(hostResult.rows[0]);
@@ -2984,7 +3174,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const budget = await client.query(
         `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
                   FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles,
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
                 (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
          FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
       );
@@ -3029,7 +3219,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return await deny('Runner heartbeat credential is invalid or already rotated.');
       }
       const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, row.start_observation_token_sha256, heartbeatDigest];
+        row.redemption_token_sha256, row.control_token_sha256, row.start_observation_token_sha256,
+        row.outcome_token_sha256, heartbeatDigest];
       if (lifecycleDigests.includes(nextHeartbeatDigest)) {
         return await deny('Next heartbeat credential aliases an existing lifecycle credential.');
       }
@@ -3050,7 +3241,15 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       );
       if (duplicateRequest.rows.length) return await deny('Runner heartbeat request id is already bound to another reservation.');
       const duplicateToken = await client.query(
-        'SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1 LIMIT 1',
+        `SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1
+         UNION ALL
+         SELECT reservation_id FROM swarm_authority_reservations
+         WHERE consume_token_sha256=$1 OR cancel_token_sha256=$1 OR lease_claim_token_sha256=$1
+           OR redemption_token_sha256=$1 OR control_token_sha256=$1 OR heartbeat_token_sha256=$1
+           OR start_observation_token_sha256=$1 OR outcome_token_sha256=$1
+           OR runner_heartbeat_presented_token_sha256=$1 OR runner_start_presented_token_sha256=$1
+           OR runner_outcome_presented_token_sha256=$1
+         LIMIT 1`,
         [nextHeartbeatDigest],
       );
       if (duplicateToken.rows.length) return await deny('Next heartbeat credential was already issued.');
@@ -3193,7 +3392,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (evidence.runner_id !== runner.runner_id
         || evidence.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
         || evidence.runner_instance_id !== runner.runner_instance_id || evidence.runtime_id !== runner.runtime_id
-        || evidence.host_id !== runner.host_id || evidence.channel_binding_sha256 !== runner.channel_binding_sha256) {
+        || evidence.host_id !== runner.host_id || evidence.channel_binding_sha256 !== runner.channel_binding_sha256
+        || evidence.launch_attempt_id !== runner.launch_attempt_id
+        || evidence.fencing_generation !== runner.fencing_generation) {
         return await deny('Server-owned start evidence does not match the authenticated runner session.');
       }
 
@@ -3210,6 +3411,53 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
         || row.binding_digest_sha256 !== request.binding_digest_sha256) {
         return await deny('Runner start observation does not match the claimed operation.');
+      }
+      if (row.state === 'runner-never-started-observed') {
+        const generationMatches = row.start_observation_token_sha256 === startTokenDigest
+          && row.runner_id === runner.runner_id
+          && row.runner_identity_evidence_ref === runner.runner_identity_evidence_ref
+          && row.runner_instance_id === runner.runner_instance_id
+          && row.runner_runtime_id === runner.runtime_id
+          && row.runner_host_id === runner.host_id
+          && row.runner_channel_binding_sha256 === runner.channel_binding_sha256
+          && row.runner_launch_attempt_id === runner.launch_attempt_id
+          && Number(row.runner_fencing_generation) === runner.fencing_generation
+          && Date.parse(evidence.process_started_at) >= Date.parse(String(row.runner_claim_accepted_at));
+        if (!generationMatches) {
+          return await deny('Contradictory start evidence does not match the settled execution generation.');
+        }
+        const duplicate = await client.query(
+          `SELECT reservation_id FROM swarm_authority_reservations
+           WHERE runner_start_observation_request_id=$1::uuid OR runner_process_instance_sha256=$2
+             OR runner_start_evidence_ref=$3 OR runner_start_evidence_sha256=$4 LIMIT 1`,
+          [request.observation_request_id, evidence.process_instance_sha256, evidence.evidence_ref, evidence.evidence_sha256],
+        );
+        if (duplicate.rows.length) return await deny('Contradictory start request or evidence is already bound.');
+        const conflicted = await client.query(
+          `UPDATE swarm_authority_reservations SET state='stop-requested',
+             runner_start_observation_id=$2::uuid,runner_start_observation_request_id=$3::uuid,
+             runner_start_observation_accepted_at=$4::timestamptz,
+             runner_start_evidence_observed_at=$5::timestamptz,runner_process_started_at=$6::timestamptz,
+             runner_process_instance_sha256=$7,runner_start_evidence_ref=$8,
+             runner_start_evidence_sha256=$9,runner_start_presented_token_sha256=$10
+           WHERE reservation_id=$1::uuid AND state='runner-never-started-observed'
+             AND start_observation_token_sha256=$10 RETURNING reservation_id`,
+          [request.reservation_id, randomUUID(), request.observation_request_id, at,
+            evidence.observed_at, evidence.process_started_at, evidence.process_instance_sha256,
+            evidence.evidence_ref, evidence.evidence_sha256, startTokenDigest],
+        );
+        if (conflicted.rows.length !== 1) return await deny('Contradictory start evidence lost its quarantine race.');
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, claim_id: request.claim_id,
+            reason: 'authenticated start evidence contradicted settled never-started evidence',
+            execution_state: 'conflicted', released_cost_usd: 0, released_host_slots: 0,
+          })],
+        );
+        await client.query('COMMIT');
+        return runnerStartObservationDenied('Authenticated start evidence contradicted never-started evidence; authority is quarantined.');
       }
       const exactRequest = row.state === 'runner-start-observed'
         && row.runner_start_observation_request_id === request.observation_request_id;
@@ -3284,7 +3532,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const storedCredentialDigests = [
         row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
         row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
-        row.start_observation_token_sha256,
+        row.start_observation_token_sha256, row.outcome_token_sha256,
       ];
       if (storedCredentialDigests.some((digest) => typeof digest !== 'string')
         || new Set(storedCredentialDigests).size !== storedCredentialDigests.length
@@ -3298,7 +3546,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id
         || row.runner_id !== runner.runner_id || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
         || row.runner_instance_id !== runner.runner_instance_id || row.runner_runtime_id !== runner.runtime_id
-        || row.runner_host_id !== runner.host_id || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256) {
+        || row.runner_host_id !== runner.host_id || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
+        || row.runner_launch_attempt_id !== runner.launch_attempt_id
+        || Number(row.runner_fencing_generation) !== runner.fencing_generation) {
         return await quarantine('runner identity or channel drifted before start observation', 'Runner identity, placement, or channel drifted before start observation.');
       }
       if (row.broker_database_role !== brokerAttestation.session.database_role
@@ -3366,7 +3616,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const hostResult = await client.query(
         `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
                 (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
          FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
       );
       const host = hostEvidence(hostResult.rows[0]);
@@ -3385,7 +3635,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const budget = await client.query(
         `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
                   FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested'))) AS reconciles,
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
                 (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
          FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
       );
@@ -3442,6 +3692,309 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
         action: 'observe-runner-start', reservation_id: request.reservation_id,
         error: error instanceof Error ? error.message : 'unknown runner-start observation failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
+  }
+
+  async settleRunnerOutcome(input: RunnerOutcomeInput): Promise<RunnerOutcomeResult> {
+    const parsed = runnerOutcomeInputSchema.safeParse(input);
+    if (!parsed.success) return runnerOutcomeDenied('Runner outcome request is invalid.');
+    const request = parsed.data;
+    const client = await this.pool.connect();
+    let at = new Date().toISOString();
+    const deny = async (blocker: string): Promise<RunnerOutcomeResult> => {
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-outcome-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+          reservation_id: request.reservation_id, claim_id: request.claim_id,
+          outcome_request_id: request.outcome_request_id, blockers: [blocker],
+        })],
+      );
+      await client.query('COMMIT');
+      return runnerOutcomeDenied(blocker);
+    };
+    const receiptFrom = (row: Record<string, unknown>): RunnerOutcomeReceipt => ({
+      schema_version: 'starlight.runner_outcome.v1',
+      outcome_id: String(row.runner_outcome_id),
+      outcome_request_id: String(row.runner_outcome_request_id),
+      outcome_event_id: String(row.runner_outcome_event_id),
+      outcome_kind: row.runner_outcome_kind as 'never-started' | 'process-terminal',
+      claim_id: String(row.runner_claim_id),
+      reservation_id: String(row.reservation_id),
+      operation_id: String(row.operation_id),
+      effect_id: String(row.effect_id),
+      binding_digest_sha256: String(row.binding_digest_sha256),
+      runner_id: String(row.runner_id),
+      runner_instance_id: String(row.runner_instance_id),
+      runtime_id: String(row.runner_runtime_id),
+      host_id: String(row.runner_host_id),
+      channel_binding_sha256: String(row.runner_channel_binding_sha256),
+      launch_attempt_id: String(row.runner_launch_attempt_id),
+      fencing_generation: Number(row.runner_fencing_generation),
+      process_instance_sha256: row.runner_process_instance_sha256 === null ? null : String(row.runner_process_instance_sha256),
+      exit_disposition: row.runner_exit_disposition === null ? null
+        : row.runner_exit_disposition as RunnerOutcomeReceipt['exit_disposition'],
+      evidence_ref: String(row.runner_outcome_evidence_ref),
+      evidence_sha256: String(row.runner_outcome_evidence_sha256),
+      outcome_at: sqlInstant(row.runner_outcome_at),
+      evidence_observed_at: sqlInstant(row.runner_outcome_evidence_observed_at),
+      accepted_at: sqlInstant(row.runner_outcome_accepted_at),
+      remote_stop_confirmed: row.runner_remote_stop_confirmed === true,
+      restart_fenced: true,
+      launch_queue_closed: true,
+      descendants_quiesced: true,
+      transport_state: 'attested-not-deployed',
+      dispatch_state: 'not-dispatched',
+      execution_observed: row.runner_outcome_kind === 'process-terminal',
+      workload_effect_observed: false,
+      actual_usage_reconciled: false,
+      host_capacity_released: row.state === 'runner-terminal-observed',
+      budget_commitment_released: false,
+      released_host_slots: row.state === 'runner-terminal-observed' ? 1 : 0,
+      released_cost_usd: 0,
+      retained_committed_cost_usd: Number(row.committed_cost_usd),
+      state: row.state as 'runner-never-started-observed' | 'runner-terminal-observed',
+    });
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
+      at = await wallClock(client);
+      const nowMs = Date.parse(at);
+
+      const brokerAttestation = await this.brokerSessionAttestor(client);
+      if (!brokerAttestation.valid) {
+        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
+      }
+      const outcomeAttestation = await this.runnerOutcomeEvidenceAttestor(client);
+      if (!outcomeAttestation.valid) {
+        return await deny(`Runner outcome evidence is unavailable: ${outcomeAttestation.blockers.join(' ')}`);
+      }
+      const parsedEvidence = runnerOutcomeEvidenceSchema.safeParse(outcomeAttestation.evidence);
+      if (!parsedEvidence.success) return await deny('Runner outcome evidence is malformed.');
+      const evidence = parsedEvidence.data;
+      const outcomeDigest = createHash('sha256').update(request.outcome_token, 'utf8').digest('hex');
+      const found = await client.query(
+        `SELECT *,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
+         FROM swarm_authority_reservations
+         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid AND outcome_token_sha256=$3 FOR UPDATE`,
+        [request.reservation_id, request.claim_id, outcomeDigest],
+      );
+      const row = found.rows[0];
+      if (!row) return await deny('Runner claim does not exist or the outcome credential is invalid.');
+      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
+        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await deny('Runner outcome request does not match the claimed operation.');
+      }
+      if (row.broker_database_role !== brokerAttestation.session.database_role
+        || row.broker_database_name !== brokerAttestation.session.database_name
+        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256
+        || brokerAttestation.session.contract_digest_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
+        return await deny('Authenticated broker database session does not match the claimed operation.');
+      }
+      const principal = await client.query(
+        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
+                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
+         FROM swarm_authority_broker_principals
+         WHERE database_role=$1 AND database_name=$2`,
+        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
+      );
+      const principalRow = principal.rows[0];
+      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principalRow?.evidence);
+      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
+        && principalEvidence.data.database_role === principalRow.database_role
+        && principalEvidence.data.database_name === principalRow.database_name
+        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
+        && principalEvidence.data.authn_kind === principalRow.authn_kind
+        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
+        && principalEvidence.data.state === principalRow.state
+        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
+        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
+        && principalEvidence.data.state === 'ready'
+        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
+        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
+        && Date.parse(principalEvidence.data.observed_at) <= nowMs
+        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
+        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
+      if (!principalCurrent) return await deny('Broker principal is unavailable, stale, disabled, or drifted.');
+
+      const expectedState = evidence.outcome_kind === 'never-started'
+        ? 'runner-never-started-observed' : 'runner-terminal-observed';
+      const exactRetry = row.state === expectedState
+        && row.runner_outcome_request_id === request.outcome_request_id;
+      if (row.state === 'runner-never-started-observed' || row.state === 'runner-terminal-observed') {
+        if (!exactRetry) return await deny('A different immutable runner outcome already settled this claim.');
+      }
+
+      const binding = operationBindingSchema.safeParse(row.binding);
+      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
+        || row.cost_matches_binding !== true || row.committed_cost_usd !== row.reserved_cost_usd) {
+        return await deny('Stored operation or committed cost is invalid or drifted.');
+      }
+      const bindingsMatch = evidence.reservation_id === request.reservation_id
+        && evidence.claim_id === request.claim_id
+        && evidence.operation_id === request.operation_id
+        && evidence.effect_id === request.effect_id
+        && evidence.binding_digest_sha256 === request.binding_digest_sha256
+        && evidence.runner_id === row.runner_id
+        && evidence.runner_identity_evidence_ref === row.runner_identity_evidence_ref
+        && evidence.runner_instance_id === row.runner_instance_id
+        && evidence.runtime_id === row.runner_runtime_id
+        && evidence.host_id === row.runner_host_id
+        && evidence.channel_binding_sha256 === row.runner_channel_binding_sha256
+        && evidence.launch_attempt_id === row.runner_launch_attempt_id
+        && evidence.fencing_generation === Number(row.runner_fencing_generation);
+      if (!bindingsMatch) return await deny('Runner outcome evidence is bound to another execution generation.');
+
+      const outcomeMs = Date.parse(evidence.outcome_at);
+      const observedMs = Date.parse(evidence.observed_at);
+      if (outcomeMs < Date.parse(String(row.runner_claim_accepted_at))
+        || observedMs > nowMs || nowMs - observedMs > this.maxRunnerEvidenceAgeMs
+        || Date.parse(evidence.access_review_expires_at) <= nowMs) {
+        return await deny('Runner outcome evidence chronology is invalid, stale, or expired.');
+      }
+      const hasStart = row.runner_start_observation_id !== null
+        || row.runner_process_instance_sha256 !== null
+        || row.runner_start_evidence_ref !== null
+        || row.runner_start_evidence_sha256 !== null;
+      if (exactRetry) {
+        const retryDrifted = row.runner_outcome_event_id !== evidence.outcome_event_id
+          || row.runner_outcome_kind !== evidence.outcome_kind
+          || row.runner_outcome_evidence_ref !== evidence.evidence_ref
+          || row.runner_outcome_evidence_sha256 !== evidence.evidence_sha256
+          || row.runner_outcome_presented_token_sha256 !== outcomeDigest
+          || row.runner_exit_disposition !== evidence.exit_disposition
+          || sqlInstant(row.runner_outcome_at) !== sqlInstant(evidence.outcome_at)
+          || sqlInstant(row.runner_outcome_evidence_observed_at) !== sqlInstant(evidence.observed_at)
+          || row.runner_remote_stop_confirmed !== evidence.remote_stop_confirmed
+          || (evidence.outcome_kind === 'never-started' && hasStart)
+          || (evidence.outcome_kind === 'process-terminal' && (
+            !hasStart
+            || evidence.process_instance_sha256 !== row.runner_process_instance_sha256
+            || evidence.start_observation_id !== row.runner_start_observation_id
+            || evidence.start_evidence_ref !== row.runner_start_evidence_ref
+            || evidence.start_evidence_sha256 !== row.runner_start_evidence_sha256
+            || sqlInstant(evidence.process_started_at) !== sqlInstant(row.runner_process_started_at)
+          ));
+        if (retryDrifted) return await deny('Runner outcome retry evidence drifted.');
+        const receipt = receiptFrom(row);
+        await client.query('COMMIT');
+        return { settled: true, receipt, blockers: [] };
+      }
+      if (!['runner-claimed-not-started', 'runner-start-observed', 'stop-requested'].includes(String(row.state))) {
+        return await deny(`Runner outcome cannot be settled from state ${String(row.state)}.`);
+      }
+      if (evidence.outcome_kind === 'never-started') {
+        if (row.state === 'runner-start-observed' || hasStart) {
+          return await deny('Never-started evidence cannot settle an execution with start evidence.');
+        }
+      } else {
+        if ((row.state !== 'runner-start-observed' && row.state !== 'stop-requested') || !hasStart
+          || evidence.process_instance_sha256 !== row.runner_process_instance_sha256
+          || evidence.start_observation_id !== row.runner_start_observation_id
+          || evidence.start_evidence_ref !== row.runner_start_evidence_ref
+          || evidence.start_evidence_sha256 !== row.runner_start_evidence_sha256
+          || sqlInstant(evidence.process_started_at) !== sqlInstant(row.runner_process_started_at)
+          || outcomeMs < Date.parse(String(row.runner_process_started_at))) {
+          return await deny('Process-terminal evidence does not match the stored start observation.');
+        }
+      }
+
+      const duplicate = await client.query(
+        `SELECT reservation_id FROM swarm_authority_reservations
+         WHERE runner_outcome_request_id=$1::uuid OR runner_outcome_event_id=$2::uuid
+           OR runner_outcome_evidence_ref=$3 OR runner_outcome_evidence_sha256=$4 LIMIT 1`,
+        [request.outcome_request_id, evidence.outcome_event_id, evidence.evidence_ref, evidence.evidence_sha256],
+      );
+      if (duplicate.rows.length) return await deny('Runner outcome request or evidence is already bound to another reservation.');
+
+      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
+        return await deny('Committed aggregate budget authority is missing or inconsistent.');
+      }
+      const budget = await client.query(
+        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
+                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles
+         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
+        [row.budget_receipt_id],
+      );
+      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true) {
+        return await deny('Committed receipt budget authority is missing or inconsistent.');
+      }
+      const host = await client.query(
+        `SELECT authorized_slots,
+                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
+         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
+        [row.host_id],
+      );
+      if (host.rows.length !== 1 || host.rows[0].reconciles !== true || Number(host.rows[0].authorized_slots) < 1) {
+        return await deny('Authorized host ledger is missing or inconsistent.');
+      }
+
+      const outcomeId = randomUUID();
+      const transitioned = await client.query(
+        `UPDATE swarm_authority_reservations SET state=$2,
+           runner_outcome_id=$3::uuid,runner_outcome_request_id=$4::uuid,
+           runner_outcome_event_id=$5::uuid,runner_outcome_kind=$6,
+           runner_outcome_accepted_at=$7::timestamptz,runner_outcome_at=$8::timestamptz,
+           runner_outcome_evidence_observed_at=$9::timestamptz,runner_outcome_evidence_ref=$10,
+           runner_outcome_evidence_sha256=$11,runner_outcome_presented_token_sha256=$12,
+           runner_exit_disposition=$13,runner_remote_stop_confirmed=$14
+         WHERE reservation_id=$1::uuid
+           AND state IN ('runner-claimed-not-started','runner-start-observed','stop-requested') RETURNING *`,
+        [request.reservation_id, expectedState, outcomeId, request.outcome_request_id,
+          evidence.outcome_event_id, evidence.outcome_kind, at, evidence.outcome_at,
+          evidence.observed_at, evidence.evidence_ref, evidence.evidence_sha256, outcomeDigest,
+          evidence.exit_disposition, evidence.remote_stop_confirmed],
+      );
+      if (transitioned.rows.length !== 1) return await deny('Runner outcome settlement lost its authority race.');
+      if (evidence.outcome_kind === 'process-terminal') {
+        const released = await client.query(
+          `UPDATE swarm_authority_hosts SET authorized_slots=authorized_slots-1
+           WHERE host_id=$1 AND authorized_slots >= 1 RETURNING authorized_slots`,
+          [row.host_id],
+        );
+        if (released.rows.length !== 1) throw new Error('Authorized host-capacity release would underflow or references a missing host.');
+      }
+      const hostAfter = await client.query(
+        `SELECT (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
+         FROM swarm_authority_hosts WHERE host_id=$1`,
+        [row.host_id],
+      );
+      if (hostAfter.rows.length !== 1 || hostAfter.rows[0].reconciles !== true) {
+        throw new Error('Authorized host ledger failed to reconcile after outcome settlement.');
+      }
+      const receipt = receiptFrom(transitioned.rows[0]);
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-outcome-observed',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
+      );
+      if (evidence.outcome_kind === 'process-terminal') {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('host-capacity-released',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, claim_id: request.claim_id,
+            outcome_id: outcomeId, released_host_slots: 1, released_cost_usd: 0,
+            actual_usage_reconciled: false,
+          })],
+        );
+      }
+      await client.query('COMMIT');
+      return { settled: true, receipt, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'settle-runner-outcome', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown runner-outcome settlement failure',
       });
       throw error;
     } finally { client.release?.(); }
