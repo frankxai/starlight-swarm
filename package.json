@@ -9,6 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts",
     "swarm:dry-run": "tsx src/swarm/index.ts",
+    "swarm:sync": "tsx scripts/sync-memory-import.ts --sync-only",
+    "swarm:import": "tsx scripts/sync-memory-import.ts",
     "hand:pilot": "tsx src/swarm/pilot-cli.ts",
     "runtime:plan": "tsx scripts/plan-team-runtime.ts",
     "runtime:assess": "tsx scripts/assess-team-runtime.ts",
