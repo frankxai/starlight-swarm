@@ -294,7 +294,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     const claimed = await h.authority.claimRunnerStart(claimInput);
     assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
     if (!claimed.claimed) throw new Error('runner claim failed');
-    const observedAt = new Date(Math.max(Date.now(), Date.parse(claimed.receipt.accepted_at) + 1)).toISOString();
+    const observedAt = claimed.receipt.accepted_at;
     currentStartEvidence = {
       schema_version: 'starlight.runner_start_evidence.v1',
       reservation_id: h.reservation.reservation_id,
@@ -335,7 +335,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     const claimed = await h.authority.claimRunnerStart(claimInput);
     assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
     if (!claimed.claimed) throw new Error('runner claim failed');
-    const observedAt = new Date(Math.max(Date.now(), Date.parse(claimed.receipt.accepted_at) + 1)).toISOString();
+    const observedAt = claimed.receipt.accepted_at;
     currentOutcomeEvidence = {
       schema_version: 'starlight.runner_outcome_evidence.v1',
       outcome_event_id: `00000000-0000-4000-8000-0000000007${suffix}`,
