@@ -4,6 +4,7 @@ import {
   cancellationInputSchema,
   consumptionInputSchema,
   operationBindingSchema,
+  runnerClaimInputSchema,
   startLeaseInputSchema,
   startRedemptionInputSchema,
 } from './operation-authority';
@@ -24,6 +25,9 @@ import type {
   ConsumptionReceipt,
   ConsumptionResult,
   OperationAuthorityStore,
+  RunnerClaimInput,
+  RunnerClaimReceipt,
+  RunnerClaimResult,
   StartLeaseInput,
   StartLeaseReceipt,
   StartLeaseResult,
@@ -82,6 +86,42 @@ export const brokerPrincipalEvidenceSchema = z.object({
   message: 'Broker access review must expire after evidence observation.', path: ['access_review_expires_at'],
 });
 export type TrustedBrokerPrincipalEvidence = z.infer<typeof brokerPrincipalEvidenceSchema>;
+
+export interface AttestedRunnerSession {
+  runner_id: string;
+  runner_identity_evidence_ref: string;
+  runner_instance_id: string;
+  runtime_id: string;
+  host_id: string;
+  channel_binding_sha256: string;
+  observed_at: string;
+  access_review_expires_at: string;
+}
+
+const runnerSessionSchema = z.object({
+  runner_id: controlId,
+  runner_identity_evidence_ref: controlId,
+  runner_instance_id: controlId,
+  runtime_id: controlId,
+  host_id: controlId,
+  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  observed_at: controlTime,
+  access_review_expires_at: controlTime,
+}).strict().refine((value) => Date.parse(value.observed_at) < Date.parse(value.access_review_expires_at), {
+  message: 'Runner access review must expire after evidence observation.', path: ['access_review_expires_at'],
+});
+
+export type RunnerSessionAttestation =
+  | { valid: true; session: AttestedRunnerSession; blockers: [] }
+  | { valid: false; session: null; blockers: string[] };
+
+export type RunnerSessionAttestor = (client: AuthoritySqlClient) => Promise<RunnerSessionAttestation>;
+
+const denyUnconfiguredRunnerSession: RunnerSessionAttestor = async () => ({
+  valid: false,
+  session: null,
+  blockers: ['Runner transport attestor is not configured.'],
+});
 
 export const OPERATION_AUTHORITY_MIGRATION_SQL = `
 CREATE TABLE IF NOT EXISTS swarm_authority_revocations (
@@ -153,14 +193,20 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   broker_database_role TEXT, broker_database_name TEXT, broker_role_contract_sha256 CHAR(64),
   redemption_id UUID, redemption_request_id UUID, start_authorized_at TIMESTAMPTZ,
   committed_cost_usd NUMERIC,
-  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'))
+  runner_claim_id UUID, runner_claim_request_id UUID, runner_claim_accepted_at TIMESTAMPTZ,
+  runner_claim_expires_at TIMESTAMPTZ, runner_evidence_observed_at TIMESTAMPTZ,
+  runner_access_review_expires_at TIMESTAMPTZ, runner_id TEXT, runner_identity_evidence_ref TEXT,
+  runner_instance_id TEXT, runner_runtime_id TEXT, runner_host_id TEXT,
+  runner_channel_binding_sha256 CHAR(64), heartbeat_token_sha256 CHAR(64),
+  runner_revocation_refs JSONB,
+  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','stop-requested','cancelled','expired'))
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
   reservation_id UUID NOT NULL, window_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL CHECK (reserved_cost_usd >= 0),
   PRIMARY KEY (reservation_id,window_id)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -197,6 +243,20 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_id 
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_request_id UUID;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_authorized_at TIMESTAMPTZ;
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS committed_cost_usd NUMERIC;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_request_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_accepted_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_expires_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_evidence_observed_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_access_review_expires_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_id TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_identity_evidence_ref TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_instance_id TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_runtime_id TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_host_id TEXT;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_channel_binding_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS heartbeat_token_sha256 CHAR(64);
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_revocation_refs JSONB;
 
 DO $migration$
 BEGIN
@@ -392,11 +452,13 @@ SELECT 'stop-requested',operation_id,binding_digest_sha256,clock_timestamp(),
     'reason','start authorization predated authenticated broker database principal',
     'execution_state','unknown','released_cost_usd',0)
 FROM swarm_authority_reservations
-WHERE state='start-authorized-not-observed'
-  AND num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3;
+WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started')
+  AND (num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3
+    OR broker_role_contract_sha256 <> '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}');
 UPDATE swarm_authority_reservations SET state='stop-requested'
-WHERE state='start-authorized-not-observed'
-  AND num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3;
+WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started')
+  AND (num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3
+    OR broker_role_contract_sha256 <> '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}');
 
 -- Any attributed active reservation must be bound to exactly one policy and one
 -- daily window for its signed policy, and every aggregate ledger must reconcile
@@ -443,7 +505,7 @@ BEGIN
     LEFT JOIN swarm_authority_hosts host ON host.host_id=r.host_id
     LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
     LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-    WHERE r.state IN ('start-authorized-not-observed','stop-requested')
+    WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested')
     GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd,r.committed_cost_usd,
       b.receipt_id,host.host_id
     HAVING b.receipt_id IS NULL OR host.host_id IS NULL
@@ -464,7 +526,7 @@ BEGIN
     LEFT JOIN (
       SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
       FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','stop-requested')
+      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested')
       GROUP BY budget_receipt_id
     ) committed ON committed.budget_receipt_id=b.receipt_id
     WHERE b.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
@@ -477,7 +539,7 @@ BEGIN
       SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
       FROM swarm_authority_budget_holds h
       JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
-      WHERE r.state IN ('start-authorized-not-observed','stop-requested')
+      WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested')
       GROUP BY h.window_id
     ) committed ON committed.window_id=w.window_id
     WHERE w.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
@@ -489,7 +551,7 @@ BEGIN
     LEFT JOIN (
       SELECT host_id,COUNT(*)::INTEGER AS slots
       FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','stop-requested')
+      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested')
       GROUP BY host_id
     ) authorized ON authorized.host_id=h.host_id
     WHERE h.authorized_slots IS DISTINCT FROM COALESCE(authorized.slots,0)
@@ -543,6 +605,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_id_uq
   ON swarm_authority_reservations(redemption_id) WHERE redemption_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_request_id_uq
   ON swarm_authority_reservations(redemption_request_id) WHERE redemption_request_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_runner_claim_id_uq
+  ON swarm_authority_reservations(runner_claim_id) WHERE runner_claim_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_runner_claim_request_id_uq
+  ON swarm_authority_reservations(runner_claim_request_id) WHERE runner_claim_request_id IS NOT NULL;
 ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_lease_fields_check;
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_lease_fields_check CHECK (
   num_nonnulls(lease_id,start_request_id,lease_issued_at,lease_expires_at,lease_duration_ms) IN (0,5)
@@ -572,7 +638,7 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND lease_claim_token_sha256 <> control_token_sha256
     AND redemption_token_sha256 <> control_token_sha256
   ))
-  AND (state NOT IN ('start-authorized-not-observed','stop-requested') OR (
+  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested') OR (
     lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
     AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
     AND cancel_token_sha256 <> lease_claim_token_sha256
@@ -587,16 +653,40 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND num_nonnulls(redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd)=4
     AND committed_cost_usd=reserved_cost_usd
   ))
-  AND (state <> 'start-authorized-not-observed' OR (
+  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started') OR (
     num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256)=3
     AND broker_role_contract_sha256='${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
   ))
+  AND (state <> 'runner-claimed-not-started' OR (
+    num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
+      runner_evidence_observed_at,runner_access_review_expires_at,
+      runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
+      runner_channel_binding_sha256,heartbeat_token_sha256,runner_revocation_refs)=14
+    AND runner_claim_expires_at > runner_claim_accepted_at
+    AND runner_access_review_expires_at > runner_evidence_observed_at
+    AND runner_claim_expires_at <= runner_access_review_expires_at
+    AND runner_runtime_id=binding->>'runtime_id'
+    AND runner_host_id=host_id
+    AND runner_id=binding->>'execution_identity'
+    AND runner_identity_evidence_ref=binding->>'identity_evidence_ref'
+    AND heartbeat_token_sha256 <> consume_token_sha256
+    AND heartbeat_token_sha256 <> cancel_token_sha256
+    AND heartbeat_token_sha256 <> lease_claim_token_sha256
+    AND heartbeat_token_sha256 <> redemption_token_sha256
+    AND heartbeat_token_sha256 <> control_token_sha256
+    AND jsonb_typeof(runner_revocation_refs) = 'array'
+  ))
+  AND (state NOT IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','cancelled','expired') OR
+    num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
+      runner_evidence_observed_at,runner_access_review_expires_at,
+      runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
+      runner_channel_binding_sha256,heartbeat_token_sha256,runner_revocation_refs)=0)
 );
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
-  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','stop-requested','cancelled','expired'));
+  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','stop-requested','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -609,6 +699,8 @@ export interface AuthoritySqlPool { connect(): Promise<AuthoritySqlClient> }
 export interface PostgresOperationAuthorityOptions {
   maxBrokerEvidenceAgeMs?: number;
   brokerSessionAttestor?: BrokerDatabaseSessionAttestor;
+  maxRunnerEvidenceAgeMs?: number;
+  runnerSessionAttestor?: RunnerSessionAttestor;
 }
 
 function denial(blocker: string): AdmissionResult {
@@ -625,6 +717,10 @@ function startLeaseDenied(blocker: string): StartLeaseResult {
 
 function startRedemptionDenied(blocker: string): StartRedemptionResult {
   return { redeemed: false, receipt: null, blockers: [blocker] };
+}
+
+function runnerClaimDenied(blocker: string): RunnerClaimResult {
+  return { claimed: false, receipt: null, blockers: [blocker] };
 }
 
 function cancellationDenied(
@@ -670,6 +766,8 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   readonly durable = true;
   private readonly maxBrokerEvidenceAgeMs: number;
   private readonly brokerSessionAttestor: BrokerDatabaseSessionAttestor;
+  private readonly maxRunnerEvidenceAgeMs: number;
+  private readonly runnerSessionAttestor: RunnerSessionAttestor;
 
   constructor(
     private readonly pool: AuthoritySqlPool,
@@ -681,6 +779,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       throw new Error('Broker evidence age ceiling must be between 1 second and 1 hour.');
     }
     this.brokerSessionAttestor = options.brokerSessionAttestor ?? attestBrokerDatabaseSession;
+    this.maxRunnerEvidenceAgeMs = options.maxRunnerEvidenceAgeMs ?? 60_000;
+    if (!Number.isInteger(this.maxRunnerEvidenceAgeMs)
+      || this.maxRunnerEvidenceAgeMs < 1_000 || this.maxRunnerEvidenceAgeMs > 5 * 60_000) {
+      throw new Error('Runner evidence age ceiling must be between 1 second and 5 minutes.');
+    }
+    this.runnerSessionAttestor = options.runnerSessionAttestor ?? denyUnconfiguredRunnerSession;
   }
 
   async initialize(): Promise<void> {
@@ -762,7 +866,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const quarantined = await client.query(
         `UPDATE swarm_authority_reservations SET state='stop-requested'
          WHERE broker_database_role=$1 AND broker_database_name=$2
-           AND state='start-authorized-not-observed'
+           AND state IN ('start-authorized-not-observed','runner-claimed-not-started')
            AND ($3 <> 'ready' OR broker_execution_identity <> $4 OR broker_identity_evidence_ref <> $5
              OR broker_role_contract_sha256 <> $6)
          RETURNING reservation_id,operation_id,binding_digest_sha256`,
@@ -942,7 +1046,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       }
       const authorized = await client.query(
         `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE operation_id=$1 AND state='start-authorized-not-observed'
+         WHERE operation_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started')
          RETURNING reservation_id,binding_digest_sha256`,
         [operationId],
       );
@@ -1014,8 +1118,13 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       }
       const authorized = await client.query(
         `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE state='start-authorized-not-observed'
-           AND revocation_refs @> jsonb_build_array($1::text)
+         WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started')
+           AND (revocation_refs @> jsonb_build_array($1::text)
+             OR runner_revocation_refs @> jsonb_build_array($1::text)
+             OR $1='runner:'||runner_id
+             OR $1='runner-instance:'||runner_instance_id
+             OR $1='identity:'||runner_identity_evidence_ref
+             OR $1='channel:'||runner_channel_binding_sha256)
          RETURNING reservation_id,operation_id,binding_digest_sha256`,
         [ref],
       );
@@ -1073,7 +1182,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                FROM swarm_authority_budget_holds h3
                JOIN swarm_authority_reservations r3 ON r3.reservation_id=h3.reservation_id
                WHERE h3.window_id=w.window_id
-                 AND r3.state IN ('start-authorized-not-observed','stop-requested'))) AS committed_reconciles
+                 AND r3.state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS committed_reconciles
        FROM swarm_authority_budget_holds h JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
        WHERE h.reservation_id=$1::uuid ORDER BY w.kind`,
       [reservationId, expectedCost],
@@ -1695,12 +1804,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         || row.binding_digest_sha256 !== request.binding_digest_sha256) {
         return await deny('Start-redemption request does not match the leased operation.');
       }
-      const authorizedState = row.state === 'start-authorized-not-observed';
+      const authorizedState = row.state === 'start-authorized-not-observed' || row.state === 'runner-claimed-not-started';
       const exactRequest = authorizedState && row.redemption_request_id === request.redemption_request_id;
       const quarantineRetry = async (reason: string, blocker: string): Promise<StartRedemptionResult> => {
         const stopped = await client.query(
           `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING reservation_id`,
+           WHERE reservation_id=$1::uuid AND state IN ('start-authorized-not-observed','runner-claimed-not-started') RETURNING reservation_id`,
           [request.reservation_id],
         );
         if (stopped.rows.length !== 1) return await deny('Start-authorization quarantine lost its authority race.');
@@ -1886,7 +1995,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                 (reserved_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
                   WHERE host_id=$1 AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
                 (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','stop-requested'))) AS authorized_reconciles
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS authorized_reconciles
          FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
         [row.host_id],
       );
@@ -1950,7 +2059,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
                     AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
                 (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
                   FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','stop-requested'))) AS committed_reconciles
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS committed_reconciles
          FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
         [row.budget_receipt_id, binding.data.requested_cost_usd],
       );
@@ -2032,6 +2141,332 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     } finally { client.release?.(); }
   }
 
+  async claimRunnerStart(input: RunnerClaimInput): Promise<RunnerClaimResult> {
+    const parsed = runnerClaimInputSchema.safeParse(input);
+    if (!parsed.success) return runnerClaimDenied('Runner claim is invalid.');
+    const request = parsed.data;
+    const client = await this.pool.connect();
+    let at = new Date().toISOString();
+    const deny = async (blocker: string): Promise<RunnerClaimResult> => {
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-claim-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+          reservation_id: request.reservation_id, redemption_id: request.redemption_id,
+          claim_request_id: request.claim_request_id, blockers: [blocker],
+        })],
+      );
+      await client.query('COMMIT');
+      return runnerClaimDenied(blocker);
+    };
+    const receiptFrom = (row: Record<string, unknown>): RunnerClaimReceipt => ({
+      schema_version: 'starlight.runner_claim_acceptance.v1',
+      claim_id: String(row.runner_claim_id),
+      claim_request_id: String(row.runner_claim_request_id),
+      reservation_id: request.reservation_id,
+      redemption_id: request.redemption_id,
+      operation_id: request.operation_id,
+      effect_id: request.effect_id,
+      binding_digest_sha256: request.binding_digest_sha256,
+      runner_id: String(row.runner_id),
+      runner_identity_evidence_ref: String(row.runner_identity_evidence_ref),
+      runner_instance_id: String(row.runner_instance_id),
+      runtime_id: String(row.runner_runtime_id),
+      host_id: String(row.runner_host_id),
+      channel_binding_sha256: String(row.runner_channel_binding_sha256),
+      accepted_at: sqlInstant(row.runner_claim_accepted_at),
+      claim_expires_at: sqlInstant(row.runner_claim_expires_at),
+      heartbeat_token_sha256: String(row.heartbeat_token_sha256),
+      transport_state: 'attested-not-deployed',
+      dispatch_state: 'not-dispatched',
+      execution_observed: false,
+      state: 'runner-claimed-not-started',
+    });
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
+      at = await wallClock(client);
+      const nowMs = Date.parse(at);
+
+      const brokerAttestation = await this.brokerSessionAttestor(client);
+      if (!brokerAttestation.valid) {
+        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
+      }
+      const runnerAttestation = await this.runnerSessionAttestor(client);
+      if (!runnerAttestation.valid) {
+        return await deny(`Runner transport session is not authorized: ${runnerAttestation.blockers.join(' ')}`);
+      }
+      const parsedRunner = runnerSessionSchema.safeParse(runnerAttestation.session);
+      if (!parsedRunner.success) return await deny('Runner transport attestation is malformed.');
+      const runner = parsedRunner.data;
+      const runnerObservedMs = Date.parse(runner.observed_at);
+      if (runnerObservedMs > nowMs + 60_000 || nowMs - runnerObservedMs > this.maxRunnerEvidenceAgeMs) {
+        return await deny('Runner transport attestation is stale or from the future.');
+      }
+      if (Date.parse(runner.access_review_expires_at) <= nowMs) {
+        return await deny('Runner transport access review is expired.');
+      }
+
+      const controlDigest = createHash('sha256').update(request.control_token, 'utf8').digest('hex');
+      const heartbeatDigest = createHash('sha256').update(request.heartbeat_token, 'utf8').digest('hex');
+      const found = await client.query(
+        `SELECT *,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
+         FROM swarm_authority_reservations
+         WHERE reservation_id=$1::uuid AND redemption_id=$2::uuid AND control_token_sha256=$3 FOR UPDATE`,
+        [request.reservation_id, request.redemption_id, controlDigest],
+      );
+      const row = found.rows[0];
+      if (!row) return await deny('Start authorization does not exist or the control credential is invalid.');
+      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
+        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await deny('Runner claim does not match the authorized operation.');
+      }
+      const exactRequest = row.state === 'runner-claimed-not-started'
+        && row.runner_claim_request_id === request.claim_request_id;
+      const quarantine = async (reason: string, blocker: string): Promise<RunnerClaimResult> => {
+        const stopped = await client.query(
+          `UPDATE swarm_authority_reservations SET state='stop-requested'
+           WHERE reservation_id=$1::uuid
+             AND state IN ('start-authorized-not-observed','runner-claimed-not-started') RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (stopped.rows.length !== 1) return await deny('Runner-claim quarantine lost its authority race.');
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, reason, execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+        await client.query('COMMIT');
+        return runnerClaimDenied(blocker);
+      };
+      if (row.state === 'runner-claimed-not-started' && !exactRequest) {
+        return await deny('A different runner claim already owns this start authorization.');
+      }
+      if (row.state !== 'start-authorized-not-observed' && !exactRequest) {
+        return await deny(`Runner claim cannot be accepted from state ${String(row.state)}.`);
+      }
+
+      const binding = operationBindingSchema.safeParse(row.binding);
+      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
+        return await quarantine(
+          exactRequest ? 'stored binding invalid on runner-claim retry' : 'stored binding invalid before runner claim',
+          exactRequest ? 'Stored binding is invalid on the runner-claim retry.' : 'Stored reservation binding or signed cost is invalid.',
+        );
+      }
+      if (Date.parse(String(row.reservation_expires_at)) <= nowMs
+        || Date.parse(String(row.lease_expires_at)) <= nowMs
+        || Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms <= nowMs) {
+        return await quarantine(
+          exactRequest ? 'stored runner authority expired on claim retry' : 'stored runner authority expired before runner claim',
+          exactRequest ? 'Runner authority expired before the claim retry.' : 'Runner authority expired before the claim.',
+        );
+      }
+      if (runner.runner_id !== binding.data.execution_identity
+        || runner.runner_identity_evidence_ref !== binding.data.identity_evidence_ref
+        || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id) {
+        return exactRequest
+          ? await quarantine('runner identity or placement drifted on claim retry', 'Runner identity or placement drifted on the claim retry.')
+          : await deny('Attested runner identity or placement does not match the signed operation binding.');
+      }
+      if (row.broker_database_role !== brokerAttestation.session.database_role
+        || row.broker_database_name !== brokerAttestation.session.database_name
+        || row.broker_role_contract_sha256 !== brokerAttestation.session.contract_digest_sha256
+        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
+        return exactRequest
+          ? await quarantine('authenticated broker principal drifted on claim retry', 'Authenticated broker principal drifted on the claim retry.')
+          : await deny('Authenticated broker principal does not match the start authorization.');
+      }
+      const principal = await client.query(
+        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
+                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
+         FROM swarm_authority_broker_principals
+         WHERE database_role=$1 AND database_name=$2`,
+        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
+      );
+      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principal.rows[0]?.evidence);
+      const principalRow = principal.rows[0];
+      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
+        && principalEvidence.data.database_role === principalRow.database_role
+        && principalEvidence.data.database_name === principalRow.database_name
+        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
+        && principalEvidence.data.authn_kind === principalRow.authn_kind
+        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
+        && principalEvidence.data.state === principalRow.state
+        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
+        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
+        && principalEvidence.data.state === 'ready'
+        && principalEvidence.data.database_role === brokerAttestation.session.database_role
+        && principalEvidence.data.database_name === brokerAttestation.session.database_name
+        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
+        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
+        && principalEvidence.data.role_contract_digest_sha256 === brokerAttestation.session.contract_digest_sha256
+        && Date.parse(principalEvidence.data.observed_at) <= nowMs + 60_000
+        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
+        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
+      if (!principalCurrent) {
+        return await quarantine(
+          exactRequest ? 'broker principal unavailable on runner-claim retry' : 'broker principal unavailable before runner claim',
+          exactRequest ? 'Broker principal is unavailable on the runner-claim retry.' : 'Broker principal is unavailable, stale, disabled, or drifted.',
+        );
+      }
+
+      const storedRefs = revocationRefsSchema.safeParse(row.revocation_refs);
+      if (!storedRefs.success) return exactRequest
+        ? await quarantine('stored operation revocation binding invalid on claim retry', 'Stored operation revocation binding is invalid on the claim retry.')
+        : await quarantine('stored operation revocation binding invalid before runner claim', 'Stored operation revocation binding is invalid.');
+      const runnerRefs = [
+        `runner:${runner.runner_id}`, `runner-instance:${runner.runner_instance_id}`,
+        `identity:${runner.runner_identity_evidence_ref}`, `channel:${runner.channel_binding_sha256}`,
+      ];
+      const refs = revocationRefsSchema.safeParse([...storedRefs.data, ...runnerRefs]);
+      if (!refs.success) return exactRequest
+        ? await quarantine('runner revocation binding invalid on claim retry', 'Runner revocation binding is invalid on the claim retry.')
+        : await deny('Runner revocation binding is invalid.');
+      if (exactRequest) {
+        const storedRunnerRefs = revocationRefsSchema.safeParse(row.runner_revocation_refs);
+        if (!storedRunnerRefs.success || JSON.stringify(storedRunnerRefs.data) !== JSON.stringify(refs.data)) {
+          return await quarantine('runner revocation binding drifted on claim retry', 'Runner revocation binding drifted on the claim retry.');
+        }
+      }
+      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
+      if (revoked.rows.length) return await quarantine(
+        exactRequest ? 'runner or operation authority revoked on claim retry' : 'runner or operation authority revoked before runner claim',
+        exactRequest ? 'Runner or operation authority is revoked on the claim retry.' : 'Runner or operation authority is revoked.',
+      );
+      const prepared = await client.query(
+        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
+        [request.operation_id],
+      );
+      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await quarantine(
+          exactRequest ? 'prepared operation unavailable on runner-claim retry' : 'prepared operation unavailable before runner claim',
+          exactRequest ? 'Prepared operation is unavailable on the runner-claim retry.' : 'Prepared operation is unavailable or drifted.',
+        );
+      }
+
+      const hostResult = await client.query(
+        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
+                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS reconciles
+         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
+      );
+      const host = hostEvidence(hostResult.rows[0]);
+      if (!host || host.status !== 'ready' || !host.secret_readiness || host.host_id !== runner.host_id
+        || host.capacity_slots !== Number(hostResult.rows[0]?.capacity_slots)
+        || hostResult.rows[0]?.reconciles !== true
+        || Date.parse(host.observed_at) > nowMs + 60_000
+        || nowMs - Date.parse(host.observed_at) > Number(row.max_host_evidence_age_ms)
+        || Date.parse(host.access_review_expires_at) <= nowMs
+        || binding.data.capabilities.some((capability) => !host.allowed_capabilities.includes(capability))) {
+        return await quarantine(
+          exactRequest ? 'host authority unavailable on runner-claim retry' : 'host authority unavailable before runner claim',
+          exactRequest ? 'Host authority is unavailable on the runner-claim retry.' : 'Host authority is unavailable, stale, or inconsistent.',
+        );
+      }
+      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
+        return await quarantine(
+          exactRequest ? 'aggregate budget invalid on runner-claim retry' : 'aggregate budget invalid before runner claim',
+          exactRequest ? 'Aggregate budget is invalid on the runner-claim retry.' : 'Aggregate budget authority is missing or inconsistent.',
+        );
+      }
+      const budget = await client.query(
+        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
+                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS reconciles,
+                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
+         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
+      );
+      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true || budget.rows[0].within_ceiling !== true) {
+        return await quarantine(
+          exactRequest ? 'receipt budget invalid on runner-claim retry' : 'receipt budget invalid before runner claim',
+          exactRequest ? 'Receipt budget is invalid on the runner-claim retry.' : 'Receipt budget authority is missing or inconsistent.',
+        );
+      }
+
+      const claimExpiryMs = Math.min(
+        Date.parse(runner.access_review_expires_at),
+        runnerObservedMs + this.maxRunnerEvidenceAgeMs,
+        Date.parse(String(row.reservation_expires_at)),
+        Date.parse(String(row.lease_expires_at)),
+        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
+      );
+      if (!Number.isFinite(claimExpiryMs) || claimExpiryMs <= nowMs) {
+        return await quarantine(
+          exactRequest ? 'runner claim expired before retry' : 'runner claim had no valid authority interval',
+          exactRequest ? 'Runner claim expired before the retry.' : 'Runner claim would have no valid authority interval.',
+        );
+      }
+      if (exactRequest) {
+        const storedEvidenceObservedMs = Date.parse(String(row.runner_evidence_observed_at));
+        const storedAccessReviewExpiresMs = Date.parse(String(row.runner_access_review_expires_at));
+        const storedClaimExpiryMs = Date.parse(String(row.runner_claim_expires_at));
+        const storedAuthorityCapMs = Math.min(
+          storedAccessReviewExpiresMs,
+          storedEvidenceObservedMs + this.maxRunnerEvidenceAgeMs,
+          Date.parse(String(row.reservation_expires_at)),
+          Date.parse(String(row.lease_expires_at)),
+          Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
+        );
+        if (row.heartbeat_token_sha256 !== heartbeatDigest
+          || row.runner_id !== runner.runner_id
+          || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
+          || row.runner_instance_id !== runner.runner_instance_id
+          || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
+          || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
+          || !Number.isFinite(storedAuthorityCapMs)
+          || storedClaimExpiryMs !== storedAuthorityCapMs
+          || storedClaimExpiryMs > claimExpiryMs
+          || storedClaimExpiryMs <= nowMs) {
+          return await quarantine('runner claim replay evidence drifted', 'Runner claim replay evidence drifted.');
+        }
+        const receipt = receiptFrom(row);
+        await client.query('COMMIT');
+        return { claimed: true, receipt, blockers: [] };
+      }
+      const duplicate = await client.query(
+        'SELECT reservation_id FROM swarm_authority_reservations WHERE runner_claim_request_id=$1::uuid LIMIT 1',
+        [request.claim_request_id],
+      );
+      if (duplicate.rows.length) return await deny('Runner claim request id is already bound to another reservation.');
+      const claimId = randomUUID();
+      const transitioned = await client.query(
+        `UPDATE swarm_authority_reservations SET state='runner-claimed-not-started',
+           runner_claim_id=$2::uuid,runner_claim_request_id=$3::uuid,runner_claim_accepted_at=$4::timestamptz,
+           runner_claim_expires_at=$5::timestamptz,runner_evidence_observed_at=$6::timestamptz,
+           runner_access_review_expires_at=$7::timestamptz,runner_id=$8,runner_identity_evidence_ref=$9,
+           runner_instance_id=$10,runner_runtime_id=$11,runner_host_id=$12,runner_channel_binding_sha256=$13,
+           heartbeat_token_sha256=$14,runner_revocation_refs=$15::jsonb
+         WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING *`,
+        [request.reservation_id, claimId, request.claim_request_id, at, new Date(claimExpiryMs).toISOString(),
+          runner.observed_at, runner.access_review_expires_at, runner.runner_id, runner.runner_identity_evidence_ref,
+          runner.runner_instance_id, runner.runtime_id, runner.host_id, runner.channel_binding_sha256,
+          heartbeatDigest, JSON.stringify(refs.data)],
+      );
+      if (transitioned.rows.length !== 1) return await deny('Runner claim could not be accepted exactly once.');
+      const receipt = receiptFrom(transitioned.rows[0]);
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-claim-accepted',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
+      );
+      await client.query('COMMIT');
+      return { claimed: true, receipt, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'claim-runner-start', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown runner-claim failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
+  }
+
   async cancel(input: CancellationInput): Promise<CancellationResult> {
     const parsed = cancellationInputSchema.safeParse(input);
     if (!parsed.success) return cancellationDenied(String(input?.reservation_id ?? 'invalid-reservation'), 'Cancellation request is invalid.');
@@ -2079,10 +2514,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           true,
         );
       }
-      if (row.state === 'start-authorized-not-observed') {
+      if (row.state === 'start-authorized-not-observed' || row.state === 'runner-claimed-not-started') {
         const stopped = await client.query(
           `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING reservation_id`,
+           WHERE reservation_id=$1::uuid AND state IN ('start-authorized-not-observed','runner-claimed-not-started') RETURNING reservation_id`,
           [request.reservation_id],
         );
         if (stopped.rows.length !== 1) throw new Error('Stop request lost its authority race.');

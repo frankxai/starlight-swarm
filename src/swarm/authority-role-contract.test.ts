@@ -112,6 +112,16 @@ test('the restricted role can execute the redemption SQL surface but not control
       SELECT * FROM swarm_authority_revocations;
       SELECT * FROM swarm_authority_budget_holds;
       UPDATE swarm_authority_reservations SET state=state WHERE FALSE;
+      UPDATE swarm_authority_reservations SET
+        runner_claim_id=runner_claim_id,runner_claim_request_id=runner_claim_request_id,
+        runner_claim_accepted_at=runner_claim_accepted_at,runner_claim_expires_at=runner_claim_expires_at,
+        runner_evidence_observed_at=runner_evidence_observed_at,
+        runner_access_review_expires_at=runner_access_review_expires_at,
+        runner_id=runner_id,runner_identity_evidence_ref=runner_identity_evidence_ref,
+        runner_instance_id=runner_instance_id,runner_runtime_id=runner_runtime_id,
+        runner_host_id=runner_host_id,runner_channel_binding_sha256=runner_channel_binding_sha256,
+        heartbeat_token_sha256=heartbeat_token_sha256,runner_revocation_refs=runner_revocation_refs
+      WHERE FALSE;
       UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots WHERE FALSE;
       UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd WHERE FALSE;
       UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd WHERE FALSE;

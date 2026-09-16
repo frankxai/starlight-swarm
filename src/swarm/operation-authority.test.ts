@@ -13,6 +13,7 @@ import {
   PostgresOperationAuthorityStore,
   type AuthoritySqlClient,
   type AuthoritySqlPool,
+  type RunnerSessionAttestor,
   type TrustedBrokerPrincipalEvidence,
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
@@ -32,6 +33,7 @@ const BUDGET_SECRET = 'budget-secret-at-least-32-bytes-long';
 const LEASE_CLAIM_TOKEN = 'L'.repeat(43);
 const REDEMPTION_TOKEN = 'R'.repeat(43);
 const CONTROL_TOKEN = 'C'.repeat(43);
+const HEARTBEAT_TOKEN = 'H'.repeat(43);
 const BROKER_IDENTITY = 'broker-execution-001';
 const BROKER_EVIDENCE = 'broker-attestation-001';
 const BROKER_DATABASE_ROLE = 'starlight_test_broker';
@@ -42,6 +44,20 @@ const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
     database_role: BROKER_DATABASE_ROLE,
     database_name: BROKER_DATABASE_NAME,
     contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  },
+  blockers: [],
+});
+const runnerSessionAttestor: RunnerSessionAttestor = async () => ({
+  valid: true,
+  session: {
+    runner_id: 'openai-codex-worker',
+    runner_identity_evidence_ref: 'identity-attestation-001',
+    runner_instance_id: 'runner-instance-001',
+    runtime_id: 'railway-temporal',
+    host_id: 'trusted-host-001',
+    channel_binding_sha256: '9'.repeat(64),
+    observed_at: new Date().toISOString(),
+    access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
   },
   blockers: [],
 });
@@ -146,9 +162,13 @@ function binding(overrides: Partial<OperationBinding> = {}): OperationBinding {
 async function harness(
   operation = binding(),
   windows: { policyLimit?: number; dailyLimit?: number; endsAt?: string } = {},
+  runnerAttestor?: RunnerSessionAttestor,
 ) {
   const pool = new PGlitePool();
-  const store = new PostgresOperationAuthorityStore(pool, { brokerSessionAttestor });
+  const store = new PostgresOperationAuthorityStore(pool, {
+    brokerSessionAttestor,
+    ...(runnerAttestor ? { runnerSessionAttestor: runnerAttestor } : {}),
+  });
   await store.initialize();
   await store.putBrokerPrincipalEvidence(brokerEvidence());
   await store.putHostEvidence({
@@ -279,6 +299,43 @@ function startRedemption(
     redemption_token: REDEMPTION_TOKEN,
     ...overrides,
   };
+}
+
+function runnerClaim(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  redemptionId: string,
+  overrides: Partial<{ claim_request_id: string; control_token: string; heartbeat_token: string }> = {},
+) {
+  return {
+    claim_request_id: '00000000-0000-4000-8000-000000000401',
+    reservation_id: reservation.reservation_id,
+    redemption_id: redemptionId,
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    control_token: CONTROL_TOKEN,
+    heartbeat_token: HEARTBEAT_TOKEN,
+    ...overrides,
+  };
+}
+
+async function authorizeForRunnerClaim(h: Harness, leaseDurationMs = 5_000) {
+  const reservation = await reserve(h);
+  const consumed = await h.authority.consume(consumption(h, reservation));
+  assert.equal(consumed.consumed, true);
+  if (!consumed.consumed) throw new Error('consume failed');
+  const leased = await h.authority.leaseStart(startLease(
+    h, reservation, consumed.receipt.consumption_id, { lease_duration_ms: leaseDurationMs },
+  ));
+  assert.equal(leased.leased, true);
+  if (!leased.leased) throw new Error('lease failed');
+  const redeemed = await h.authority.redeemStartAuthorization(
+    startRedemption(h, reservation, leased.receipt.lease_id),
+  );
+  assert.equal(redeemed.redeemed, true);
+  if (!redeemed.redeemed) throw new Error('redemption failed');
+  return { reservation, redeemed };
 }
 
 function cancellation(reservation: Awaited<ReturnType<typeof reserve>>, reason: string) {
@@ -709,6 +766,7 @@ test('requires server-owned preparation and strictly valid, fresh host evidence'
       consume: async () => ({ consumed: false, receipt: null, blockers: [] }),
       leaseStart: async () => ({ leased: false, receipt: null, blockers: [] }),
       redeemStartAuthorization: async () => ({ redeemed: false, receipt: null, blockers: [] }),
+      claimRunnerStart: async () => ({ claimed: false, receipt: null, blockers: [] }),
       cancel: async (input) => ({ cancelled: false, reservation_id: input.reservation_id, state: null, already_terminal: false, released_cost_usd: 0, blockers: [] }),
       recordDenial: async () => {},
     }, { approvalIssuers: {}, budgetIssuers: {} }, Number.NaN),
@@ -1032,6 +1090,245 @@ test('redeems one start authority, moves reserved ledgers to committed, and quar
   } finally { await h.pool.close(); }
 });
 
+test('runner claim is transport-attested, replay-safe, and remains not-started', async () => {
+  const h = await harness(binding(), {}, runnerSessionAttestor);
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    const redeemed = await h.authority.redeemStartAuthorization(
+      startRedemption(h, reservation, leased.receipt.lease_id),
+    );
+    assert.equal(redeemed.redeemed, true);
+    if (!redeemed.redeemed) return;
+
+    const input = runnerClaim(h, reservation, redeemed.receipt.redemption_id);
+    const first = await h.authority.claimRunnerStart(input);
+    assert.equal(first.claimed, true, first.blockers.join(' '));
+    if (!first.claimed) return;
+    assert.equal(first.receipt.state, 'runner-claimed-not-started');
+    assert.equal(first.receipt.execution_observed, false);
+    assert.equal(first.receipt.dispatch_state, 'not-dispatched');
+    assert.equal(first.receipt.runner_id, h.operation.execution_identity);
+    assert.equal(first.receipt.runtime_id, h.operation.runtime_id);
+
+    const retry = await h.authority.claimRunnerStart(input);
+    assert.equal(retry.claimed, true, retry.blockers.join(' '));
+    if (retry.claimed) assert.deepEqual(retry.receipt, first.receipt);
+    const competing = await h.authority.claimRunnerStart({
+      ...input, claim_request_id: '00000000-0000-4000-8000-000000000402',
+    });
+    assert.equal(competing.claimed, false);
+    assert.match(competing.blockers.join(' '), /different runner claim/i);
+
+    await h.store.revoke(`runner:${h.operation.execution_identity}`, NOW, 'runner identity revoked');
+    const rows = await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(rows[0].state, 'stop-requested');
+    assert.equal(Number(rows[0].committed_usd), 0.25);
+    assert.equal(Number(rows[0].authorized_slots), 1);
+    const audit = JSON.stringify(await h.pool.rows('SELECT event,detail FROM swarm_authority_audit ORDER BY seq'));
+    assert.doesNotMatch(audit, new RegExp(HEARTBEAT_TOKEN));
+    assert.doesNotMatch(audit, new RegExp(CONTROL_TOKEN));
+    const accepted = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-claim-accepted'");
+    assert.equal(accepted.length, 1);
+  } finally { await h.pool.close(); }
+});
+
+test('runner claim defaults closed when no authenticated transport is configured', async () => {
+  const h = await harness();
+  try {
+    const reservation = await reserve(h);
+    const consumed = await h.authority.consume(consumption(h, reservation));
+    assert.equal(consumed.consumed, true);
+    if (!consumed.consumed) return;
+    const leased = await h.authority.leaseStart(startLease(h, reservation, consumed.receipt.consumption_id));
+    assert.equal(leased.leased, true);
+    if (!leased.leased) return;
+    const redeemed = await h.authority.redeemStartAuthorization(
+      startRedemption(h, reservation, leased.receipt.lease_id),
+    );
+    assert.equal(redeemed.redeemed, true);
+    if (!redeemed.redeemed) return;
+    const denied = await h.authority.claimRunnerStart(
+      runnerClaim(h, reservation, redeemed.receipt.redemption_id),
+    );
+    assert.equal(denied.claimed, false);
+    assert.match(denied.blockers.join(' '), /attestor is not configured/i);
+    const rows = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+    assert.equal(rows[0].state, 'start-authorized-not-observed');
+  } finally { await h.pool.close(); }
+});
+
+test('runner claim quarantines expired, revoked, or corrupted committed authority', async (t) => {
+  await t.test('malformed stored revocation binding', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      await h.pool.execute("UPDATE swarm_authority_reservations SET revocation_refs='{}'::jsonb");
+      const denied = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /revocation binding is invalid/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+
+  for (const expiry of ['reservation', 'lease'] as const) {
+    await t.test(`expired ${expiry}`, async () => {
+      const h = await harness(binding(), {}, runnerSessionAttestor);
+      try {
+        const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+        if (expiry === 'reservation') {
+          await h.pool.execute("UPDATE swarm_authority_reservations SET reservation_expires_at=clock_timestamp()-INTERVAL '1 second'");
+        } else {
+          await h.pool.execute(`UPDATE swarm_authority_reservations
+            SET lease_issued_at=clock_timestamp()-(lease_duration_ms*INTERVAL '1 millisecond')-INTERVAL '1 second',
+                lease_expires_at=clock_timestamp()-INTERVAL '1 second'`);
+        }
+        const denied = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+        assert.equal(denied.claimed, false);
+        assert.match(denied.blockers.join(' '), /expired/i);
+        const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+        assert.equal(state[0].state, 'stop-requested');
+      } finally { await h.pool.close(); }
+    });
+  }
+
+  await t.test('relational broker state drift', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      await h.pool.execute("UPDATE swarm_authority_broker_principals SET state='disabled'");
+      const denied = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /broker principal/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+});
+
+test('runner claim expiry is capped by the original transport observation', async () => {
+  const observed = Date.now() - 55_000;
+  const nearlyStale: RunnerSessionAttestor = async () => ({
+    valid: true,
+    session: {
+      runner_id: 'openai-codex-worker', runner_identity_evidence_ref: 'identity-attestation-001',
+      runner_instance_id: 'runner-instance-nearly-stale', runtime_id: 'railway-temporal',
+      host_id: 'trusted-host-001', channel_binding_sha256: '8'.repeat(64),
+      observed_at: new Date(observed).toISOString(),
+      access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+    },
+    blockers: [],
+  });
+  const h = await harness(binding(), {}, nearlyStale);
+  try {
+    const { reservation, redeemed } = await authorizeForRunnerClaim(h, 10_000);
+    const claimed = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+    assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
+    if (claimed.claimed) {
+      assert.ok(Date.parse(claimed.receipt.claim_expires_at) <= observed + 60_000);
+    }
+  } finally { await h.pool.close(); }
+});
+
+test('runner claims reject credential aliasing and quarantine authenticated channel drift', async (t) => {
+  await t.test('heartbeat aliases control credential', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      const denied = await h.authority.claimRunnerStart(runnerClaim(
+        h, reservation, redeemed.receipt.redemption_id, { heartbeat_token: CONTROL_TOKEN },
+      ));
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /invalid/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'start-authorized-not-observed');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('channel binding drifts on exact retry', async () => {
+    let channel = 'a'.repeat(64);
+    const mutableAttestor: RunnerSessionAttestor = async () => ({
+      valid: true,
+      session: {
+        runner_id: 'openai-codex-worker', runner_identity_evidence_ref: 'identity-attestation-001',
+        runner_instance_id: 'runner-instance-mutable', runtime_id: 'railway-temporal',
+        host_id: 'trusted-host-001', channel_binding_sha256: channel,
+        observed_at: new Date().toISOString(),
+        access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+      },
+      blockers: [],
+    });
+    const h = await harness(binding(), {}, mutableAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      const input = runnerClaim(h, reservation, redeemed.receipt.redemption_id);
+      assert.equal((await h.authority.claimRunnerStart(input)).claimed, true);
+      channel = 'b'.repeat(64);
+      const denied = await h.authority.claimRunnerStart(input);
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /drifted/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+});
+
+test('runner claim replay quarantines stored expiry and revocation drift', async (t) => {
+  await t.test('claim expiry is extended beyond its original authority', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      const input = runnerClaim(h, reservation, redeemed.receipt.redemption_id);
+      assert.equal((await h.authority.claimRunnerStart(input)).claimed, true);
+      await h.pool.execute(`UPDATE swarm_authority_reservations SET
+        runner_evidence_observed_at=clock_timestamp(),
+        runner_access_review_expires_at=clock_timestamp()+INTERVAL '1 hour',
+        runner_claim_expires_at=clock_timestamp()+INTERVAL '30 minutes'`);
+      const denied = await h.authority.claimRunnerStart(input);
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /replay evidence drifted/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('stored canonical runner revocations are weakened', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      const input = runnerClaim(h, reservation, redeemed.receipt.redemption_id);
+      assert.equal((await h.authority.claimRunnerStart(input)).claimed, true);
+      await h.pool.execute("UPDATE swarm_authority_reservations SET runner_revocation_refs='[]'::jsonb");
+      const denied = await h.authority.claimRunnerStart(input);
+      assert.equal(denied.claimed, false);
+      assert.match(denied.blockers.join(' '), /revocation binding drifted/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('direct identity revocation does not trust the mutable revocation array', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h);
+      assert.equal((await h.authority.claimRunnerStart(
+        runnerClaim(h, reservation, redeemed.receipt.redemption_id),
+      )).claimed, true);
+      await h.pool.execute("UPDATE swarm_authority_reservations SET runner_revocation_refs='[]'::jsonb");
+      await h.store.revoke(`runner:${h.operation.execution_identity}`, NOW, 'runner revoked after binding drift');
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+});
+
 test('redeems through the exact restricted database role and ignores a temp-shadowed authority table', async () => {
   const h = await harness();
   try {
@@ -1058,6 +1355,11 @@ test('redeems through the exact restricted database role and ignores a temp-shad
     if (redeemed.redeemed) {
       assert.equal(redeemed.receipt.broker_database_role, BROKER_DATABASE_ROLE);
       assert.equal(redeemed.receipt.broker_database_name, databaseName);
+      const restrictedClaimStore = new PostgresOperationAuthorityStore(h.pool, { runnerSessionAttestor });
+      const claimed = await restrictedClaimStore.claimRunnerStart(
+        runnerClaim(h, reservation, redeemed.receipt.redemption_id),
+      );
+      assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
     }
   } finally { await h.pool.close(); }
 });
@@ -1559,7 +1861,7 @@ test('revocation and expiry deny consumption, release resources once, and retain
         binding: h.operation,
         approval_receipt: h.approval,
         budget_receipt: h.budget,
-        reservation_duration_ms: 60_000,
+        reservation_duration_ms: 5 * 60_000,
       });
       assert.equal(replay.admitted, false);
       assert.match(replay.blockers.join(' '), /already reserved/i);

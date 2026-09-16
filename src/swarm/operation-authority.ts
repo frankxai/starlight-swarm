@@ -211,6 +211,27 @@ export const startRedemptionInputSchema = z.object({
 
 export type StartRedemptionInput = z.infer<typeof startRedemptionInputSchema>;
 
+export const runnerClaimInputSchema = z.object({
+  claim_request_id: z.uuid(),
+  reservation_id: z.uuid(),
+  redemption_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  control_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict().superRefine((value, context) => {
+  if (value.control_token === value.heartbeat_token) {
+    context.addIssue({
+      code: 'custom',
+      path: ['heartbeat_token'],
+      message: 'Runner control and heartbeat credentials must be distinct.',
+    });
+  }
+});
+
+export type RunnerClaimInput = z.infer<typeof runnerClaimInputSchema>;
+
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
   cancel_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
@@ -298,6 +319,34 @@ export type StartRedemptionResult =
   | { redeemed: true; receipt: StartRedemptionReceipt; blockers: [] }
   | { redeemed: false; receipt: null; blockers: string[] };
 
+export interface RunnerClaimReceipt {
+  schema_version: 'starlight.runner_claim_acceptance.v1';
+  claim_id: string;
+  claim_request_id: string;
+  reservation_id: string;
+  redemption_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  runner_id: string;
+  runner_identity_evidence_ref: string;
+  runner_instance_id: string;
+  runtime_id: string;
+  host_id: string;
+  channel_binding_sha256: string;
+  accepted_at: string;
+  claim_expires_at: string;
+  heartbeat_token_sha256: string;
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  execution_observed: false;
+  state: 'runner-claimed-not-started';
+}
+
+export type RunnerClaimResult =
+  | { claimed: true; receipt: RunnerClaimReceipt; blockers: [] }
+  | { claimed: false; receipt: null; blockers: string[] };
+
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
   | { cancelled: false; reservation_id: string; state: null | 'expired' | 'stop-requested'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
@@ -313,6 +362,7 @@ export interface OperationAuthorityStore {
   consume(input: ConsumptionInput): Promise<ConsumptionResult>;
   leaseStart(input: StartLeaseInput): Promise<StartLeaseResult>;
   redeemStartAuthorization(input: StartRedemptionInput): Promise<StartRedemptionResult>;
+  claimRunnerStart(input: RunnerClaimInput): Promise<RunnerClaimResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -486,6 +536,17 @@ export class OperationAuthority {
       return { redeemed: false, receipt: null, blockers: ['Start-redemption request is invalid.'] };
     }
     return this.store.redeemStartAuthorization(parsed.data);
+  }
+
+  async claimRunnerStart(input: unknown): Promise<RunnerClaimResult> {
+    if (!this.store.durable) return { claimed: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    const parsed = runnerClaimInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = this.clock();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', Number.isFinite(Date.parse(at)) ? at : new Date().toISOString(), ['Runner claim is invalid.']);
+      return { claimed: false, receipt: null, blockers: ['Runner claim is invalid.'] };
+    }
+    return this.store.claimRunnerStart(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {
