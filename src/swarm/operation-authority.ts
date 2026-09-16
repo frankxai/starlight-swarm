@@ -220,12 +220,14 @@ export const runnerClaimInputSchema = z.object({
   binding_digest_sha256: digest,
   control_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  start_observation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict().superRefine((value, context) => {
-  if (value.control_token === value.heartbeat_token) {
+  const credentials = [value.control_token, value.heartbeat_token, value.start_observation_token];
+  if (new Set(credentials).size !== credentials.length) {
     context.addIssue({
       code: 'custom',
-      path: ['heartbeat_token'],
-      message: 'Runner control and heartbeat credentials must be distinct.',
+      path: ['start_observation_token'],
+      message: 'Runner control, heartbeat, and start-observation credentials must be pairwise distinct.',
     });
   }
 });
@@ -262,6 +264,18 @@ export const runnerHeartbeatExpiryInputSchema = z.object({
 }).strict();
 
 export type RunnerHeartbeatExpiryInput = z.infer<typeof runnerHeartbeatExpiryInputSchema>;
+
+export const runnerStartObservationInputSchema = z.object({
+  observation_request_id: z.uuid(),
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  start_observation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
+export type RunnerStartObservationInput = z.infer<typeof runnerStartObservationInputSchema>;
 
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
@@ -368,6 +382,7 @@ export interface RunnerClaimReceipt {
   accepted_at: string;
   claim_expires_at: string;
   heartbeat_token_sha256: string;
+  start_observation_token_sha256: string;
   transport_state: 'attested-not-deployed';
   dispatch_state: 'not-dispatched';
   execution_observed: false;
@@ -398,8 +413,9 @@ export interface RunnerHeartbeatReceipt {
   heartbeat_token_sha256: string;
   transport_state: 'attested-not-deployed';
   dispatch_state: 'not-dispatched';
-  execution_observed: false;
-  state: 'runner-claimed-not-started';
+  execution_observed: boolean;
+  workload_effect_observed: false;
+  state: 'runner-claimed-not-started' | 'runner-start-observed';
 }
 
 export type RunnerHeartbeatResult =
@@ -407,8 +423,39 @@ export type RunnerHeartbeatResult =
   | { accepted: false; receipt: null; blockers: string[] };
 
 export type RunnerHeartbeatExpiryResult =
-  | { reconciled: true; reservation_id: string; state: 'runner-claimed-not-started' | 'stop-requested'; expired: boolean; blockers: [] }
+  | { reconciled: true; reservation_id: string; state: 'runner-claimed-not-started' | 'runner-start-observed' | 'stop-requested'; expired: boolean; blockers: [] }
   | { reconciled: false; reservation_id: string; state: null; expired: false; blockers: string[] };
+
+export interface RunnerStartObservationReceipt {
+  schema_version: 'starlight.runner_start_observation.v1';
+  observation_id: string;
+  observation_request_id: string;
+  claim_id: string;
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  runner_id: string;
+  runner_instance_id: string;
+  runtime_id: string;
+  host_id: string;
+  channel_binding_sha256: string;
+  process_instance_sha256: string;
+  evidence_ref: string;
+  evidence_sha256: string;
+  process_started_at: string;
+  evidence_observed_at: string;
+  accepted_at: string;
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  execution_observed: true;
+  workload_effect_observed: false;
+  state: 'runner-start-observed';
+}
+
+export type RunnerStartObservationResult =
+  | { observed: true; receipt: RunnerStartObservationReceipt; blockers: [] }
+  | { observed: false; receipt: null; blockers: string[] };
 
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
@@ -428,6 +475,7 @@ export interface OperationAuthorityStore {
   claimRunnerStart(input: RunnerClaimInput): Promise<RunnerClaimResult>;
   acceptRunnerHeartbeat(input: RunnerHeartbeatInput): Promise<RunnerHeartbeatResult>;
   reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult>;
+  observeRunnerStart(input: RunnerStartObservationInput): Promise<RunnerStartObservationResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -634,6 +682,19 @@ export class OperationAuthority {
       return { reconciled: false, reservation_id: parsed.data.reservation_id, state: null, expired: false, blockers: ['A durable authority store is required.'] };
     }
     return this.store.reconcileRunnerHeartbeatExpiry(parsed.data);
+  }
+
+  async observeRunnerStart(input: unknown): Promise<RunnerStartObservationResult> {
+    const parsed = runnerStartObservationInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = new Date().toISOString();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', at, ['Runner start observation is invalid.']);
+      return { observed: false, receipt: null, blockers: ['Runner start observation is invalid.'] };
+    }
+    if (!this.store.durable) {
+      return { observed: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    }
+    return this.store.observeRunnerStart(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {
