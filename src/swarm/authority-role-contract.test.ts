@@ -106,6 +106,7 @@ test('the restricted role can execute the redemption SQL surface but not control
       SELECT * FROM swarm_authority_broker_principals;
       SELECT * FROM swarm_authority_reservations FOR UPDATE;
       SELECT * FROM swarm_authority_hosts FOR UPDATE;
+      SELECT * FROM swarm_authority_heartbeat_tokens;
       SELECT * FROM swarm_authority_budgets FOR UPDATE;
       SELECT * FROM swarm_authority_budget_windows FOR UPDATE;
       SELECT * FROM swarm_authority_prepared_operations;
@@ -120,13 +121,22 @@ test('the restricted role can execute the redemption SQL surface but not control
         runner_id=runner_id,runner_identity_evidence_ref=runner_identity_evidence_ref,
         runner_instance_id=runner_instance_id,runner_runtime_id=runner_runtime_id,
         runner_host_id=runner_host_id,runner_channel_binding_sha256=runner_channel_binding_sha256,
-        heartbeat_token_sha256=heartbeat_token_sha256,runner_revocation_refs=runner_revocation_refs
+        heartbeat_token_sha256=heartbeat_token_sha256,runner_revocation_refs=runner_revocation_refs,
+        runner_heartbeat_id=runner_heartbeat_id,
+        runner_heartbeat_request_id=runner_heartbeat_request_id,
+        runner_heartbeat_sequence=runner_heartbeat_sequence,
+        runner_heartbeat_accepted_at=runner_heartbeat_accepted_at,
+        runner_heartbeat_presented_token_sha256=runner_heartbeat_presented_token_sha256
       WHERE FALSE;
       UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots WHERE FALSE;
       UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd WHERE FALSE;
       UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd WHERE FALSE;
       INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
         VALUES ('denied','role-contract-test',repeat('0',64),clock_timestamp(),'{}'::jsonb);
+      INSERT INTO swarm_authority_heartbeat_tokens
+        (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
+        VALUES (repeat('f',64),'00000000-0000-4000-8000-000000000001',0,
+          '00000000-0000-4000-8000-000000000002',clock_timestamp(),'claim');
       ROLLBACK;`);
     await assert.rejects(
       db.query("UPDATE swarm_authority_prepared_operations SET state='cancelled'"),
