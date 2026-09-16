@@ -51,8 +51,19 @@ export interface Worker {
   run(task: Task, vault: SisVaultMcp): Promise<WorkerReport>;
 }
 
-/** Factory for a stateless dry-run worker. */
-export function makeWorker(name: string, stream: StreamId, skill: string): Worker {
+/**
+ * Factory for a stateless dry-run worker.
+ *
+ * `clock` is injectable so a dry-run can be byte-reproducible: a wall-clock
+ * timestamp in the only field a worker writes is enough to make every run
+ * differ, which costs the runtime its ability to diff one run against the next.
+ */
+export function makeWorker(
+  name: string,
+  stream: StreamId,
+  skill: string,
+  clock: () => string = () => new Date().toISOString(),
+): Worker {
   return {
     name,
     stream,
@@ -63,7 +74,7 @@ export function makeWorker(name: string, stream: StreamId, skill: string): Worke
         stream,
         task: task.id,
         note: `worker drafted: ${task.description}`,
-        timestamp: new Date().toISOString(),
+        timestamp: clock(),
       };
       // Append-only memory write — the only side effect a worker is allowed.
       await vault.sis_append_entry(entry);
