@@ -5,6 +5,8 @@ import {
   consumptionInputSchema,
   operationBindingSchema,
   runnerClaimInputSchema,
+  runnerHeartbeatExpiryInputSchema,
+  runnerHeartbeatInputSchema,
   startLeaseInputSchema,
   startRedemptionInputSchema,
 } from './operation-authority';
@@ -28,6 +30,11 @@ import type {
   RunnerClaimInput,
   RunnerClaimReceipt,
   RunnerClaimResult,
+  RunnerHeartbeatInput,
+  RunnerHeartbeatExpiryInput,
+  RunnerHeartbeatExpiryResult,
+  RunnerHeartbeatReceipt,
+  RunnerHeartbeatResult,
   StartLeaseInput,
   StartLeaseReceipt,
   StartLeaseResult,
@@ -199,14 +206,24 @@ CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
   runner_instance_id TEXT, runner_runtime_id TEXT, runner_host_id TEXT,
   runner_channel_binding_sha256 CHAR(64), heartbeat_token_sha256 CHAR(64),
   runner_revocation_refs JSONB,
+  runner_heartbeat_id UUID, runner_heartbeat_request_id UUID UNIQUE,
+  runner_heartbeat_sequence INTEGER, runner_heartbeat_accepted_at TIMESTAMPTZ,
+  runner_heartbeat_presented_token_sha256 CHAR(64),
   state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','stop-requested','cancelled','expired'))
+);
+CREATE TABLE IF NOT EXISTS swarm_authority_heartbeat_tokens (
+  token_sha256 CHAR(64) PRIMARY KEY, reservation_id UUID NOT NULL,
+  sequence INTEGER NOT NULL CHECK (sequence >= 0),
+  issued_by_request_id UUID NOT NULL, issued_at TIMESTAMPTZ NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('claim','heartbeat')),
+  UNIQUE (reservation_id,sequence)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
   reservation_id UUID NOT NULL, window_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL CHECK (reserved_cost_usd >= 0),
   PRIMARY KEY (reservation_id,window_id)
 );
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -257,6 +274,58 @@ ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_host_id
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_channel_binding_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS heartbeat_token_sha256 CHAR(64);
 ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_revocation_refs JSONB;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_request_id UUID;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_sequence INTEGER;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_accepted_at TIMESTAMPTZ;
+ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_presented_token_sha256 CHAR(64);
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_heartbeat_request_unique
+  ON swarm_authority_reservations (runner_heartbeat_request_id)
+  WHERE runner_heartbeat_request_id IS NOT NULL;
+
+-- A grant-contract digest change cannot silently inherit an already-authorized
+-- runner. Quarantine existing positive authority and retain committed ledgers
+-- until a separately reviewed recovery path exists.
+WITH quarantined AS (
+  UPDATE swarm_authority_reservations SET state='stop-requested'
+  WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started')
+    AND broker_role_contract_sha256 IS DISTINCT FROM '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
+  RETURNING reservation_id,operation_id,binding_digest_sha256
+)
+INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+SELECT 'stop-requested',operation_id,binding_digest_sha256,clock_timestamp(),
+  jsonb_build_object('reservation_id',reservation_id,'reason','broker role contract changed during migration',
+    'execution_state','unknown','released_cost_usd',0)
+FROM quarantined;
+
+INSERT INTO swarm_authority_heartbeat_tokens
+  (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
+SELECT heartbeat_token_sha256,reservation_id,COALESCE(runner_heartbeat_sequence,0),
+  COALESCE(runner_heartbeat_request_id,runner_claim_request_id),
+  COALESCE(runner_heartbeat_accepted_at,runner_claim_accepted_at),
+  CASE WHEN runner_heartbeat_sequence IS NULL THEN 'claim' ELSE 'heartbeat' END
+FROM swarm_authority_reservations r
+WHERE heartbeat_token_sha256 IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM swarm_authority_heartbeat_tokens t
+    WHERE t.token_sha256=r.heartbeat_token_sha256
+  );
+
+DO $heartbeat_token_integrity$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM swarm_authority_reservations r
+    LEFT JOIN swarm_authority_heartbeat_tokens t
+      ON t.token_sha256=r.heartbeat_token_sha256
+    WHERE r.heartbeat_token_sha256 IS NOT NULL AND (
+      t.token_sha256 IS NULL OR t.reservation_id<>r.reservation_id
+      OR t.sequence<>COALESCE(r.runner_heartbeat_sequence,0)
+    )
+  ) THEN
+    RAISE EXCEPTION 'current heartbeat credential history is missing or inconsistent';
+  END IF;
+END
+$heartbeat_token_integrity$;
 
 DO $migration$
 BEGIN
@@ -675,18 +744,38 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
     AND heartbeat_token_sha256 <> redemption_token_sha256
     AND heartbeat_token_sha256 <> control_token_sha256
     AND jsonb_typeof(runner_revocation_refs) = 'array'
+    AND (num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
+      runner_heartbeat_sequence,runner_heartbeat_accepted_at,
+      runner_heartbeat_presented_token_sha256)=0 OR (
+      num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
+        runner_heartbeat_sequence,runner_heartbeat_accepted_at,
+        runner_heartbeat_presented_token_sha256)=5
+      AND runner_heartbeat_sequence >= 1
+      AND runner_heartbeat_accepted_at >= runner_claim_accepted_at
+      AND runner_claim_expires_at > runner_heartbeat_accepted_at
+      AND runner_heartbeat_presented_token_sha256 <> heartbeat_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> consume_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> cancel_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> lease_claim_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> redemption_token_sha256
+      AND runner_heartbeat_presented_token_sha256 <> control_token_sha256
+    ))
   ))
   AND (state NOT IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','cancelled','expired') OR
     num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
       runner_evidence_observed_at,runner_access_review_expires_at,
       runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
       runner_channel_binding_sha256,heartbeat_token_sha256,runner_revocation_refs)=0)
+  AND (state IN ('runner-claimed-not-started','stop-requested') OR
+    num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
+      runner_heartbeat_sequence,runner_heartbeat_accepted_at,
+      runner_heartbeat_presented_token_sha256)=0)
 );
 ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
   CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','stop-requested','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
 `;
 
 interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
@@ -700,6 +789,7 @@ export interface PostgresOperationAuthorityOptions {
   maxBrokerEvidenceAgeMs?: number;
   brokerSessionAttestor?: BrokerDatabaseSessionAttestor;
   maxRunnerEvidenceAgeMs?: number;
+  minRunnerHeartbeatIntervalMs?: number;
   runnerSessionAttestor?: RunnerSessionAttestor;
 }
 
@@ -721,6 +811,10 @@ function startRedemptionDenied(blocker: string): StartRedemptionResult {
 
 function runnerClaimDenied(blocker: string): RunnerClaimResult {
   return { claimed: false, receipt: null, blockers: [blocker] };
+}
+
+function runnerHeartbeatDenied(blocker: string): RunnerHeartbeatResult {
+  return { accepted: false, receipt: null, blockers: [blocker] };
 }
 
 function cancellationDenied(
@@ -767,6 +861,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   private readonly maxBrokerEvidenceAgeMs: number;
   private readonly brokerSessionAttestor: BrokerDatabaseSessionAttestor;
   private readonly maxRunnerEvidenceAgeMs: number;
+  private readonly minRunnerHeartbeatIntervalMs: number;
   private readonly runnerSessionAttestor: RunnerSessionAttestor;
 
   constructor(
@@ -783,6 +878,11 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     if (!Number.isInteger(this.maxRunnerEvidenceAgeMs)
       || this.maxRunnerEvidenceAgeMs < 1_000 || this.maxRunnerEvidenceAgeMs > 5 * 60_000) {
       throw new Error('Runner evidence age ceiling must be between 1 second and 5 minutes.');
+    }
+    this.minRunnerHeartbeatIntervalMs = options.minRunnerHeartbeatIntervalMs ?? 1_000;
+    if (!Number.isInteger(this.minRunnerHeartbeatIntervalMs)
+      || this.minRunnerHeartbeatIntervalMs < 1_000 || this.minRunnerHeartbeatIntervalMs > 60_000) {
+      throw new Error('Runner heartbeat interval must be between 1 second and 1 minute.');
     }
     this.runnerSessionAttestor = options.runnerSessionAttestor ?? denyUnconfiguredRunnerSession;
   }
@@ -829,6 +929,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     const trusted = hostEvidenceSchema.parse(evidence);
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
+      const transactionAt = await wallClock(client);
       await client.query(
         `INSERT INTO swarm_authority_hosts (host_id,evidence,observed_at,capacity_slots,reserved_slots,authorized_slots)
          VALUES ($1,$2::jsonb,$3::timestamptz,$4,0,0)
@@ -836,6 +939,31 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
          observed_at=EXCLUDED.observed_at, capacity_slots=EXCLUDED.capacity_slots`,
         [trusted.host_id, JSON.stringify(trusted), trusted.observed_at, trusted.capacity_slots],
       );
+      const quarantined = await client.query(
+        `UPDATE swarm_authority_reservations SET state='stop-requested'
+         WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started')
+           AND ($2 <> 'ready' OR $3::boolean=FALSE OR $4::timestamptz <= $5::timestamptz
+             OR $4::timestamptz > $5::timestamptz+INTERVAL '1 minute'
+             OR $5::timestamptz-$4::timestamptz > max_host_evidence_age_ms*INTERVAL '1 millisecond'
+             OR NOT (binding->'capabilities' <@ $6::jsonb))
+         RETURNING reservation_id,operation_id,binding_digest_sha256`,
+        [trusted.host_id, trusted.status, trusted.secret_readiness, trusted.observed_at,
+          transactionAt, JSON.stringify(trusted.allowed_capabilities)],
+      );
+      for (const row of quarantined.rows) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
+            reservation_id: row.reservation_id, reason: 'host evidence became unavailable or drifted',
+            host_id: trusted.host_id, execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
     } finally { client.release?.(); }
   }
 
@@ -2333,6 +2461,18 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         if (!storedRunnerRefs.success || JSON.stringify(storedRunnerRefs.data) !== JSON.stringify(refs.data)) {
           return await quarantine('runner revocation binding drifted on claim retry', 'Runner revocation binding drifted on the claim retry.');
         }
+        const tokenHistory = await client.query(
+          `SELECT reservation_id,sequence,issued_by_request_id,kind
+           FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1`,
+          [heartbeatDigest],
+        );
+        if (tokenHistory.rows.length !== 1
+          || tokenHistory.rows[0].reservation_id !== request.reservation_id
+          || Number(tokenHistory.rows[0].sequence) !== 0
+          || tokenHistory.rows[0].issued_by_request_id !== request.claim_request_id
+          || tokenHistory.rows[0].kind !== 'claim') {
+          return await quarantine('initial heartbeat credential history drifted on claim retry', 'Initial heartbeat credential history drifted on the claim retry.');
+        }
       }
       const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
       if (revoked.rows.length) return await quarantine(
@@ -2434,6 +2574,11 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         [request.claim_request_id],
       );
       if (duplicate.rows.length) return await deny('Runner claim request id is already bound to another reservation.');
+      const duplicateHeartbeatToken = await client.query(
+        'SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1 LIMIT 1',
+        [heartbeatDigest],
+      );
+      if (duplicateHeartbeatToken.rows.length) return await deny('Heartbeat credential was already issued.');
       const claimId = randomUUID();
       const transitioned = await client.query(
         `UPDATE swarm_authority_reservations SET state='runner-claimed-not-started',
@@ -2449,6 +2594,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           heartbeatDigest, JSON.stringify(refs.data)],
       );
       if (transitioned.rows.length !== 1) return await deny('Runner claim could not be accepted exactly once.');
+      await client.query(
+        `INSERT INTO swarm_authority_heartbeat_tokens
+         (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
+         VALUES ($1,$2::uuid,0,$3::uuid,$4::timestamptz,'claim')`,
+        [heartbeatDigest, request.reservation_id, request.claim_request_id, at],
+      );
       const receipt = receiptFrom(transitioned.rows[0]);
       await client.query(
         `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
@@ -2462,6 +2613,454 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
         action: 'claim-runner-start', reservation_id: request.reservation_id,
         error: error instanceof Error ? error.message : 'unknown runner-claim failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
+  }
+
+  async acceptRunnerHeartbeat(input: RunnerHeartbeatInput): Promise<RunnerHeartbeatResult> {
+    const parsed = runnerHeartbeatInputSchema.safeParse(input);
+    if (!parsed.success) return runnerHeartbeatDenied('Runner heartbeat is invalid.');
+    const request = parsed.data;
+    const client = await this.pool.connect();
+    let at = new Date().toISOString();
+    const deny = async (blocker: string): Promise<RunnerHeartbeatResult> => {
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-heartbeat-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+          reservation_id: request.reservation_id, claim_id: request.claim_id,
+          heartbeat_request_id: request.heartbeat_request_id,
+          heartbeat_sequence: request.heartbeat_sequence, blockers: [blocker],
+        })],
+      );
+      await client.query('COMMIT');
+      return runnerHeartbeatDenied(blocker);
+    };
+    const receiptFrom = (row: Record<string, unknown>): RunnerHeartbeatReceipt => ({
+      schema_version: 'starlight.runner_heartbeat_acceptance.v1',
+      heartbeat_id: String(row.runner_heartbeat_id),
+      heartbeat_request_id: String(row.runner_heartbeat_request_id),
+      heartbeat_sequence: Number(row.runner_heartbeat_sequence),
+      claim_id: request.claim_id,
+      reservation_id: request.reservation_id,
+      operation_id: request.operation_id,
+      effect_id: request.effect_id,
+      binding_digest_sha256: request.binding_digest_sha256,
+      runner_id: String(row.runner_id),
+      runner_instance_id: String(row.runner_instance_id),
+      runtime_id: String(row.runner_runtime_id),
+      host_id: String(row.runner_host_id),
+      channel_binding_sha256: String(row.runner_channel_binding_sha256),
+      accepted_at: sqlInstant(row.runner_heartbeat_accepted_at),
+      claim_expires_at: sqlInstant(row.runner_claim_expires_at),
+      heartbeat_token_sha256: String(row.heartbeat_token_sha256),
+      transport_state: 'attested-not-deployed',
+      dispatch_state: 'not-dispatched',
+      execution_observed: false,
+      state: 'runner-claimed-not-started',
+    });
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
+      at = await wallClock(client);
+      const nowMs = Date.parse(at);
+
+      const brokerAttestation = await this.brokerSessionAttestor(client);
+      if (!brokerAttestation.valid) {
+        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
+      }
+      const runnerAttestation = await this.runnerSessionAttestor(client);
+      if (!runnerAttestation.valid) {
+        return await deny(`Runner transport session is not authorized: ${runnerAttestation.blockers.join(' ')}`);
+      }
+      const parsedRunner = runnerSessionSchema.safeParse(runnerAttestation.session);
+      if (!parsedRunner.success) return await deny('Runner transport attestation is malformed.');
+      const runner = parsedRunner.data;
+      const runnerObservedMs = Date.parse(runner.observed_at);
+      if (runnerObservedMs > nowMs + 60_000 || nowMs - runnerObservedMs > this.maxRunnerEvidenceAgeMs) {
+        return await deny('Runner transport attestation is stale or from the future.');
+      }
+      if (Date.parse(runner.access_review_expires_at) <= nowMs) {
+        return await deny('Runner transport access review is expired.');
+      }
+
+      const heartbeatDigest = createHash('sha256').update(request.heartbeat_token, 'utf8').digest('hex');
+      const nextHeartbeatDigest = createHash('sha256').update(request.next_heartbeat_token, 'utf8').digest('hex');
+      const found = await client.query(
+        `SELECT *,
+                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
+         FROM swarm_authority_reservations
+         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid FOR UPDATE`,
+        [request.reservation_id, request.claim_id],
+      );
+      const row = found.rows[0];
+      if (!row) return await deny('Runner claim does not exist.');
+      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
+        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await deny('Runner heartbeat does not match the claimed operation.');
+      }
+      const exactRequest = row.state === 'runner-claimed-not-started'
+        && row.runner_heartbeat_request_id === request.heartbeat_request_id
+        && Number(row.runner_heartbeat_sequence) === request.heartbeat_sequence;
+      const quarantine = async (reason: string, blocker: string): Promise<RunnerHeartbeatResult> => {
+        const stopped = await client.query(
+          `UPDATE swarm_authority_reservations SET state='stop-requested'
+           WHERE reservation_id=$1::uuid AND state='runner-claimed-not-started' RETURNING reservation_id`,
+          [request.reservation_id],
+        );
+        if (stopped.rows.length !== 1) return await deny('Runner-heartbeat quarantine lost its authority race.');
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+            reservation_id: request.reservation_id, claim_id: request.claim_id, reason,
+            execution_state: 'unknown', released_cost_usd: 0,
+          })],
+        );
+        await client.query('COMMIT');
+        return runnerHeartbeatDenied(blocker);
+      };
+      if (row.state !== 'runner-claimed-not-started') {
+        return await deny(`Runner heartbeat cannot be accepted from state ${String(row.state)}.`);
+      }
+
+      const binding = operationBindingSchema.safeParse(row.binding);
+      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
+        return await quarantine('stored binding invalid before runner heartbeat', 'Stored reservation binding or signed cost is invalid.');
+      }
+      const fixedAuthorityCapMs = Math.min(
+        Date.parse(String(row.reservation_expires_at)),
+        Date.parse(String(row.lease_expires_at)),
+        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
+      );
+      const currentEvidenceObservedMs = Date.parse(String(row.runner_evidence_observed_at));
+      const currentAccessReviewExpiresMs = Date.parse(String(row.runner_access_review_expires_at));
+      const currentClaimExpiryMs = Date.parse(String(row.runner_claim_expires_at));
+      const currentAuthorityCapMs = Math.min(
+        currentAccessReviewExpiresMs,
+        currentEvidenceObservedMs + this.maxRunnerEvidenceAgeMs,
+        fixedAuthorityCapMs,
+      );
+      if (!Number.isFinite(currentAuthorityCapMs) || currentClaimExpiryMs !== currentAuthorityCapMs) {
+        return await quarantine('stored runner heartbeat authority drifted', 'Stored runner heartbeat authority drifted.');
+      }
+      if (currentClaimExpiryMs <= nowMs) {
+        return await quarantine('runner heartbeat authority expired', 'Runner heartbeat authority expired before renewal.');
+      }
+      const storedCredentialDigests = [
+        row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
+        row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
+      ];
+      if (storedCredentialDigests.some((digest) => typeof digest !== 'string')
+        || new Set(storedCredentialDigests).size !== storedCredentialDigests.length
+        || (row.runner_heartbeat_presented_token_sha256 !== null
+          && (typeof row.runner_heartbeat_presented_token_sha256 !== 'string'
+            || storedCredentialDigests.includes(row.runner_heartbeat_presented_token_sha256)))) {
+        return await quarantine('stored lifecycle credential separation drifted', 'Stored lifecycle credential separation drifted.');
+      }
+      const storedSequence = row.runner_heartbeat_sequence === null ? 0 : Number(row.runner_heartbeat_sequence);
+      const currentTokenHistory = await client.query(
+        `SELECT reservation_id,sequence,issued_by_request_id,kind
+         FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1`,
+        [row.heartbeat_token_sha256],
+      );
+      if (!Number.isSafeInteger(storedSequence) || currentTokenHistory.rows.length !== 1
+        || currentTokenHistory.rows[0].reservation_id !== request.reservation_id
+        || Number(currentTokenHistory.rows[0].sequence) !== storedSequence) {
+        return await quarantine('current heartbeat credential history drifted', 'Current heartbeat credential history drifted.');
+      }
+      if (runner.runner_id !== binding.data.execution_identity
+        || runner.runner_identity_evidence_ref !== binding.data.identity_evidence_ref
+        || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id
+        || row.runner_id !== runner.runner_id
+        || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
+        || row.runner_instance_id !== runner.runner_instance_id
+        || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
+        || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256) {
+        return await quarantine('runner identity or channel drifted before heartbeat', 'Runner identity, placement, or channel drifted before heartbeat.');
+      }
+      if (row.broker_database_role !== brokerAttestation.session.database_role
+        || row.broker_database_name !== brokerAttestation.session.database_name
+        || row.broker_role_contract_sha256 !== brokerAttestation.session.contract_digest_sha256
+        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
+        return await quarantine('authenticated broker principal drifted before heartbeat', 'Authenticated broker principal drifted before heartbeat.');
+      }
+      const principal = await client.query(
+        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
+                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
+         FROM swarm_authority_broker_principals
+         WHERE database_role=$1 AND database_name=$2`,
+        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
+      );
+      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principal.rows[0]?.evidence);
+      const principalRow = principal.rows[0];
+      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
+        && principalEvidence.data.database_role === principalRow.database_role
+        && principalEvidence.data.database_name === principalRow.database_name
+        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
+        && principalEvidence.data.authn_kind === principalRow.authn_kind
+        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
+        && principalEvidence.data.state === principalRow.state
+        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
+        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
+        && principalEvidence.data.state === 'ready'
+        && principalEvidence.data.database_role === brokerAttestation.session.database_role
+        && principalEvidence.data.database_name === brokerAttestation.session.database_name
+        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
+        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
+        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
+        && Date.parse(principalEvidence.data.observed_at) <= nowMs + 60_000
+        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
+        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
+      if (!principalCurrent) {
+        return await quarantine('broker principal unavailable before heartbeat', 'Broker principal is unavailable, stale, disabled, or drifted.');
+      }
+
+      const storedOperationRefs = revocationRefsSchema.safeParse(row.revocation_refs);
+      const storedRunnerRefs = revocationRefsSchema.safeParse(row.runner_revocation_refs);
+      if (!storedOperationRefs.success || !storedRunnerRefs.success) {
+        return await quarantine('stored revocation binding invalid before heartbeat', 'Stored revocation binding is invalid.');
+      }
+      const refs = revocationRefsSchema.safeParse([
+        ...storedOperationRefs.data,
+        `runner:${runner.runner_id}`, `runner-instance:${runner.runner_instance_id}`,
+        `identity:${runner.runner_identity_evidence_ref}`, `channel:${runner.channel_binding_sha256}`,
+      ]);
+      if (!refs.success || JSON.stringify(refs.data) !== JSON.stringify(storedRunnerRefs.data)) {
+        return await quarantine('runner revocation binding drifted before heartbeat', 'Runner revocation binding drifted before heartbeat.');
+      }
+      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
+      if (revoked.rows.length) {
+        return await quarantine('runner or operation authority revoked before heartbeat', 'Runner or operation authority is revoked.');
+      }
+      const prepared = await client.query(
+        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
+        [request.operation_id],
+      );
+      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
+        return await quarantine('prepared operation unavailable before heartbeat', 'Prepared operation is unavailable or drifted.');
+      }
+      const hostResult = await client.query(
+        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
+                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
+                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS reconciles
+         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
+      );
+      const host = hostEvidence(hostResult.rows[0]);
+      if (!host || host.status !== 'ready' || !host.secret_readiness || host.host_id !== runner.host_id
+        || host.capacity_slots !== Number(hostResult.rows[0]?.capacity_slots)
+        || hostResult.rows[0]?.reconciles !== true
+        || Date.parse(host.observed_at) > nowMs + 60_000
+        || nowMs - Date.parse(host.observed_at) > Number(row.max_host_evidence_age_ms)
+        || Date.parse(host.access_review_expires_at) <= nowMs
+        || binding.data.capabilities.some((capability) => !host.allowed_capabilities.includes(capability))) {
+        return await quarantine('host authority unavailable before heartbeat', 'Host authority is unavailable, stale, or inconsistent.');
+      }
+      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
+        return await quarantine('aggregate budget invalid before heartbeat', 'Aggregate budget authority is missing or inconsistent.');
+      }
+      const budget = await client.query(
+        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
+                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
+                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','stop-requested'))) AS reconciles,
+                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
+         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
+      );
+      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true || budget.rows[0].within_ceiling !== true) {
+        return await quarantine('receipt budget invalid before heartbeat', 'Receipt budget authority is missing or inconsistent.');
+      }
+
+      const freshClaimExpiryMs = Math.min(
+        Date.parse(runner.access_review_expires_at),
+        runnerObservedMs + this.maxRunnerEvidenceAgeMs,
+        fixedAuthorityCapMs,
+      );
+      if (!Number.isFinite(freshClaimExpiryMs) || freshClaimExpiryMs <= nowMs) {
+        return await quarantine('runner heartbeat had no valid authority interval', 'Runner heartbeat would have no valid authority interval.');
+      }
+      if (exactRequest) {
+        const presentedTokenHistory = await client.query(
+          `SELECT reservation_id,sequence FROM swarm_authority_heartbeat_tokens
+           WHERE token_sha256=$1`,
+          [heartbeatDigest],
+        );
+        if (row.runner_heartbeat_presented_token_sha256 !== heartbeatDigest
+          || row.heartbeat_token_sha256 !== nextHeartbeatDigest
+          || presentedTokenHistory.rows.length !== 1
+          || presentedTokenHistory.rows[0].reservation_id !== request.reservation_id
+          || Number(presentedTokenHistory.rows[0].sequence) !== request.heartbeat_sequence - 1
+          || currentClaimExpiryMs > freshClaimExpiryMs) {
+          return await quarantine('runner heartbeat replay evidence drifted', 'Runner heartbeat replay evidence drifted.');
+        }
+        const receipt = receiptFrom(row);
+        await client.query('COMMIT');
+        return { accepted: true, receipt, blockers: [] };
+      }
+      if (row.runner_heartbeat_request_id === request.heartbeat_request_id) {
+        return await quarantine('runner heartbeat request replay drifted', 'Runner heartbeat request replay drifted.');
+      }
+      const priorSequence = storedSequence;
+      if (!Number.isSafeInteger(priorSequence) || request.heartbeat_sequence !== priorSequence + 1) {
+        return await deny('Runner heartbeat sequence is stale, skipped, or already consumed.');
+      }
+      if (row.heartbeat_token_sha256 !== heartbeatDigest) {
+        return await deny('Runner heartbeat credential is invalid or already rotated.');
+      }
+      const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
+        row.redemption_token_sha256, row.control_token_sha256, heartbeatDigest];
+      if (lifecycleDigests.includes(nextHeartbeatDigest)) {
+        return await deny('Next heartbeat credential aliases an existing lifecycle credential.');
+      }
+      if (freshClaimExpiryMs <= currentClaimExpiryMs) {
+        return await deny('Fresh heartbeat evidence does not extend the live authority interval.');
+      }
+      const claimAcceptedMs = Date.parse(String(row.runner_claim_accepted_at));
+      const maxHeartbeatSequence = Math.max(
+        1,
+        Math.ceil((fixedAuthorityCapMs - claimAcceptedMs) / this.minRunnerHeartbeatIntervalMs),
+      );
+      if (!Number.isFinite(claimAcceptedMs) || request.heartbeat_sequence > maxHeartbeatSequence) {
+        return await deny('Runner heartbeat exceeds the fixed authority resource bound.');
+      }
+      const duplicateRequest = await client.query(
+        'SELECT reservation_id FROM swarm_authority_reservations WHERE runner_heartbeat_request_id=$1::uuid LIMIT 1',
+        [request.heartbeat_request_id],
+      );
+      if (duplicateRequest.rows.length) return await deny('Runner heartbeat request id is already bound to another reservation.');
+      const duplicateToken = await client.query(
+        'SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1 LIMIT 1',
+        [nextHeartbeatDigest],
+      );
+      if (duplicateToken.rows.length) return await deny('Next heartbeat credential was already issued.');
+      if (priorSequence > 0) {
+        const priorAcceptedMs = Date.parse(String(row.runner_heartbeat_accepted_at));
+        if (!Number.isFinite(priorAcceptedMs)) {
+          return await quarantine('stored runner heartbeat acceptance time drifted', 'Stored runner heartbeat acceptance time drifted.');
+        }
+        if (nowMs - priorAcceptedMs < this.minRunnerHeartbeatIntervalMs) {
+          // A predictable throttle denial must not itself create an unbounded audit stream.
+          await client.query('COMMIT');
+          return runnerHeartbeatDenied('Runner heartbeat arrived before the server-owned minimum interval.');
+        }
+      }
+
+      const heartbeatId = randomUUID();
+      const transitioned = await client.query(
+        `UPDATE swarm_authority_reservations SET
+           runner_heartbeat_id=$2::uuid,runner_heartbeat_request_id=$3::uuid,
+           runner_heartbeat_sequence=$4,runner_heartbeat_accepted_at=$5::timestamptz,
+           runner_heartbeat_presented_token_sha256=$6,heartbeat_token_sha256=$7,
+           runner_claim_expires_at=$8::timestamptz,runner_evidence_observed_at=$9::timestamptz,
+           runner_access_review_expires_at=$10::timestamptz,runner_revocation_refs=$11::jsonb
+         WHERE reservation_id=$1::uuid AND state='runner-claimed-not-started'
+           AND heartbeat_token_sha256=$6 RETURNING *`,
+        [request.reservation_id, heartbeatId, request.heartbeat_request_id, request.heartbeat_sequence, at,
+          heartbeatDigest, nextHeartbeatDigest, new Date(freshClaimExpiryMs).toISOString(),
+          runner.observed_at, runner.access_review_expires_at, JSON.stringify(refs.data)],
+      );
+      if (transitioned.rows.length !== 1) return await deny('Runner heartbeat could not be accepted exactly once.');
+      await client.query(
+        `INSERT INTO swarm_authority_heartbeat_tokens
+         (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
+         VALUES ($1,$2::uuid,$3,$4::uuid,$5::timestamptz,'heartbeat')`,
+        [nextHeartbeatDigest, request.reservation_id, request.heartbeat_sequence,
+          request.heartbeat_request_id, at],
+      );
+      const receipt = receiptFrom(transitioned.rows[0]);
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('runner-heartbeat-accepted',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
+      );
+      await client.query('COMMIT');
+      return { accepted: true, receipt, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'accept-runner-heartbeat', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown runner-heartbeat failure',
+      });
+      throw error;
+    } finally { client.release?.(); }
+  }
+
+  async reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult> {
+    const parsed = runnerHeartbeatExpiryInputSchema.safeParse(input);
+    if (!parsed.success) {
+      return { reconciled: false, reservation_id: String(input?.reservation_id ?? 'invalid-reservation'), state: null, expired: false, blockers: ['Runner heartbeat expiry request is invalid.'] };
+    }
+    const request = parsed.data;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
+      const at = await wallClock(client);
+      const nowMs = Date.parse(at);
+      const found = await client.query(
+        `SELECT reservation_id,operation_id,binding_digest_sha256,state,runner_claim_expires_at,
+                runner_evidence_observed_at,runner_access_review_expires_at,reservation_expires_at,
+                lease_expires_at,start_authorized_at,binding
+         FROM swarm_authority_reservations
+         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid FOR UPDATE`,
+        [request.reservation_id, request.claim_id],
+      );
+      const row = found.rows[0];
+      if (!row || row.operation_id !== request.operation_id
+        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
+        await client.query('COMMIT');
+        return { reconciled: false, reservation_id: request.reservation_id, state: null, expired: false, blockers: ['Runner claim does not exist or does not match the expiry request.'] };
+      }
+      if (row.state === 'stop-requested') {
+        await client.query('COMMIT');
+        return { reconciled: true, reservation_id: request.reservation_id, state: 'stop-requested', expired: true, blockers: [] };
+      }
+      if (row.state !== 'runner-claimed-not-started') {
+        await client.query('COMMIT');
+        return { reconciled: false, reservation_id: request.reservation_id, state: null, expired: false, blockers: [`Runner heartbeat expiry cannot be reconciled from state ${String(row.state)}.`] };
+      }
+      const binding = operationBindingSchema.safeParse(row.binding);
+      const expiryMs = Date.parse(String(row.runner_claim_expires_at));
+      const authorityCapMs = binding.success ? Math.min(
+        Date.parse(String(row.runner_access_review_expires_at)),
+        Date.parse(String(row.runner_evidence_observed_at)) + this.maxRunnerEvidenceAgeMs,
+        Date.parse(String(row.reservation_expires_at)),
+        Date.parse(String(row.lease_expires_at)),
+        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
+      ) : Number.NaN;
+      const invalidOrExpired = !binding.success
+        || sha256Digest(binding.data) !== row.binding_digest_sha256
+        || !Number.isFinite(authorityCapMs)
+        || expiryMs !== authorityCapMs
+        || expiryMs <= nowMs;
+      if (!invalidOrExpired) {
+        await client.query('COMMIT');
+        return { reconciled: true, reservation_id: request.reservation_id, state: 'runner-claimed-not-started', expired: false, blockers: [] };
+      }
+      const stopped = await client.query(
+        `UPDATE swarm_authority_reservations SET state='stop-requested'
+         WHERE reservation_id=$1::uuid AND state='runner-claimed-not-started' RETURNING reservation_id`,
+        [request.reservation_id],
+      );
+      if (stopped.rows.length !== 1) throw new Error('Runner heartbeat expiry reconciliation lost its authority race.');
+      await client.query(
+        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+         VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
+        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
+          reservation_id: request.reservation_id, claim_id: request.claim_id,
+          reason: 'runner heartbeat authority expired or drifted', execution_state: 'unknown', released_cost_usd: 0,
+        })],
+      );
+      await client.query('COMMIT');
+      return { reconciled: true, reservation_id: request.reservation_id, state: 'stop-requested', expired: true, blockers: [] };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
+        action: 'reconcile-runner-heartbeat-expiry', reservation_id: request.reservation_id,
+        error: error instanceof Error ? error.message : 'unknown runner-heartbeat expiry reconciliation failure',
       });
       throw error;
     } finally { client.release?.(); }

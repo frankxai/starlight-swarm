@@ -15,6 +15,8 @@ export const BROKER_DATABASE_ROLE_CONTRACT = Object.freeze({
     'swarm_authority_budget_windows:SELECT',
     'swarm_authority_budgets:SELECT',
     'swarm_authority_hosts:SELECT',
+    'swarm_authority_heartbeat_tokens:INSERT',
+    'swarm_authority_heartbeat_tokens:SELECT',
     'swarm_authority_prepared_operations:SELECT',
     'swarm_authority_reservations:SELECT',
     'swarm_authority_revocations:SELECT',
@@ -42,6 +44,11 @@ export const BROKER_DATABASE_ROLE_CONTRACT = Object.freeze({
     'swarm_authority_reservations:runner_access_review_expires_at',
     'swarm_authority_reservations:runner_evidence_observed_at',
     'swarm_authority_reservations:runner_host_id',
+    'swarm_authority_reservations:runner_heartbeat_accepted_at',
+    'swarm_authority_reservations:runner_heartbeat_id',
+    'swarm_authority_reservations:runner_heartbeat_presented_token_sha256',
+    'swarm_authority_reservations:runner_heartbeat_request_id',
+    'swarm_authority_reservations:runner_heartbeat_sequence',
     'swarm_authority_reservations:runner_id',
     'swarm_authority_reservations:runner_identity_evidence_ref',
     'swarm_authority_reservations:runner_instance_id',
@@ -164,6 +171,8 @@ export const attestBrokerDatabaseSession: BrokerDatabaseSessionAttestor = async 
   `);
   const allowedSelectTables = new Set(BROKER_DATABASE_ROLE_CONTRACT.table_grants
     .filter((grant) => grant.endsWith(':SELECT')).map((grant) => grant.split(':')[0]));
+  const allowedInsertTables = new Set(BROKER_DATABASE_ROLE_CONTRACT.table_grants
+    .filter((grant) => grant.endsWith(':INSERT')).map((grant) => grant.split(':')[0]));
   const expectedUpdates = new Set(BROKER_DATABASE_ROLE_CONTRACT.column_updates);
   const actualColumnUpdates: string[] = [];
   const unexpectedColumnAuthority: string[] = [];
@@ -174,7 +183,7 @@ export const attestBrokerDatabaseSession: BrokerDatabaseSessionAttestor = async 
     const key = `${table}:${column}`;
     if (privilege === 'UPDATE') actualColumnUpdates.push(key);
     const allowed = (privilege === 'SELECT' && allowedSelectTables.has(table))
-      || (privilege === 'INSERT' && table === 'swarm_authority_audit')
+      || (privilege === 'INSERT' && allowedInsertTables.has(table))
       || (privilege === 'UPDATE' && expectedUpdates.has(key));
     if (!allowed) unexpectedColumnAuthority.push(`${key}:${privilege}`);
   }
@@ -235,6 +244,9 @@ export function brokerDatabaseRoleGrantSql(untrustedRole: string): string {
   const selects = BROKER_DATABASE_ROLE_CONTRACT.table_grants
     .filter((grant) => grant.endsWith(':SELECT'))
     .map((grant) => grant.split(':')[0]);
+  const inserts = BROKER_DATABASE_ROLE_CONTRACT.table_grants
+    .filter((grant) => grant.endsWith(':INSERT'))
+    .map((grant) => grant.split(':')[0]);
   const updates = new Map<string, string[]>();
   for (const grant of BROKER_DATABASE_ROLE_CONTRACT.column_updates) {
     const [table, column] = grant.split(':');
@@ -249,7 +261,7 @@ export function brokerDatabaseRoleGrantSql(untrustedRole: string): string {
     `REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${role};`,
     `REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM ${role};`,
     `GRANT SELECT ON ${selects.join(',')} TO ${role};`,
-    'GRANT INSERT ON swarm_authority_audit TO '+role+';',
+    `GRANT INSERT ON ${inserts.join(',')} TO ${role};`,
     ...Array.from(updates.entries()).sort(([a], [b]) => a.localeCompare(b))
       .map(([table, columns]) => `GRANT UPDATE (${columns.sort().join(',')}) ON ${table} TO ${role};`),
     `GRANT USAGE ON SEQUENCE swarm_authority_audit_seq_seq TO ${role};`,

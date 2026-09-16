@@ -232,6 +232,37 @@ export const runnerClaimInputSchema = z.object({
 
 export type RunnerClaimInput = z.infer<typeof runnerClaimInputSchema>;
 
+export const runnerHeartbeatInputSchema = z.object({
+  heartbeat_request_id: z.uuid(),
+  heartbeat_sequence: z.number().int().min(1).max(1_000_000_000),
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  next_heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict().superRefine((value, context) => {
+  if (value.heartbeat_token === value.next_heartbeat_token) {
+    context.addIssue({
+      code: 'custom',
+      path: ['next_heartbeat_token'],
+      message: 'Current and next heartbeat credentials must be distinct.',
+    });
+  }
+});
+
+export type RunnerHeartbeatInput = z.infer<typeof runnerHeartbeatInputSchema>;
+
+export const runnerHeartbeatExpiryInputSchema = z.object({
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  operation_id: id,
+  binding_digest_sha256: digest,
+}).strict();
+
+export type RunnerHeartbeatExpiryInput = z.infer<typeof runnerHeartbeatExpiryInputSchema>;
+
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
   cancel_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
@@ -347,6 +378,38 @@ export type RunnerClaimResult =
   | { claimed: true; receipt: RunnerClaimReceipt; blockers: [] }
   | { claimed: false; receipt: null; blockers: string[] };
 
+export interface RunnerHeartbeatReceipt {
+  schema_version: 'starlight.runner_heartbeat_acceptance.v1';
+  heartbeat_id: string;
+  heartbeat_request_id: string;
+  heartbeat_sequence: number;
+  claim_id: string;
+  reservation_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  runner_id: string;
+  runner_instance_id: string;
+  runtime_id: string;
+  host_id: string;
+  channel_binding_sha256: string;
+  accepted_at: string;
+  claim_expires_at: string;
+  heartbeat_token_sha256: string;
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  execution_observed: false;
+  state: 'runner-claimed-not-started';
+}
+
+export type RunnerHeartbeatResult =
+  | { accepted: true; receipt: RunnerHeartbeatReceipt; blockers: [] }
+  | { accepted: false; receipt: null; blockers: string[] };
+
+export type RunnerHeartbeatExpiryResult =
+  | { reconciled: true; reservation_id: string; state: 'runner-claimed-not-started' | 'stop-requested'; expired: boolean; blockers: [] }
+  | { reconciled: false; reservation_id: string; state: null; expired: false; blockers: string[] };
+
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
   | { cancelled: false; reservation_id: string; state: null | 'expired' | 'stop-requested'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
@@ -363,6 +426,8 @@ export interface OperationAuthorityStore {
   leaseStart(input: StartLeaseInput): Promise<StartLeaseResult>;
   redeemStartAuthorization(input: StartRedemptionInput): Promise<StartRedemptionResult>;
   claimRunnerStart(input: RunnerClaimInput): Promise<RunnerClaimResult>;
+  acceptRunnerHeartbeat(input: RunnerHeartbeatInput): Promise<RunnerHeartbeatResult>;
+  reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -547,6 +612,28 @@ export class OperationAuthority {
       return { claimed: false, receipt: null, blockers: ['Runner claim is invalid.'] };
     }
     return this.store.claimRunnerStart(parsed.data);
+  }
+
+  async acceptRunnerHeartbeat(input: unknown): Promise<RunnerHeartbeatResult> {
+    if (!this.store.durable) return { accepted: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    const parsed = runnerHeartbeatInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = this.clock();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', Number.isFinite(Date.parse(at)) ? at : new Date().toISOString(), ['Runner heartbeat is invalid.']);
+      return { accepted: false, receipt: null, blockers: ['Runner heartbeat is invalid.'] };
+    }
+    return this.store.acceptRunnerHeartbeat(parsed.data);
+  }
+
+  async reconcileRunnerHeartbeatExpiry(input: unknown): Promise<RunnerHeartbeatExpiryResult> {
+    const parsed = runnerHeartbeatExpiryInputSchema.safeParse(input);
+    if (!parsed.success) {
+      return { reconciled: false, reservation_id: 'invalid-reservation', state: null, expired: false, blockers: ['Runner heartbeat expiry request is invalid.'] };
+    }
+    if (!this.store.durable) {
+      return { reconciled: false, reservation_id: parsed.data.reservation_id, state: null, expired: false, blockers: ['A durable authority store is required.'] };
+    }
+    return this.store.reconcileRunnerHeartbeatExpiry(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {

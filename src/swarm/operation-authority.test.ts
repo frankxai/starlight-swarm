@@ -34,6 +34,8 @@ const LEASE_CLAIM_TOKEN = 'L'.repeat(43);
 const REDEMPTION_TOKEN = 'R'.repeat(43);
 const CONTROL_TOKEN = 'C'.repeat(43);
 const HEARTBEAT_TOKEN = 'H'.repeat(43);
+const NEXT_HEARTBEAT_TOKEN = 'N'.repeat(43);
+const SECOND_NEXT_HEARTBEAT_TOKEN = 'M'.repeat(43);
 const BROKER_IDENTITY = 'broker-execution-001';
 const BROKER_EVIDENCE = 'broker-attestation-001';
 const BROKER_DATABASE_ROLE = 'starlight_test_broker';
@@ -316,6 +318,31 @@ function runnerClaim(
     binding_digest_sha256: reservation.binding_digest_sha256,
     control_token: CONTROL_TOKEN,
     heartbeat_token: HEARTBEAT_TOKEN,
+    ...overrides,
+  };
+}
+
+function runnerHeartbeat(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  claimId: string,
+  overrides: Partial<{
+    heartbeat_request_id: string;
+    heartbeat_sequence: number;
+    heartbeat_token: string;
+    next_heartbeat_token: string;
+  }> = {},
+) {
+  return {
+    heartbeat_request_id: '00000000-0000-4000-8000-000000000501',
+    heartbeat_sequence: 1,
+    reservation_id: reservation.reservation_id,
+    claim_id: claimId,
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    heartbeat_token: HEARTBEAT_TOKEN,
+    next_heartbeat_token: NEXT_HEARTBEAT_TOKEN,
     ...overrides,
   };
 }
@@ -767,6 +794,8 @@ test('requires server-owned preparation and strictly valid, fresh host evidence'
       leaseStart: async () => ({ leased: false, receipt: null, blockers: [] }),
       redeemStartAuthorization: async () => ({ redeemed: false, receipt: null, blockers: [] }),
       claimRunnerStart: async () => ({ claimed: false, receipt: null, blockers: [] }),
+      acceptRunnerHeartbeat: async () => ({ accepted: false, receipt: null, blockers: [] }),
+      reconcileRunnerHeartbeatExpiry: async (input) => ({ reconciled: false, reservation_id: input.reservation_id, state: null, expired: false, blockers: [] }),
       cancel: async (input) => ({ cancelled: false, reservation_id: input.reservation_id, state: null, already_terminal: false, released_cost_usd: 0, blockers: [] }),
       recordDenial: async () => {},
     }, { approvalIssuers: {}, budgetIssuers: {} }, Number.NaN),
@@ -1136,6 +1165,259 @@ test('runner claim is transport-attested, replay-safe, and remains not-started',
     assert.doesNotMatch(audit, new RegExp(CONTROL_TOKEN));
     const accepted = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-claim-accepted'");
     assert.equal(accepted.length, 1);
+  } finally { await h.pool.close(); }
+});
+
+test('runner heartbeat rotates credentials, renews once, and never proves execution', async () => {
+  const h = await harness(binding(), {}, runnerSessionAttestor);
+  try {
+    const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+    const claim = await h.authority.claimRunnerStart(
+      runnerClaim(h, reservation, redeemed.receipt.redemption_id),
+    );
+    assert.equal(claim.claimed, true, claim.blockers.join(' '));
+    if (!claim.claimed) return;
+
+    const input = runnerHeartbeat(h, reservation, claim.receipt.claim_id);
+    const first = await h.authority.acceptRunnerHeartbeat(input);
+    assert.equal(first.accepted, true, first.blockers.join(' '));
+    if (!first.accepted) return;
+    assert.equal(first.receipt.heartbeat_sequence, 1);
+    assert.equal(first.receipt.state, 'runner-claimed-not-started');
+    assert.equal(first.receipt.execution_observed, false);
+    assert.equal(first.receipt.dispatch_state, 'not-dispatched');
+    assert.ok(Date.parse(first.receipt.claim_expires_at) > Date.parse(claim.receipt.claim_expires_at));
+
+    const retry = await h.authority.acceptRunnerHeartbeat(input);
+    assert.equal(retry.accepted, true, retry.blockers.join(' '));
+    if (retry.accepted) assert.deepEqual(retry.receipt, first.receipt);
+
+    const stale = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(
+      h, reservation, claim.receipt.claim_id,
+      { heartbeat_request_id: '00000000-0000-4000-8000-000000000502', heartbeat_sequence: 2 },
+    ));
+    assert.equal(stale.accepted, false);
+    assert.match(stale.blockers.join(' '), /credential/i);
+
+    const recycled = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(
+      h, reservation, claim.receipt.claim_id,
+      {
+        heartbeat_request_id: '00000000-0000-4000-8000-000000000504',
+        heartbeat_sequence: 2,
+        heartbeat_token: NEXT_HEARTBEAT_TOKEN,
+        next_heartbeat_token: HEARTBEAT_TOKEN,
+      },
+    ));
+    assert.equal(recycled.accepted, false);
+    assert.match(recycled.blockers.join(' '), /already issued/i);
+
+    const rows = await h.pool.rows(`SELECT r.state,r.runner_heartbeat_sequence,
+      b.reserved_usd,b.committed_usd,host.reserved_slots,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(rows[0].state, 'runner-claimed-not-started');
+    assert.equal(Number(rows[0].runner_heartbeat_sequence), 1);
+    assert.deepEqual([
+      Number(rows[0].reserved_usd), Number(rows[0].committed_usd),
+      Number(rows[0].reserved_slots), Number(rows[0].authorized_slots),
+    ], [0, 0.25, 0, 1]);
+    const audit = JSON.stringify(await h.pool.rows('SELECT event,detail FROM swarm_authority_audit ORDER BY seq'));
+    assert.doesNotMatch(audit, new RegExp(HEARTBEAT_TOKEN));
+    assert.doesNotMatch(audit, new RegExp(NEXT_HEARTBEAT_TOKEN));
+    const accepted = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-heartbeat-accepted'");
+    assert.equal(accepted.length, 1);
+  } finally { await h.pool.close(); }
+});
+
+test('runner heartbeat fails closed for invalid, unauthenticated, expired, or drifted authority', async (t) => {
+  await t.test('next credential aliases the current credential', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      const denied = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(
+        h, reservation, claim.receipt.claim_id, { next_heartbeat_token: HEARTBEAT_TOKEN },
+      ));
+      assert.equal(denied.accepted, false);
+      assert.match(denied.blockers.join(' '), /invalid/i);
+      const state = await h.pool.rows('SELECT state,runner_heartbeat_sequence FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'runner-claimed-not-started');
+      assert.equal(state[0].runner_heartbeat_sequence, null);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('default runner attestor refuses heartbeat', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      const closed = new OperationAuthority(
+        new PostgresOperationAuthorityStore(h.pool, { brokerSessionAttestor }),
+        { approvalIssuers: {}, budgetIssuers: {} },
+      );
+      const denied = await closed.acceptRunnerHeartbeat(runnerHeartbeat(h, reservation, claim.receipt.claim_id));
+      assert.equal(denied.accepted, false);
+      assert.match(denied.blockers.join(' '), /attestor is not configured/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'runner-claimed-not-started');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('expired prior claim is quarantined with committed resources retained', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      await h.pool.execute(`UPDATE swarm_authority_reservations SET
+        runner_claim_accepted_at=clock_timestamp()-INTERVAL '70 seconds',
+        runner_evidence_observed_at=clock_timestamp()-INTERVAL '61 seconds',
+        runner_access_review_expires_at=clock_timestamp()+INTERVAL '1 minute',
+        runner_claim_expires_at=clock_timestamp()-INTERVAL '1 second'`);
+      const denied = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(h, reservation, claim.receipt.claim_id));
+      assert.equal(denied.accepted, false);
+      assert.match(denied.blockers.join(' '), /expired/i);
+      const rows = await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+      assert.equal(rows[0].state, 'stop-requested');
+      assert.equal(Number(rows[0].committed_usd), 0.25);
+      assert.equal(Number(rows[0].authorized_slots), 1);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('channel drift is quarantined', async () => {
+    let channel = '9'.repeat(64);
+    const mutableAttestor: RunnerSessionAttestor = async () => ({
+      valid: true,
+      session: {
+        runner_id: 'openai-codex-worker', runner_identity_evidence_ref: 'identity-attestation-001',
+        runner_instance_id: 'runner-instance-001', runtime_id: 'railway-temporal',
+        host_id: 'trusted-host-001', channel_binding_sha256: channel,
+        observed_at: new Date().toISOString(),
+        access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+      },
+      blockers: [],
+    });
+    const h = await harness(binding(), {}, mutableAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      channel = 'a'.repeat(64);
+      const denied = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(h, reservation, claim.receipt.claim_id));
+      assert.equal(denied.accepted, false);
+      assert.match(denied.blockers.join(' '), /channel drifted/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('stored latest request sequence drift is quarantined on retry', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      const input = runnerHeartbeat(h, reservation, claim.receipt.claim_id);
+      assert.equal((await h.authority.acceptRunnerHeartbeat(input)).accepted, true);
+      await h.pool.execute('UPDATE swarm_authority_reservations SET runner_heartbeat_sequence=2');
+      const denied = await h.authority.acceptRunnerHeartbeat(input);
+      assert.equal(denied.accepted, false);
+      assert.match(denied.blockers.join(' '), /history drifted|replay drifted/i);
+      const state = await h.pool.rows('SELECT state FROM swarm_authority_reservations');
+      assert.equal(state[0].state, 'stop-requested');
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('monotonic second heartbeat consumes only the rotated credential', async () => {
+    const h = await harness(binding(), {}, runnerSessionAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true);
+      if (!claim.claimed) return;
+      const first = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(h, reservation, claim.receipt.claim_id));
+      assert.equal(first.accepted, true);
+      const secondInput = runnerHeartbeat(
+        h, reservation, claim.receipt.claim_id,
+        {
+          heartbeat_request_id: '00000000-0000-4000-8000-000000000503',
+          heartbeat_sequence: 2,
+          heartbeat_token: NEXT_HEARTBEAT_TOKEN,
+          next_heartbeat_token: SECOND_NEXT_HEARTBEAT_TOKEN,
+        },
+      );
+      const tooSoon = await h.authority.acceptRunnerHeartbeat(secondInput);
+      assert.equal(tooSoon.accepted, false);
+      assert.match(tooSoon.blockers.join(' '), /minimum interval/i);
+      assert.equal((await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-heartbeat-denied'")).length, 0);
+      await h.pool.execute(`UPDATE swarm_authority_reservations SET
+        runner_claim_accepted_at=runner_claim_accepted_at-INTERVAL '2 seconds',
+        runner_heartbeat_accepted_at=runner_heartbeat_accepted_at-INTERVAL '2 seconds'`);
+      const second = await h.authority.acceptRunnerHeartbeat(secondInput);
+      assert.equal(second.accepted, true, second.blockers.join(' '));
+      if (second.accepted) assert.equal(second.receipt.heartbeat_sequence, 2);
+      const recycled = await h.authority.acceptRunnerHeartbeat(runnerHeartbeat(
+        h, reservation, claim.receipt.claim_id,
+        {
+          heartbeat_request_id: '00000000-0000-4000-8000-000000000505',
+          heartbeat_sequence: 3,
+          heartbeat_token: SECOND_NEXT_HEARTBEAT_TOKEN,
+          next_heartbeat_token: NEXT_HEARTBEAT_TOKEN,
+        },
+      ));
+      assert.equal(recycled.accepted, false);
+      assert.match(recycled.blockers.join(' '), /already issued/i);
+      const events = await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-heartbeat-accepted'");
+      assert.equal(events.length, 2);
+    } finally { await h.pool.close(); }
+  });
+});
+
+test('heartbeat expiry reconciliation never releases unknown committed execution', async () => {
+  const h = await harness(binding(), {}, runnerSessionAttestor);
+  try {
+    const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+    const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+    assert.equal(claim.claimed, true);
+    if (!claim.claimed) return;
+    const input = {
+      reservation_id: reservation.reservation_id,
+      claim_id: claim.receipt.claim_id,
+      operation_id: h.operation.operation_id,
+      binding_digest_sha256: reservation.binding_digest_sha256,
+    };
+    const live = await h.authority.reconcileRunnerHeartbeatExpiry(input);
+    assert.equal(live.reconciled, true);
+    if (live.reconciled) {
+      assert.equal(live.state, 'runner-claimed-not-started');
+      assert.equal(live.expired, false);
+    }
+    await h.pool.execute(`UPDATE swarm_authority_reservations SET
+      runner_claim_accepted_at=clock_timestamp()-INTERVAL '70 seconds',
+      runner_evidence_observed_at=clock_timestamp()-INTERVAL '61 seconds',
+      runner_access_review_expires_at=clock_timestamp()+INTERVAL '1 minute',
+      runner_claim_expires_at=clock_timestamp()-INTERVAL '1 second'`);
+    const expired = await h.authority.reconcileRunnerHeartbeatExpiry(input);
+    assert.equal(expired.reconciled, true);
+    if (expired.reconciled) {
+      assert.equal(expired.state, 'stop-requested');
+      assert.equal(expired.expired, true);
+    }
+    const rows = await h.pool.rows(`SELECT r.state,b.reserved_usd,b.committed_usd,
+      host.reserved_slots,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`);
+    assert.equal(rows[0].state, 'stop-requested');
+    assert.deepEqual([
+      Number(rows[0].reserved_usd), Number(rows[0].committed_usd),
+      Number(rows[0].reserved_slots), Number(rows[0].authorized_slots),
+    ], [0, 0.25, 0, 1]);
   } finally { await h.pool.close(); }
 });
 

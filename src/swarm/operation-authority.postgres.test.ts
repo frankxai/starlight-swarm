@@ -22,6 +22,8 @@ const leaseClaimToken = 'L'.repeat(43);
 const redemptionToken = 'R'.repeat(43);
 const controlToken = 'C'.repeat(43);
 const heartbeatToken = 'H'.repeat(43);
+const nextHeartbeatToken = 'N'.repeat(43);
+const competingHeartbeatToken = 'M'.repeat(43);
 const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
   valid: true,
   session: {
@@ -114,6 +116,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
       swarm_authority_budgets,swarm_authority_prepared_operations,
       swarm_authority_budget_holds,swarm_authority_budget_windows,
+      swarm_authority_heartbeat_tokens,
       swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
     const operation = binding();
     const digest = sha256Digest(operation);
@@ -217,7 +220,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       control_token: controlToken,
       broker_execution_identity: 'postgres-broker-001',
       broker_identity_evidence_ref: 'postgres-broker-evidence-001',
-      lease_duration_ms: 30_000,
+      lease_duration_ms: 110_000,
     });
     assert.equal(lease.leased, true);
     if (!lease.leased) throw new Error('lease failed');
@@ -243,6 +246,24 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       binding_digest_sha256: h.consume.binding_digest_sha256,
       control_token: controlToken,
       heartbeat_token: heartbeatToken,
+    };
+  };
+
+  const claimForHeartbeat = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    const claimInput = await authorize(h, suffix);
+    const claimed = await h.authority.claimRunnerStart(claimInput);
+    assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
+    if (!claimed.claimed) throw new Error('runner claim failed');
+    return {
+      heartbeat_request_id: `00000000-0000-4000-8000-0000000005${suffix}`,
+      heartbeat_sequence: 1,
+      reservation_id: h.reservation.reservation_id,
+      claim_id: claimed.receipt.claim_id,
+      operation_id: h.consume.operation_id,
+      effect_id: h.consume.effect_id,
+      binding_digest_sha256: h.consume.binding_digest_sha256,
+      heartbeat_token: heartbeatToken,
+      next_heartbeat_token: nextHeartbeatToken,
     };
   };
 
@@ -419,6 +440,159 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
         Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
       ], [0, 0.25, 0, 1]);
+    });
+
+    await t.test('competing next heartbeats rotate one credential and preserve committed ledgers', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '81');
+      const [first, second] = await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.secondAuthority.acceptRunnerHeartbeat({
+          ...heartbeat,
+          heartbeat_request_id: '00000000-0000-4000-8000-000000000582',
+          next_heartbeat_token: competingHeartbeatToken,
+        }),
+      ]);
+      assert.equal([first, second].filter((result) => result.accepted).length, 1);
+      assert.equal([first, second].filter((result) => !result.accepted).length, 1);
+      const state = await pool.query(`SELECT r.state,r.runner_heartbeat_sequence,
+        b.reserved_usd,b.committed_usd,h.reserved_slots,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'runner-claimed-not-started');
+      assert.equal(Number(state.rows[0].runner_heartbeat_sequence), 1);
+      assert.deepEqual([
+        Number(state.rows[0].reserved_usd), Number(state.rows[0].committed_usd),
+        Number(state.rows[0].reserved_slots), Number(state.rows[0].authorized_slots),
+      ], [0, 0.25, 0, 1]);
+      const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='runner-heartbeat-accepted'");
+      assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('heartbeat history prevents recycling an earlier credential', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '83');
+      const first = await h.authority.acceptRunnerHeartbeat(heartbeat);
+      assert.equal(first.accepted, true, first.blockers.join(' '));
+      const recycled = await h.secondAuthority.acceptRunnerHeartbeat({
+        ...heartbeat,
+        heartbeat_request_id: '00000000-0000-4000-8000-000000000584',
+        heartbeat_sequence: 2,
+        heartbeat_token: nextHeartbeatToken,
+        next_heartbeat_token: heartbeatToken,
+      });
+      assert.equal(recycled.accepted, false);
+      assert.match(recycled.blockers.join(' '), /already issued/i);
+      const history = await pool.query(
+        'SELECT sequence,kind FROM swarm_authority_heartbeat_tokens ORDER BY sequence',
+      );
+      assert.deepEqual(history.rows.map((row) => [Number(row.sequence), row.kind]), [[0, 'claim'], [1, 'heartbeat']]);
+    });
+
+    await t.test('heartbeat versus cancellation cannot resurrect committed authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '91');
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.secondAuthority.cancel({
+          reservation_id: h.reservation.reservation_id,
+          cancel_token: h.reservation.cancel_token,
+          reason: 'concurrent heartbeat cancellation',
+        }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('heartbeat versus broker disable cannot leave active authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '92');
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.store.putBrokerPrincipalEvidence({ ...h.brokerEvidence, state: 'disabled' as const }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('heartbeat versus runner revocation cannot leave active authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '93');
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.store.revoke('runner:postgres-execution-001', new Date().toISOString(), 'concurrent heartbeat revocation'),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('heartbeat versus prepared cancellation cannot leave active authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '95');
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.store.cancelPreparedOperation(heartbeat.operation_id),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('heartbeat versus degraded host evidence cannot leave active authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '96');
+      const now = Date.now();
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.store.putHostEvidence({
+          host_id: 'postgres-test-host',
+          observed_at: new Date(now).toISOString(),
+          status: 'degraded',
+          capacity_slots: 1,
+          secret_readiness: true,
+          access_review_expires_at: new Date(now + 10 * 60_000).toISOString(),
+          allowed_capabilities: ['repository.read', 'repository.write'],
+        }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('heartbeat versus expiry reconciliation cannot resurrect expired authority', async () => {
+      const h = await prepare();
+      const heartbeat = await claimForHeartbeat(h, '94');
+      await pool.query(`UPDATE swarm_authority_reservations SET
+        runner_claim_accepted_at=clock_timestamp()-INTERVAL '70 seconds',
+        runner_evidence_observed_at=clock_timestamp()-INTERVAL '61 seconds',
+        runner_access_review_expires_at=clock_timestamp()+INTERVAL '1 minute',
+        runner_claim_expires_at=clock_timestamp()-INTERVAL '1 second'`);
+      await Promise.all([
+        h.authority.acceptRunnerHeartbeat(heartbeat),
+        h.secondAuthority.reconcileRunnerHeartbeatExpiry({
+          reservation_id: heartbeat.reservation_id,
+          claim_id: heartbeat.claim_id,
+          operation_id: heartbeat.operation_id,
+          binding_digest_sha256: heartbeat.binding_digest_sha256,
+        }),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(state.rows[0].state, 'stop-requested');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
     });
 
     await t.test('redemption versus cancellation has only released or quarantined outcomes', async () => {
