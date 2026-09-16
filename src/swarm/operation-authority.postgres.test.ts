@@ -326,7 +326,6 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
       start_observation_token: startObservationToken,
-      outcome_token: outcomeToken,
     };
   };
 
