@@ -718,7 +718,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
           observation_request_id: '00000000-0000-4000-8000-000000000602',
         }),
       ]);
-      assert.equal([first, second].filter((result) => result.observed).length, 1);
+      assert.equal([first, second].filter((result) => result.observed).length, 1, JSON.stringify([first, second]));
       assert.equal([first, second].filter((result) => !result.observed).length, 1);
       const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
         FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
@@ -743,13 +743,14 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         heartbeat_token: heartbeatToken,
         next_heartbeat_token: nextHeartbeatToken,
       };
-      await Promise.all([
+      const results = await Promise.all([
         h.authority.observeRunnerStart(observation),
         h.secondAuthority.acceptRunnerHeartbeat(heartbeat),
       ]);
       const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
         FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
-      assert.ok(['runner-start-observed', 'stop-requested'].includes(String(state.rows[0].state)));
+      assert.ok(['runner-start-observed', 'stop-requested'].includes(String(state.rows[0].state)),
+        JSON.stringify({ results, state: state.rows[0].state }));
       assert.equal(Number(state.rows[0].committed_usd), 0.25);
       assert.equal(Number(state.rows[0].authorized_slots), 1);
     });
