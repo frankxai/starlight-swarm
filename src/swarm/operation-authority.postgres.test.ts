@@ -142,11 +142,8 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       };
     },
   };
-  const usageStoreOptions = {
-    ...storeOptions, usageEvidencePool: authorityPool, usageEvidenceSessionAttestor: brokerSessionAttestor,
-  };
-  const store = new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions);
-  await store.initialize();
+  const bootstrapStore = new PostgresOperationAuthorityStore(authorityPool, storeOptions);
+  await bootstrapStore.initialize();
 
   // Ephemeral CI-only roles; these credentials never leave the disposable test database.
   const brokerPassword = 'postgres-broker-test-only';
@@ -190,6 +187,11 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   });
   const brokerRoleAuthorityPool = adaptPool(brokerRolePool);
   const verifierRoleAuthorityPool = adaptPool(verifierRolePool);
+  const usageStoreOptions = {
+    ...storeOptions,
+    usageEvidencePool: verifierRoleAuthorityPool,
+  };
+  const store = new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions);
 
   const prepare = async () => {
     currentRunnerLaunchAttemptId = 'postgres-launch-attempt-001';

@@ -2251,7 +2251,7 @@ test('records authenticated provider usage evidence without releasing committed 
         usageEvidence = { ...finalEvidence, ...drift };
         const denied = await h.authority.recordRunnerUsageEvidence(finalInput);
         assert.equal(denied.recorded, false, name);
-        assert.match(denied.blockers.join(' '), /stream identity, key, interval, or token chain drifted/i, name);
+        assert.match(denied.blockers.join(' '), /stream identity, key, interval, cost, or token chain drifted/i, name);
       }
       usageEvidence = finalEvidence;
       const final = await h.authority.recordRunnerUsageEvidence(finalInput);

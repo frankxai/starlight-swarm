@@ -4586,96 +4586,6 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         return await deny('Runner usage interval falls outside the authenticated execution interval.');
       }
 
-      const priorRequest = await client.query(
-        `SELECT * FROM swarm_authority_usage_evidence WHERE usage_request_id=$1::uuid FOR UPDATE`,
-        [request.usage_request_id],
-      );
-      if (priorRequest.rows.length) {
-        const prior = priorRequest.rows[0];
-        const exactRetry = prior.reservation_id === request.reservation_id
-          && prior.claim_id === request.claim_id && prior.outcome_id === request.outcome_id
-          && prior.operation_id === request.operation_id && prior.effect_id === request.effect_id
-          && prior.binding_digest_sha256 === request.binding_digest_sha256
-          && Number(prior.usage_sequence) === request.usage_sequence
-          && prior.presented_token_sha256 === usageDigest && prior.next_token_sha256 === nextUsageDigest
-          && prior.provider_event_id === evidence.provider_event_id
-          && prior.provider_id === evidence.provider_id
-          && prior.provider_account_ref === evidence.provider_account_ref
-          && prior.provider_usage_correlation_id === evidence.provider_usage_correlation_id
-          && prior.meter_id === evidence.meter_id
-          && prior.evidence_ref === evidence.evidence_ref && prior.evidence_sha256 === evidence.evidence_sha256
-          && sqlInstant(prior.usage_started_at) === sqlInstant(evidence.usage_started_at)
-          && sqlInstant(prior.usage_ended_at) === sqlInstant(evidence.usage_ended_at)
-          && prior.statement_status === evidence.statement_status
-          && (prior.statement_finalized_at === null
-            ? evidence.statement_finalized_at === null
-            : sqlInstant(prior.statement_finalized_at) === sqlInstant(evidence.statement_finalized_at))
-          && sqlInstant(prior.evidence_observed_at) === sqlInstant(evidence.observed_at)
-          && prior.currency === evidence.currency
-          && canonicalUsd(prior.cumulative_cost_usd) === evidence.cumulative_cost_usd
-          && prior.issuer === evidence.issuer && prior.key_id === evidence.key_id
-          && prior.authn_kind === evidence.authn_kind;
-        if (!exactRetry) return await deny('Runner usage-evidence retry drifted.');
-        const receipt = receiptFrom(prior);
-        await client.query('COMMIT');
-        return { recorded: true, receipt, blockers: [] };
-      }
-
-      const latest = await client.query(
-        `SELECT *
-         FROM swarm_authority_usage_evidence WHERE reservation_id=$1::uuid
-         ORDER BY usage_sequence DESC LIMIT 1 FOR UPDATE`,
-        [request.reservation_id],
-      );
-      const priorSequence = latest.rows.length ? Number(latest.rows[0].usage_sequence) : 0;
-      if (latest.rows[0]?.statement_status === 'final') {
-        return await deny('A final provider usage statement is already recorded.');
-      }
-      if (!Number.isSafeInteger(priorSequence) || request.usage_sequence !== priorSequence + 1) {
-        return await deny('Runner usage-evidence sequence is stale, skipped, or already consumed.');
-      }
-      if (row.usage_reconciliation_token_sha256 !== usageDigest) {
-        return await deny('Usage-reconciliation credential is invalid or already rotated.');
-      }
-      const currentHistory = await client.query(
-        `SELECT reservation_id,sequence FROM swarm_authority_usage_tokens WHERE token_sha256=$1`,
-        [usageDigest],
-      );
-      if (currentHistory.rows.length !== 1
-        || currentHistory.rows[0].reservation_id !== request.reservation_id
-        || Number(currentHistory.rows[0].sequence) !== priorSequence) {
-        return await deny('Current usage-reconciliation credential history is missing or inconsistent.');
-      }
-      if (latest.rows.length) {
-        const prior = latest.rows[0];
-        const sameStream = prior.provider_id === evidence.provider_id
-          && prior.provider_account_ref === evidence.provider_account_ref
-          && prior.provider_usage_correlation_id === evidence.provider_usage_correlation_id
-          && prior.meter_id === evidence.meter_id
-          && prior.currency === evidence.currency
-          && prior.authn_kind === evidence.authn_kind
-          && prior.issuer === evidence.issuer
-          && prior.key_id === evidence.key_id
-          && sqlInstant(prior.usage_started_at) === sqlInstant(evidence.usage_started_at)
-          && Date.parse(sqlInstant(evidence.usage_ended_at)) >= Date.parse(sqlInstant(prior.usage_ended_at))
-          && prior.next_token_sha256 === usageDigest;
-        if (!sameStream) {
-          return await deny('Provider usage stream identity, key, interval, or token chain drifted.');
-        }
-        const monotonic = await client.query(
-          'SELECT $1::numeric >= $2::numeric AS monotonic',
-          [evidence.cumulative_cost_usd, latest.rows[0].cumulative_cost_usd],
-        );
-        if (monotonic.rows[0]?.monotonic !== true) {
-          return await deny('Cumulative provider usage cannot decrease.');
-        }
-      }
-      const duplicateEvidence = await client.query(
-        `SELECT reservation_id FROM swarm_authority_usage_evidence
-         WHERE provider_event_id=$1::uuid OR evidence_ref=$2 OR evidence_sha256=$3 LIMIT 1`,
-        [evidence.provider_event_id, evidence.evidence_ref, evidence.evidence_sha256],
-      );
-      if (duplicateEvidence.rows.length) return await deny('Provider usage evidence is already bound to another request.');
       const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
         row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
         row.start_observation_token_sha256, row.outcome_token_sha256, usageDigest,
@@ -4684,19 +4594,6 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (lifecycleDigests.includes(nextUsageDigest)) {
         return await deny('Next usage-reconciliation credential aliases an existing lifecycle credential.');
       }
-      const duplicateToken = await client.query(
-        `SELECT reservation_id FROM swarm_authority_usage_tokens WHERE token_sha256=$1
-         UNION ALL SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1
-         UNION ALL SELECT reservation_id FROM swarm_authority_reservations
-         WHERE consume_token_sha256=$1 OR cancel_token_sha256=$1 OR lease_claim_token_sha256=$1
-           OR redemption_token_sha256=$1 OR control_token_sha256=$1 OR heartbeat_token_sha256=$1
-           OR start_observation_token_sha256=$1 OR outcome_token_sha256=$1
-           OR usage_reconciliation_token_sha256=$1 OR runner_heartbeat_presented_token_sha256=$1
-           OR runner_start_presented_token_sha256=$1 OR runner_outcome_presented_token_sha256=$1
-         LIMIT 1`,
-        [nextUsageDigest],
-      );
-      if (duplicateToken.rows.length) return await deny('Next usage-reconciliation credential was already issued.');
       if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
         return await deny('Committed aggregate budget authority is missing or inconsistent.');
       }
