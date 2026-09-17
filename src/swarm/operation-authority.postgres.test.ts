@@ -12,6 +12,8 @@ import {
   type RunnerOutcomeEvidenceAttestor,
   type RunnerStartEvidence,
   type RunnerStartEvidenceAttestor,
+  type RunnerUsageEvidence,
+  type RunnerUsageEvidenceAttestor,
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
 import {
@@ -28,6 +30,10 @@ const controlToken = 'C'.repeat(43);
 const heartbeatToken = 'H'.repeat(43);
 const startObservationToken = 'S'.repeat(43);
 const outcomeToken = 'O'.repeat(43);
+const usageToken = 'U'.repeat(43);
+const nextUsageToken = 'V'.repeat(43);
+const secondNextUsageToken = 'W'.repeat(43);
+const competingUsageToken = 'X'.repeat(43);
 const nextHeartbeatToken = 'N'.repeat(43);
 const competingHeartbeatToken = 'M'.repeat(43);
 const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
@@ -60,14 +66,19 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => {
 };
 let currentStartEvidence: RunnerStartEvidence | undefined;
 let currentOutcomeEvidence: RunnerOutcomeEvidence | undefined;
+let currentUsageEvidence: RunnerUsageEvidence | undefined;
 const runnerStartEvidenceAttestor: RunnerStartEvidenceAttestor = async () => currentStartEvidence
   ? { valid: true, evidence: currentStartEvidence, blockers: [] }
   : { valid: false, evidence: null, blockers: ['No server-owned process evidence exists.'] };
 const runnerOutcomeEvidenceAttestor: RunnerOutcomeEvidenceAttestor = async () => currentOutcomeEvidence
   ? { valid: true, evidence: currentOutcomeEvidence, blockers: [] }
   : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+const runnerUsageEvidenceAttestor: RunnerUsageEvidenceAttestor = async () => currentUsageEvidence
+  ? { valid: true, evidence: currentUsageEvidence, blockers: [] }
+  : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
 const storeOptions = {
   brokerSessionAttestor, runnerSessionAttestor, runnerStartEvidenceAttestor, runnerOutcomeEvidenceAttestor,
+  runnerUsageEvidenceAttestor,
 };
 
 function binding(): OperationBinding {
@@ -133,10 +144,11 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   const prepare = async () => {
     currentStartEvidence = undefined;
     currentOutcomeEvidence = undefined;
+    currentUsageEvidence = undefined;
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
       swarm_authority_budgets,swarm_authority_prepared_operations,
       swarm_authority_budget_holds,swarm_authority_budget_windows,
-      swarm_authority_heartbeat_tokens,
+      swarm_authority_usage_evidence,swarm_authority_usage_tokens,swarm_authority_heartbeat_tokens,
       swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
     const operation = binding();
     const digest = sha256Digest(operation);
@@ -209,6 +221,15 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       reservation_duration_ms: 5 * 60_000,
     });
     if (!admitted.admitted) assert.fail(admitted.blockers.join(' '));
+    const tokens = {
+      leaseClaim: leaseClaimToken,
+      redemption: redemptionToken,
+      control: controlToken,
+      heartbeat: heartbeatToken,
+      startObservation: startObservationToken,
+      outcome: outcomeToken,
+      usage: usageToken,
+    };
     const consume = {
       reservation_id: admitted.reservation.reservation_id,
       operation_id: operation.operation_id,
@@ -217,9 +238,12 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       execution_identity: operation.execution_identity,
       identity_evidence_ref: operation.identity_evidence_ref,
       consume_token: admitted.reservation.consume_token,
-      lease_claim_token: leaseClaimToken,
+      lease_claim_token: tokens.leaseClaim,
     };
-    return { authority, secondAuthority, store, brokerEvidence, reservation: admitted.reservation, consume };
+    return {
+      authority, secondAuthority, store, brokerEvidence, reservation: admitted.reservation, consume, tokens,
+      providerCorrelation: 'postgres-provider-correlation-001',
+    };
   };
 
   const authorize = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
@@ -235,9 +259,9 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       binding_digest_sha256: h.consume.binding_digest_sha256,
       execution_identity: h.consume.execution_identity,
       identity_evidence_ref: h.consume.identity_evidence_ref,
-      lease_claim_token: leaseClaimToken,
-      redemption_token: redemptionToken,
-      control_token: controlToken,
+      lease_claim_token: h.tokens.leaseClaim,
+      redemption_token: h.tokens.redemption,
+      control_token: h.tokens.control,
       broker_execution_identity: 'postgres-broker-001',
       broker_identity_evidence_ref: 'postgres-broker-evidence-001',
       lease_duration_ms: 110_000,
@@ -253,7 +277,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       binding_digest_sha256: h.consume.binding_digest_sha256,
       execution_identity: h.consume.execution_identity,
       identity_evidence_ref: h.consume.identity_evidence_ref,
-      redemption_token: redemptionToken,
+      redemption_token: h.tokens.redemption,
     });
     assert.equal(redeemed.redeemed, true);
     if (!redeemed.redeemed) throw new Error('redemption failed');
@@ -264,10 +288,12 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       operation_id: h.consume.operation_id,
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
-      control_token: controlToken,
-      heartbeat_token: heartbeatToken,
-      start_observation_token: startObservationToken,
-      outcome_token: outcomeToken,
+      control_token: h.tokens.control,
+      heartbeat_token: h.tokens.heartbeat,
+      start_observation_token: h.tokens.startObservation,
+      outcome_token: h.tokens.outcome,
+      usage_reconciliation_token: h.tokens.usage,
+      provider_usage_correlation_id: h.providerCorrelation,
     };
   };
 
@@ -284,7 +310,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       operation_id: h.consume.operation_id,
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
-      heartbeat_token: heartbeatToken,
+      heartbeat_token: h.tokens.heartbeat,
       next_heartbeat_token: nextHeartbeatToken,
     };
   };
@@ -325,7 +351,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       operation_id: h.consume.operation_id,
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
-      start_observation_token: startObservationToken,
+      start_observation_token: h.tokens.startObservation,
     };
   };
 
@@ -375,7 +401,132 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       operation_id: h.consume.operation_id,
       effect_id: h.consume.effect_id,
       binding_digest_sha256: h.consume.binding_digest_sha256,
-      outcome_token: outcomeToken,
+      outcome_token: h.tokens.outcome,
+    };
+  };
+
+  const settleForUsageEvidence = async (
+    h: Awaited<ReturnType<typeof prepare>>,
+    suffix: string,
+    statementStatus: 'provisional' | 'final' = 'final',
+    cumulativeCostUsd = '0.000000',
+  ) => {
+    const outcomeRequest = await claimForNeverStartedOutcome(h, suffix);
+    const settled = await h.authority.settleRunnerOutcome(outcomeRequest);
+    assert.equal(settled.settled, true, settled.blockers.join(' '));
+    if (!settled.settled) throw new Error('runner outcome failed');
+    const observedAt = settled.receipt.outcome_at;
+    currentUsageEvidence = {
+      schema_version: 'starlight.runner_usage_provider_evidence.v1',
+      provider_event_id: `00000000-0000-4000-8000-0000000009${suffix}`,
+      reservation_id: h.reservation.reservation_id,
+      claim_id: settled.receipt.claim_id,
+      outcome_id: settled.receipt.outcome_id,
+      operation_id: h.consume.operation_id,
+      effect_id: h.consume.effect_id,
+      binding_digest_sha256: h.consume.binding_digest_sha256,
+      runner_id: 'postgres-execution-001',
+      runner_identity_evidence_ref: 'postgres-identity-evidence-001',
+      runner_instance_id: 'postgres-runner-instance-001',
+      runtime_id: 'postgres-test-runtime',
+      host_id: 'postgres-test-host',
+      channel_binding_sha256: '9'.repeat(64),
+      launch_attempt_id: 'postgres-launch-attempt-001',
+      fencing_generation: 1,
+      process_instance_sha256: null,
+      provider_id: 'postgres-provider-001',
+      provider_account_ref: 'postgres-provider-account-001',
+      provider_usage_correlation_id: h.providerCorrelation,
+      meter_id: 'provider-cost-usd',
+      evidence_ref: `postgres-usage-evidence-${suffix}`,
+      evidence_sha256: suffix.padStart(64, 'e').slice(-64),
+      usage_started_at: observedAt,
+      usage_ended_at: observedAt,
+      statement_status: statementStatus,
+      statement_finalized_at: statementStatus === 'final' ? observedAt : null,
+      observed_at: observedAt,
+      access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+      currency: 'USD',
+      cumulative_cost_usd: cumulativeCostUsd,
+      authn_kind: 'provider-signed-statement',
+      issuer: 'postgres-provider-billing',
+      key_id: 'postgres-provider-key-001',
+    };
+    return {
+      usage_request_id: `00000000-0000-4000-8000-000000000a${suffix}`,
+      usage_sequence: 1,
+      reservation_id: h.reservation.reservation_id,
+      claim_id: settled.receipt.claim_id,
+      outcome_id: settled.receipt.outcome_id,
+      operation_id: h.consume.operation_id,
+      effect_id: h.consume.effect_id,
+      binding_digest_sha256: h.consume.binding_digest_sha256,
+      usage_reconciliation_token: h.tokens.usage,
+      next_usage_reconciliation_token: nextUsageToken,
+    };
+  };
+
+  const admitRelated = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    const now = new Date();
+    const issuedAt = now.toISOString();
+    const expires = new Date(now.getTime() + 10 * 60_000).toISOString();
+    await h.store.putHostEvidence({
+      host_id: 'postgres-test-host', observed_at: issuedAt, status: 'ready', capacity_slots: 2,
+      secret_readiness: true, access_review_expires_at: expires,
+      allowed_capabilities: ['repository.read', 'repository.write'],
+    });
+    const operation: OperationBinding = {
+      ...binding(),
+      operation_id: `postgres-related-operation-${suffix}`,
+      effect_id: `postgres-related-effect-${suffix}`,
+      call_id: `postgres-related-call-${suffix}`,
+      effect: { ...binding().effect, resource: `repo://frankxai/starlight-swarm/related-${suffix}` },
+    };
+    const digest = sha256Digest(operation);
+    const approval = signApprovalReceipt({
+      schema_version: 'starlight.operation_approval.v1', receipt_id: `postgres-related-approval-${suffix}`,
+      issuer: 'postgres-approval', key_id: 'postgres-approval-key', issued_at: issuedAt,
+      expires_at: expires, binding_digest_sha256: digest, scope: 'admit-bounded-operation',
+      allowed_capabilities: operation.capabilities,
+    }, approvalSecret);
+    const budget = signBudgetReceipt({
+      schema_version: 'starlight.operation_budget.v1', receipt_id: `postgres-related-budget-${suffix}`,
+      issuer: 'postgres-budget', key_id: 'postgres-budget-key', issued_at: issuedAt,
+      expires_at: expires, binding_digest_sha256: digest, budget_policy_id: operation.budget_policy_id,
+      hard_limit_usd: 0.5,
+    }, budgetSecret);
+    await h.store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
+    await h.store.putPreparedOperation(operation.operation_id, digest, issuedAt);
+    const admitted = await h.authority.admit({
+      binding: operation, approval_receipt: approval, budget_receipt: budget,
+      reservation_duration_ms: 5 * 60_000,
+    });
+    assert.equal(admitted.admitted, true, admitted.blockers.join(' '));
+    if (!admitted.admitted) throw new Error('related admission failed');
+    const tokens = {
+      leaseClaim: `related-lease-${suffix}`.padEnd(43, 'l'),
+      redemption: `related-redeem-${suffix}`.padEnd(43, 'r'),
+      control: `related-control-${suffix}`.padEnd(43, 'c'),
+      heartbeat: `related-heartbeat-${suffix}`.padEnd(43, 'h'),
+      startObservation: `related-start-${suffix}`.padEnd(43, 's'),
+      outcome: `related-outcome-${suffix}`.padEnd(43, 'o'),
+      usage: `related-usage-${suffix}`.padEnd(43, 'u'),
+    };
+    return {
+      ...h,
+      reservation: admitted.reservation,
+      consume: {
+        reservation_id: admitted.reservation.reservation_id,
+        operation_id: operation.operation_id,
+        effect_id: operation.effect_id,
+        binding_digest_sha256: admitted.reservation.binding_digest_sha256,
+        execution_identity: operation.execution_identity,
+        identity_evidence_ref: operation.identity_evidence_ref,
+        consume_token: admitted.reservation.consume_token,
+        lease_claim_token: tokens.leaseClaim,
+      },
+      tokens,
+      providerCorrelation: `postgres-provider-correlation-${suffix}`,
     };
   };
 
@@ -936,6 +1087,167 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.ok(['runner-never-started-observed', 'stop-requested'].includes(String(state.rows[0].state)));
       assert.equal(Number(state.rows[0].committed_usd), 0.25);
       assert.equal(Number(state.rows[0].authorized_slots), 1);
+    });
+
+    await t.test('duplicate provider usage evidence records one immutable event and releases no budget', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '74');
+      const results = await Promise.all([
+        h.authority.recordRunnerUsageEvidence(usage),
+        h.secondAuthority.recordRunnerUsageEvidence(usage),
+      ]);
+      assert.ok(results.every((result) => result.recorded));
+      const ids = results.flatMap((result) => result.recorded ? [result.receipt.usage_evidence_id] : []);
+      assert.equal(new Set(ids).size, 1);
+      const state = await pool.query(`SELECT b.committed_usd,h.authorized_slots
+        FROM swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+      const evidence = await pool.query('SELECT usage_sequence,cumulative_cost_usd FROM swarm_authority_usage_evidence');
+      assert.deepEqual(evidence.rows.map((row) => [Number(row.usage_sequence), Number(row.cumulative_cost_usd)]), [[1, 0]]);
+      const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='runner-usage-evidence-observed'");
+      assert.equal(events.rowCount, 1);
+    });
+
+    await t.test('usage evidence versus broker disable never releases committed authority', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '75');
+      const [recorded] = await Promise.all([
+        h.authority.recordRunnerUsageEvidence(usage),
+        h.store.putBrokerPrincipalEvidence({ ...h.brokerEvidence, state: 'disabled' as const }),
+      ]);
+      assert.ok(recorded.recorded || recorded.blockers.length > 0);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.ok(['runner-never-started-observed', 'stop-requested'].includes(String(state.rows[0].state)));
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+      assert.equal(Number(state.rows[0].authorized_slots), 1);
+      const evidence = await pool.query('SELECT usage_evidence_id FROM swarm_authority_usage_evidence');
+      assert.ok(evidence.rowCount === 0 || evidence.rowCount === 1);
+    });
+
+    await t.test('competing final provider statements accept one sequence-two transition', async () => {
+      const h = await prepare();
+      const first = await settleForUsageEvidence(h, '76', 'provisional');
+      const recordedFirst = await h.authority.recordRunnerUsageEvidence(first);
+      assert.equal(recordedFirst.recorded, true, recordedFirst.blockers.join(' '));
+      if (!recordedFirst.recorded || !currentUsageEvidence) return;
+      const finalizedAt = new Date().toISOString();
+      currentUsageEvidence = {
+        ...currentUsageEvidence,
+        provider_event_id: '00000000-0000-4000-8000-000000000976',
+        evidence_ref: 'postgres-usage-evidence-76-final',
+        evidence_sha256: 'f'.repeat(62) + '76',
+        statement_status: 'final',
+        statement_finalized_at: finalizedAt,
+        observed_at: finalizedAt,
+      };
+      const second = {
+        ...first,
+        usage_request_id: '00000000-0000-4000-8000-000000000a77',
+        usage_sequence: 2,
+        usage_reconciliation_token: nextUsageToken,
+        next_usage_reconciliation_token: secondNextUsageToken,
+      };
+      const results = await Promise.all([
+        h.authority.recordRunnerUsageEvidence(second),
+        h.secondAuthority.recordRunnerUsageEvidence({
+          ...second,
+          usage_request_id: '00000000-0000-4000-8000-000000000a78',
+          next_usage_reconciliation_token: competingUsageToken,
+        }),
+      ]);
+      assert.equal(results.filter((result) => result.recorded).length, 1);
+      const evidence = await pool.query('SELECT usage_sequence,statement_status FROM swarm_authority_usage_evidence ORDER BY usage_sequence');
+      assert.deepEqual(evidence.rows.map((row) => [Number(row.usage_sequence), row.statement_status]),
+        [[1, 'provisional'], [2, 'final']]);
+      const state = await pool.query('SELECT committed_usd FROM swarm_authority_budgets');
+      assert.equal(Number(state.rows[0].committed_usd), 0.25);
+    });
+
+    await t.test('final overage is retained as a breach and cannot release any commitment', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '77', 'final', '0.300000');
+      const recorded = await h.authority.recordRunnerUsageEvidence(usage);
+      assert.equal(recorded.recorded, true, recorded.blockers.join(' '));
+      if (!recorded.recorded) return;
+      assert.equal(recorded.receipt.budget_breach_observed, true);
+      const state = await pool.query(`SELECT b.committed_usd,w.committed_usd AS window_committed,
+        h.authorized_slots FROM swarm_authority_budgets b
+        CROSS JOIN swarm_authority_budget_windows w CROSS JOIN swarm_authority_hosts h`);
+      assert.ok(state.rows.every((row) => Number(row.committed_usd) === 0.25
+        && Number(row.window_committed) === 0.25 && Number(row.authorized_slots) === 1));
+      const breach = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='runner-usage-budget-breach'");
+      assert.equal(breach.rowCount, 1);
+    });
+
+    await t.test('usage evidence versus cancellation retains committed authority in every interleaving', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '78');
+      await Promise.all([
+        h.authority.recordRunnerUsageEvidence(usage),
+        h.secondAuthority.cancel({
+          reservation_id: h.reservation.reservation_id,
+          cancel_token: h.reservation.cancel_token,
+          reason: 'usage evidence cancellation race',
+        }),
+      ]);
+      const state = await pool.query(`SELECT b.committed_usd,w.committed_usd AS window_committed,
+        h.authorized_slots FROM swarm_authority_budgets b
+        CROSS JOIN swarm_authority_budget_windows w CROSS JOIN swarm_authority_hosts h`);
+      assert.ok(state.rows.every((row) => Number(row.committed_usd) === 0.25
+        && Number(row.window_committed) === 0.25 && Number(row.authorized_slots) === 1));
+    });
+
+    await t.test('usage evidence versus runner revocation cannot release committed authority', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '79');
+      await Promise.all([
+        h.authority.recordRunnerUsageEvidence(usage),
+        h.store.revoke('runner:postgres-execution-001', new Date().toISOString(), 'usage evidence race'),
+      ]);
+      const state = await pool.query(`SELECT r.state,b.committed_usd,w.committed_usd AS window_committed,
+        h.authorized_slots FROM swarm_authority_reservations r CROSS JOIN swarm_authority_budgets b
+        CROSS JOIN swarm_authority_budget_windows w CROSS JOIN swarm_authority_hosts h`);
+      assert.ok(state.rows.every((row) => Number(row.committed_usd) === 0.25
+        && Number(row.window_committed) === 0.25 && Number(row.authorized_slots) === 1));
+      assert.ok(['runner-never-started-observed', 'stop-requested'].includes(String(state.rows[0].state)));
+    });
+
+    await t.test('cross-reservation evidence and credential replay fail closed', async () => {
+      const h = await prepare();
+      const firstUsage = await settleForUsageEvidence(h, '80');
+      const firstRecorded = await h.authority.recordRunnerUsageEvidence(firstUsage);
+      assert.equal(firstRecorded.recorded, true, firstRecorded.blockers.join(' '));
+      if (!firstRecorded.recorded || !currentUsageEvidence) return;
+      const firstEvidence = currentUsageEvidence;
+
+      const related = await admitRelated(h, '02');
+      const secondUsage = await settleForUsageEvidence(related, '81');
+      assert.ok(currentUsageEvidence);
+      if (!currentUsageEvidence) return;
+      const secondEvidence = currentUsageEvidence;
+      currentUsageEvidence = {
+        ...secondEvidence,
+        provider_event_id: firstEvidence.provider_event_id,
+        evidence_ref: firstEvidence.evidence_ref,
+        evidence_sha256: firstEvidence.evidence_sha256,
+      };
+      const duplicateEvidence = await related.authority.recordRunnerUsageEvidence({
+        ...secondUsage,
+        next_usage_reconciliation_token: `related-next-02`.padEnd(43, 'n'),
+      });
+      assert.equal(duplicateEvidence.recorded, false);
+      assert.match(duplicateEvidence.blockers.join(' '), /already bound/i);
+
+      currentUsageEvidence = secondEvidence;
+      const recycledCredential = await related.authority.recordRunnerUsageEvidence(secondUsage);
+      assert.equal(recycledCredential.recorded, false);
+      assert.match(recycledCredential.blockers.join(' '), /already issued/i);
+      const state = await pool.query(`SELECT SUM(committed_usd) AS committed FROM swarm_authority_budgets`);
+      assert.equal(Number(state.rows[0].committed), 0.5);
+      const evidence = await pool.query('SELECT reservation_id FROM swarm_authority_usage_evidence');
+      assert.equal(evidence.rowCount, 1);
     });
 
     await t.test('redemption versus cancellation has only released or quarantined outcomes', async () => {

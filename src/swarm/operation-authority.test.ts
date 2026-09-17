@@ -18,6 +18,8 @@ import {
   type RunnerOutcomeEvidenceAttestor,
   type RunnerStartEvidence,
   type RunnerStartEvidenceAttestor,
+  type RunnerUsageEvidence,
+  type RunnerUsageEvidenceAttestor,
   type TrustedBrokerPrincipalEvidence,
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
@@ -29,9 +31,7 @@ import {
 
 const NOW_MS = Date.now();
 const NOW = new Date(NOW_MS).toISOString();
-const EXPIRES = new Date(NOW_MS + 10 * 60_000).toISOString();
-const WINDOW_START = new Date(NOW_MS - 60_000).toISOString();
-const WINDOW_END = new Date(NOW_MS + 15 * 60_000).toISOString();
+const EXPIRES = new Date(NOW_MS + 60 * 60_000).toISOString();
 const APPROVAL_SECRET = 'approval-secret-at-least-32-bytes-long';
 const BUDGET_SECRET = 'budget-secret-at-least-32-bytes-long';
 const LEASE_CLAIM_TOKEN = 'L'.repeat(43);
@@ -40,6 +40,9 @@ const CONTROL_TOKEN = 'C'.repeat(43);
 const HEARTBEAT_TOKEN = 'H'.repeat(43);
 const START_OBSERVATION_TOKEN = 'S'.repeat(43);
 const OUTCOME_TOKEN = 'O'.repeat(43);
+const USAGE_TOKEN = 'U'.repeat(43);
+const NEXT_USAGE_TOKEN = 'V'.repeat(43);
+const SECOND_NEXT_USAGE_TOKEN = 'W'.repeat(43);
 const NEXT_HEARTBEAT_TOKEN = 'N'.repeat(43);
 const SECOND_NEXT_HEARTBEAT_TOKEN = 'M'.repeat(43);
 const BROKER_IDENTITY = 'broker-execution-001';
@@ -75,6 +78,7 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => ({
 function brokerEvidence(
   overrides: Partial<TrustedBrokerPrincipalEvidence> = {},
 ): TrustedBrokerPrincipalEvidence {
+  const observedAt = new Date().toISOString();
   return {
     schema_version: 'starlight.broker_principal_evidence.v1',
     database_role: BROKER_DATABASE_ROLE,
@@ -83,7 +87,7 @@ function brokerEvidence(
     broker_identity_evidence_ref: BROKER_EVIDENCE,
     authn_kind: 'postgres-session-role',
     role_contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
-    observed_at: NOW,
+    observed_at: observedAt,
     access_review_expires_at: EXPIRES,
     state: 'ready',
     ...overrides,
@@ -175,31 +179,39 @@ async function harness(
   runnerAttestor?: RunnerSessionAttestor,
   startEvidenceAttestor?: RunnerStartEvidenceAttestor,
   outcomeEvidenceAttestor?: RunnerOutcomeEvidenceAttestor,
+  usageEvidenceAttestor?: RunnerUsageEvidenceAttestor,
 ) {
+  const harnessNowMs = Date.now();
+  const harnessNow = new Date(harnessNowMs).toISOString();
+  const harnessExpires = new Date(harnessNowMs + 60 * 60_000).toISOString();
+  const harnessWindowStart = new Date(harnessNowMs - 60_000).toISOString();
+  const harnessWindowEnd = new Date(harnessNowMs + 65 * 60_000).toISOString();
   const pool = new PGlitePool();
   const store = new PostgresOperationAuthorityStore(pool, {
     brokerSessionAttestor,
     ...(runnerAttestor ? { runnerSessionAttestor: runnerAttestor } : {}),
     ...(startEvidenceAttestor ? { runnerStartEvidenceAttestor: startEvidenceAttestor } : {}),
     ...(outcomeEvidenceAttestor ? { runnerOutcomeEvidenceAttestor: outcomeEvidenceAttestor } : {}),
+    ...(usageEvidenceAttestor ? { runnerUsageEvidenceAttestor: usageEvidenceAttestor } : {}),
   });
   await store.initialize();
   await store.putBrokerPrincipalEvidence(brokerEvidence());
+  const hostObservedAt = new Date().toISOString();
   await store.putHostEvidence({
     host_id: operation.host_id,
-    observed_at: NOW,
+    observed_at: hostObservedAt,
     status: 'ready',
     capacity_slots: 4,
     secret_readiness: true,
-    access_review_expires_at: EXPIRES,
+    access_review_expires_at: harnessExpires,
     allowed_capabilities: ['repository.read', 'repository.write'],
   });
   await store.registerBudgetWindow({
     window_id: `${operation.budget_policy_id}:policy-window`,
     policy_id: operation.budget_policy_id,
     kind: 'policy',
-    starts_at: WINDOW_START,
-    ends_at: windows.endsAt ?? WINDOW_END,
+    starts_at: harnessWindowStart,
+    ends_at: windows.endsAt ?? harnessWindowEnd,
     currency: 'USD',
     hard_limit_usd: windows.policyLimit ?? 0.5,
   });
@@ -207,8 +219,8 @@ async function harness(
     window_id: `${operation.budget_policy_id}:daily-window`,
     policy_id: operation.budget_policy_id,
     kind: 'daily',
-    starts_at: WINDOW_START,
-    ends_at: windows.endsAt ?? WINDOW_END,
+    starts_at: harnessWindowStart,
+    ends_at: windows.endsAt ?? harnessWindowEnd,
     currency: 'USD',
     hard_limit_usd: windows.dailyLimit ?? 0.5,
   });
@@ -218,8 +230,8 @@ async function harness(
     receipt_id: 'approval-001',
     issuer: 'starlight-approval',
     key_id: 'approval-key-001',
-    issued_at: NOW,
-    expires_at: EXPIRES,
+    issued_at: harnessNow,
+    expires_at: harnessExpires,
     binding_digest_sha256: digest,
     scope: 'admit-bounded-operation',
     allowed_capabilities: ['repository.read', 'repository.write'],
@@ -229,19 +241,23 @@ async function harness(
     receipt_id: 'budget-001',
     issuer: 'starlight-budget',
     key_id: 'budget-key-001',
-    issued_at: NOW,
-    expires_at: EXPIRES,
+    issued_at: harnessNow,
+    expires_at: harnessExpires,
     binding_digest_sha256: digest,
     budget_policy_id: operation.budget_policy_id,
     hard_limit_usd: 0.5,
   }, BUDGET_SECRET);
   await store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
-  await store.putPreparedOperation(operation.operation_id, digest, NOW);
+  await store.putPreparedOperation(operation.operation_id, digest, harnessNow);
   const authority = new OperationAuthority(store, {
     approvalIssuers: { [approval.issuer]: { [approval.key_id]: APPROVAL_SECRET } },
     budgetIssuers: { [budget.issuer]: { [budget.key_id]: BUDGET_SECRET } },
-  }, 5 * 60_000, () => NOW);
-  return { pool, store, authority, operation, approval, budget };
+  }, 5 * 60_000, () => harnessNow);
+  return {
+    pool, store, authority, operation, approval, budget,
+    windowStart: harnessWindowStart,
+    windowEnd: windows.endsAt ?? harnessWindowEnd,
+  };
 }
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -319,7 +335,7 @@ function runnerClaim(
   h: Harness,
   reservation: Awaited<ReturnType<typeof reserve>>,
   redemptionId: string,
-  overrides: Partial<{ claim_request_id: string; control_token: string; heartbeat_token: string; start_observation_token: string; outcome_token: string }> = {},
+  overrides: Partial<{ claim_request_id: string; control_token: string; heartbeat_token: string; start_observation_token: string; outcome_token: string; usage_reconciliation_token: string; provider_usage_correlation_id: string }> = {},
 ) {
   return {
     claim_request_id: '00000000-0000-4000-8000-000000000401',
@@ -332,6 +348,8 @@ function runnerClaim(
     heartbeat_token: HEARTBEAT_TOKEN,
     start_observation_token: START_OBSERVATION_TOKEN,
     outcome_token: OUTCOME_TOKEN,
+    usage_reconciliation_token: USAGE_TOKEN,
+    provider_usage_correlation_id: 'provider-usage-correlation-001',
     ...overrides,
   };
 }
@@ -485,6 +503,83 @@ function runnerOutcome(
     effect_id: h.operation.effect_id,
     binding_digest_sha256: reservation.binding_digest_sha256,
     outcome_token: OUTCOME_TOKEN,
+    ...overrides,
+  };
+}
+
+function runnerUsageEvidence(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  claimId: string,
+  outcomeId: string,
+  intervalStart: string,
+  intervalEnd: string,
+  overrides: Partial<RunnerUsageEvidence> = {},
+): RunnerUsageEvidence {
+  const observedAt = new Date(Math.max(Date.now(), Date.parse(intervalEnd))).toISOString();
+  const statementStatus = overrides.statement_status ?? 'provisional';
+  return {
+    schema_version: 'starlight.runner_usage_provider_evidence.v1',
+    provider_event_id: '00000000-0000-4000-8000-000000000901',
+    reservation_id: reservation.reservation_id,
+    claim_id: claimId,
+    outcome_id: outcomeId,
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    runner_id: 'openai-codex-worker',
+    runner_identity_evidence_ref: 'identity-attestation-001',
+    runner_instance_id: 'runner-instance-001',
+    runtime_id: 'railway-temporal',
+    host_id: 'trusted-host-001',
+    channel_binding_sha256: '9'.repeat(64),
+    launch_attempt_id: 'launch-attempt-001',
+    fencing_generation: 1,
+    process_instance_sha256: null,
+    provider_id: 'provider-test-001',
+    provider_account_ref: 'provider-account-test-001',
+    provider_usage_correlation_id: 'provider-usage-correlation-001',
+    meter_id: 'provider-cost-usd',
+    evidence_ref: 'provider-usage-evidence-001',
+    evidence_sha256: 'e'.repeat(64),
+    usage_started_at: intervalStart,
+    usage_ended_at: intervalEnd,
+    statement_status: statementStatus,
+    statement_finalized_at: statementStatus === 'final' ? observedAt : null,
+    observed_at: observedAt,
+    access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+    currency: 'USD',
+    cumulative_cost_usd: '0.000000',
+    authn_kind: 'provider-signed-statement',
+    issuer: 'provider-billing-test',
+    key_id: 'provider-billing-key-001',
+    ...overrides,
+  };
+}
+
+function runnerUsageRequest(
+  h: Harness,
+  reservation: Awaited<ReturnType<typeof reserve>>,
+  claimId: string,
+  outcomeId: string,
+  overrides: Partial<{
+    usage_request_id: string;
+    usage_sequence: number;
+    usage_reconciliation_token: string;
+    next_usage_reconciliation_token: string;
+  }> = {},
+) {
+  return {
+    usage_request_id: '00000000-0000-4000-8000-000000000a01',
+    usage_sequence: 1,
+    reservation_id: reservation.reservation_id,
+    claim_id: claimId,
+    outcome_id: outcomeId,
+    operation_id: h.operation.operation_id,
+    effect_id: h.operation.effect_id,
+    binding_digest_sha256: reservation.binding_digest_sha256,
+    usage_reconciliation_token: USAGE_TOKEN,
+    next_usage_reconciliation_token: NEXT_USAGE_TOKEN,
     ...overrides,
   };
 }
@@ -816,8 +911,8 @@ test('enforces immutable policy and daily windows across independent signed rece
       window_id: `${h.operation.budget_policy_id}:daily-window`,
       policy_id: h.operation.budget_policy_id,
       kind: 'daily',
-      starts_at: WINDOW_START,
-      ends_at: WINDOW_END,
+      starts_at: h.windowStart,
+      ends_at: h.windowEnd,
       currency: 'USD',
       hard_limit_usd: 0.5,
     });
@@ -826,8 +921,8 @@ test('enforces immutable policy and daily windows across independent signed rece
       window_id: `${h.operation.budget_policy_id}:daily-window`,
       policy_id: h.operation.budget_policy_id,
       kind: 'daily',
-      starts_at: WINDOW_START,
-      ends_at: WINDOW_END,
+      starts_at: h.windowStart,
+      ends_at: h.windowEnd,
       currency: 'USD',
       hard_limit_usd: 1,
     });
@@ -837,8 +932,8 @@ test('enforces immutable policy and daily windows across independent signed rece
       window_id: 'overlapping-daily-window',
       policy_id: h.operation.budget_policy_id,
       kind: 'daily',
-      starts_at: new Date(NOW_MS).toISOString(),
-      ends_at: new Date(NOW_MS + 20 * 60_000).toISOString(),
+      starts_at: new Date(Date.parse(h.windowStart) + 60_000).toISOString(),
+      ends_at: new Date(Date.parse(h.windowStart) + 20 * 60_000).toISOString(),
       currency: 'USD',
       hard_limit_usd: 1,
     });
@@ -852,7 +947,7 @@ test('enforces immutable policy and daily windows across independent signed rece
     const first = await reserve(h);
     assert.equal(first.budget_policy_id, h.operation.budget_policy_id);
     assert.deepEqual(first.budget_windows.map((window) => window.kind).sort(), ['daily', 'policy']);
-    assert.ok(first.budget_windows.every((window) => window.starts_at === WINDOW_START && window.ends_at === WINDOW_END));
+    assert.ok(first.budget_windows.every((window) => window.starts_at === h.windowStart && window.ends_at === h.windowEnd));
     const secondOperation = binding({ operation_id: 'operation-aggregate-002', effect_id: 'effect-aggregate-002', call_id: 'call-aggregate-002' });
     const second = await admitRelated(h, secondOperation, 'aggregate-002');
     assert.equal(second.admitted, true);
@@ -894,7 +989,7 @@ test('the tighter daily window wins and a reservation cannot cross either window
 
   await t.test('half-open boundary', async () => {
     const operation = binding({ budget_policy_id: 'boundary-policy' });
-    const h = await harness(operation, { endsAt: new Date(NOW_MS + 30_000).toISOString() });
+    const h = await harness(operation, { endsAt: new Date(Date.now() + 30_000).toISOString() });
     try {
       const denied = await h.authority.admit({
         binding: h.operation, approval_receipt: h.approval, budget_receipt: h.budget,
@@ -994,6 +1089,7 @@ test('requires server-owned preparation and strictly valid, fresh host evidence'
       reconcileRunnerHeartbeatExpiry: async (input) => ({ reconciled: false, reservation_id: input.reservation_id, state: null, expired: false, blockers: [] }),
       observeRunnerStart: async () => ({ observed: false, receipt: null, blockers: [] }),
       settleRunnerOutcome: async () => ({ settled: false, receipt: null, blockers: [] }),
+      recordRunnerUsageEvidence: async () => ({ recorded: false, receipt: null, blockers: [] }),
       cancel: async (input) => ({ cancelled: false, reservation_id: input.reservation_id, state: null, already_terminal: false, released_cost_usd: 0, blockers: [] }),
       recordDenial: async () => {},
     }, { approvalIssuers: {}, budgetIssuers: {} }, Number.NaN),
@@ -1850,6 +1946,8 @@ test('settles fenced runner outcomes once, releases only host capacity, and reta
             heartbeat_token: 'I'.repeat(43),
             start_observation_token: 'T'.repeat(43),
             outcome_token: 'Y'.repeat(43),
+            usage_reconciliation_token: 'Z'.repeat(43),
+            provider_usage_correlation_id: `provider-correlation-${suffix}`,
           };
           claimInput[field] = recycledToken;
           const denied = await h.authority.claimRunnerStart(claimInput);
@@ -1896,6 +1994,228 @@ test('settles fenced runner outcomes once, releases only host capacity, and reta
       const rows = await h.pool.rows('SELECT state,broker_role_contract_sha256 FROM swarm_authority_reservations');
       assert.equal(rows[0].state, 'runner-terminal-observed');
       assert.equal(rows[0].broker_role_contract_sha256, 'f'.repeat(64));
+    } finally { await h.pool.close(); }
+  });
+});
+
+test('records authenticated provider usage evidence without releasing committed budget', async (t) => {
+  await t.test('default usage attestor denies evidence and preserves ledgers', async () => {
+    let outcomeEvidence: RunnerOutcomeEvidence | undefined;
+    const outcomeAttestor: RunnerOutcomeEvidenceAttestor = async () => outcomeEvidence
+      ? { valid: true, evidence: outcomeEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+    const h = await harness(binding(), {}, runnerSessionAttestor, undefined, outcomeAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true, claim.blockers.join(' '));
+      if (!claim.claimed) return;
+      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'never-started');
+      const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
+      assert.equal(settled.settled, true, settled.blockers.join(' '));
+      if (!settled.settled) return;
+      const denied = await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+      ));
+      assert.equal(denied.recorded, false);
+      assert.match(denied.blockers.join(' '), /attestor is not configured/i);
+      const rows = await h.pool.rows(`SELECT b.committed_usd,host.authorized_slots
+        FROM swarm_authority_budgets b,swarm_authority_hosts host`);
+      assert.deepEqual([Number(rows[0].committed_usd), Number(rows[0].authorized_slots)], [0.25, 1]);
+      assert.equal((await h.pool.rows('SELECT * FROM swarm_authority_usage_evidence')).length, 0);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('provisional then final evidence rotates credentials idempotently and releases zero', async () => {
+    let outcomeEvidence: RunnerOutcomeEvidence | undefined;
+    let usageEvidence: RunnerUsageEvidence | undefined;
+    const outcomeAttestor: RunnerOutcomeEvidenceAttestor = async () => outcomeEvidence
+      ? { valid: true, evidence: outcomeEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+    const usageAttestor: RunnerUsageEvidenceAttestor = async () => usageEvidence
+      ? { valid: true, evidence: usageEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
+    const h = await harness(binding(), {}, runnerSessionAttestor, undefined, outcomeAttestor, usageAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true, claim.blockers.join(' '));
+      if (!claim.claimed) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'never-started');
+      const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
+      assert.equal(settled.settled, true, settled.blockers.join(' '));
+      if (!settled.settled) return;
+
+      usageEvidence = runnerUsageEvidence(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        claim.receipt.accepted_at, settled.receipt.outcome_at,
+      );
+      const firstInput = runnerUsageRequest(h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id);
+      const first = await h.authority.recordRunnerUsageEvidence(firstInput);
+      assert.equal(first.recorded, true, first.blockers.join(' '));
+      if (!first.recorded) return;
+      assert.deepEqual([
+        first.receipt.statement_status, first.receipt.cumulative_cost_usd,
+        first.receipt.actual_usage_reconciled, first.receipt.budget_commitment_released,
+        first.receipt.released_cost_usd,
+      ], ['provisional', '0.000000', false, false, '0.000000']);
+      const retry = await h.authority.recordRunnerUsageEvidence(firstInput);
+      assert.equal(retry.recorded, true, retry.blockers.join(' '));
+      if (retry.recorded) assert.deepEqual(retry.receipt, first.receipt);
+
+      const finalEvidence = runnerUsageEvidence(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        claim.receipt.accepted_at, settled.receipt.outcome_at,
+        {
+          provider_event_id: '00000000-0000-4000-8000-000000000902',
+          evidence_ref: 'provider-usage-evidence-002',
+          evidence_sha256: 'f'.repeat(64),
+          statement_status: 'final',
+          cumulative_cost_usd: '0.000000',
+        },
+      );
+      const finalInput = runnerUsageRequest(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        {
+          usage_request_id: '00000000-0000-4000-8000-000000000a02',
+          usage_sequence: 2,
+          usage_reconciliation_token: NEXT_USAGE_TOKEN,
+          next_usage_reconciliation_token: SECOND_NEXT_USAGE_TOKEN,
+        },
+      );
+      const driftCases: Array<[string, Partial<RunnerUsageEvidence>]> = [
+        ['provider', { provider_id: 'provider-test-002' }],
+        ['account', { provider_account_ref: 'provider-account-test-002' }],
+        ['meter', { meter_id: 'provider-tokens' }],
+        ['issuer', { issuer: 'provider-billing-test-002' }],
+        ['key', { key_id: 'provider-billing-key-002' }],
+        ['start', { usage_started_at: settled.receipt.outcome_at }],
+        ['end', { usage_ended_at: claim.receipt.accepted_at,
+          statement_finalized_at: finalEvidence.observed_at }],
+      ];
+      for (const [name, drift] of driftCases) {
+        usageEvidence = { ...finalEvidence, ...drift };
+        const denied = await h.authority.recordRunnerUsageEvidence(finalInput);
+        assert.equal(denied.recorded, false, name);
+        assert.match(denied.blockers.join(' '), /stream identity, key, interval, or token chain drifted/i, name);
+      }
+      usageEvidence = finalEvidence;
+      const final = await h.authority.recordRunnerUsageEvidence(finalInput);
+      assert.equal(final.recorded, true, final.blockers.join(' '));
+      if (final.recorded) assert.equal(final.receipt.statement_status, 'final');
+      const rows = await h.pool.rows(`SELECT b.committed_usd,host.authorized_slots
+        FROM swarm_authority_budgets b,swarm_authority_hosts host`);
+      assert.deepEqual([Number(rows[0].committed_usd), Number(rows[0].authorized_slots)], [0.25, 1]);
+      assert.equal((await h.pool.rows('SELECT * FROM swarm_authority_usage_evidence')).length, 2);
+      assert.equal((await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-usage-evidence-observed'")).length, 2);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('over-budget evidence is retained as a breach while every commitment remains locked', async () => {
+    let outcomeEvidence: RunnerOutcomeEvidence | undefined;
+    let usageEvidence: RunnerUsageEvidence | undefined;
+    const outcomeAttestor: RunnerOutcomeEvidenceAttestor = async () => outcomeEvidence
+      ? { valid: true, evidence: outcomeEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+    const usageAttestor: RunnerUsageEvidenceAttestor = async () => usageEvidence
+      ? { valid: true, evidence: usageEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
+    const h = await harness(binding(), {}, runnerSessionAttestor, undefined, outcomeAttestor, usageAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true, claim.blockers.join(' '));
+      if (!claim.claimed) return;
+      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'never-started');
+      const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
+      assert.equal(settled.settled, true, settled.blockers.join(' '));
+      if (!settled.settled) return;
+      usageEvidence = runnerUsageEvidence(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        claim.receipt.accepted_at, settled.receipt.outcome_at,
+        { statement_status: 'final', cumulative_cost_usd: '0.300000' },
+      );
+      const recorded = await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+      ));
+      assert.equal(recorded.recorded, true, recorded.blockers.join(' '));
+      if (!recorded.recorded) return;
+      assert.equal(recorded.receipt.budget_breach_observed, true);
+      assert.equal(recorded.receipt.budget_commitment_released, false);
+      assert.equal(recorded.receipt.released_cost_usd, '0.000000');
+      const ledgers = await h.pool.rows(`SELECT b.committed_usd,w.committed_usd AS window_committed
+        FROM swarm_authority_budgets b CROSS JOIN swarm_authority_budget_windows w ORDER BY w.window_id`);
+      assert.ok(ledgers.every((row) => Number(row.committed_usd) === 0.25
+        && Number(row.window_committed) === 0.25));
+      assert.equal((await h.pool.rows("SELECT event FROM swarm_authority_audit WHERE event='runner-usage-budget-breach'")).length, 1);
+    } finally { await h.pool.close(); }
+  });
+
+  await t.test('migration rejects stream, token-chain, and binding corruption', async () => {
+    let outcomeEvidence: RunnerOutcomeEvidence | undefined;
+    let usageEvidence: RunnerUsageEvidence | undefined;
+    const outcomeAttestor: RunnerOutcomeEvidenceAttestor = async () => outcomeEvidence
+      ? { valid: true, evidence: outcomeEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
+    const usageAttestor: RunnerUsageEvidenceAttestor = async () => usageEvidence
+      ? { valid: true, evidence: usageEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
+    const h = await harness(binding(), {}, runnerSessionAttestor, undefined, outcomeAttestor, usageAttestor);
+    try {
+      const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+      const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
+      assert.equal(claim.claimed, true, claim.blockers.join(' '));
+      if (!claim.claimed) return;
+      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'never-started');
+      const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
+      assert.equal(settled.settled, true, settled.blockers.join(' '));
+      if (!settled.settled) return;
+      usageEvidence = runnerUsageEvidence(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        claim.receipt.accepted_at, settled.receipt.outcome_at,
+      );
+      assert.equal((await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+      ))).recorded, true);
+      usageEvidence = runnerUsageEvidence(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        claim.receipt.accepted_at, settled.receipt.outcome_at,
+        {
+          provider_event_id: '00000000-0000-4000-8000-000000000903',
+          evidence_ref: 'provider-usage-evidence-003', evidence_sha256: 'a'.repeat(64),
+          statement_status: 'final', cumulative_cost_usd: '0.000000',
+        },
+      );
+      assert.equal((await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
+        h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
+        {
+          usage_request_id: '00000000-0000-4000-8000-000000000a03', usage_sequence: 2,
+          usage_reconciliation_token: NEXT_USAGE_TOKEN,
+          next_usage_reconciliation_token: SECOND_NEXT_USAGE_TOKEN,
+        },
+      ))).recorded, true);
+      const original = (await h.pool.rows(`SELECT provider_id,next_token_sha256,authorized_cost_usd
+        FROM swarm_authority_usage_evidence WHERE usage_sequence=2`))[0];
+
+      await h.pool.execute("UPDATE swarm_authority_usage_evidence SET provider_id='drifted-provider' WHERE usage_sequence=2");
+      await assert.rejects(h.store.initialize(), /stream drifted or regressed/i);
+      await h.pool.execute(`UPDATE swarm_authority_usage_evidence SET provider_id='${String(original.provider_id)}'
+        WHERE usage_sequence=2`);
+      await h.store.initialize();
+
+      await h.pool.execute(`UPDATE swarm_authority_usage_evidence SET next_token_sha256='${'0'.repeat(64)}'
+        WHERE usage_sequence=2`);
+      await assert.rejects(h.store.initialize(), /token chain is missing or inconsistent/i);
+      await h.pool.execute(`UPDATE swarm_authority_usage_evidence
+        SET next_token_sha256='${String(original.next_token_sha256)}' WHERE usage_sequence=2`);
+      await h.store.initialize();
+
+      await h.pool.execute('UPDATE swarm_authority_usage_evidence SET authorized_cost_usd=0.200000 WHERE usage_sequence=2');
+      await assert.rejects(h.store.initialize(), /binding or breach attribution is inconsistent/i);
+      await h.pool.execute(`UPDATE swarm_authority_usage_evidence
+        SET authorized_cost_usd=${Number(original.authorized_cost_usd)} WHERE usage_sequence=2`);
+      await h.store.initialize();
     } finally { await h.pool.close(); }
   });
 });
@@ -2158,19 +2478,22 @@ test('runner claim quarantines expired, revoked, or corrupted committed authorit
 });
 
 test('runner claim expiry is capped by the original transport observation', async () => {
-  const observed = Date.now() - 55_000;
-  const nearlyStale: RunnerSessionAttestor = async () => ({
-    valid: true,
-    session: {
-      runner_id: 'openai-codex-worker', runner_identity_evidence_ref: 'identity-attestation-001',
-      runner_instance_id: 'runner-instance-nearly-stale', runtime_id: 'railway-temporal',
-      host_id: 'trusted-host-001', channel_binding_sha256: '8'.repeat(64),
-      launch_attempt_id: 'launch-attempt-nearly-stale', fencing_generation: 1,
-      observed_at: new Date(observed).toISOString(),
-      access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
-    },
-    blockers: [],
-  });
+  let observed = 0;
+  const nearlyStale: RunnerSessionAttestor = async () => {
+    observed = Date.now() - 55_000;
+    return {
+      valid: true,
+      session: {
+        runner_id: 'openai-codex-worker', runner_identity_evidence_ref: 'identity-attestation-001',
+        runner_instance_id: 'runner-instance-nearly-stale', runtime_id: 'railway-temporal',
+        host_id: 'trusted-host-001', channel_binding_sha256: '8'.repeat(64),
+        launch_attempt_id: 'launch-attempt-nearly-stale', fencing_generation: 1,
+        observed_at: new Date(observed).toISOString(),
+        access_review_expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+      },
+      blockers: [],
+    };
+  };
   const h = await harness(binding(), {}, nearlyStale);
   try {
     const { reservation, redeemed } = await authorizeForRunnerClaim(h, 10_000);
@@ -2610,9 +2933,10 @@ test('admission counts both committed cost and authorized host slots', async (t)
   await t.test('authorized slot exhausts host capacity', async () => {
     const h = await harness();
     try {
+      const observedAt = new Date().toISOString();
       await h.store.putHostEvidence({
-        host_id: h.operation.host_id, observed_at: NOW, status: 'ready', capacity_slots: 1,
-        secret_readiness: true, access_review_expires_at: EXPIRES,
+        host_id: h.operation.host_id, observed_at: observedAt, status: 'ready', capacity_slots: 1,
+        secret_readiness: true, access_review_expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
         allowed_capabilities: ['repository.read', 'repository.write'],
       });
       await authorize(h);

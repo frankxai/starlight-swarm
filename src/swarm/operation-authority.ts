@@ -222,8 +222,11 @@ export const runnerClaimInputSchema = z.object({
   heartbeat_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   start_observation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   outcome_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  usage_reconciliation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  provider_usage_correlation_id: id,
 }).strict().superRefine((value, context) => {
-  const credentials = [value.control_token, value.heartbeat_token, value.start_observation_token, value.outcome_token];
+  const credentials = [value.control_token, value.heartbeat_token, value.start_observation_token,
+    value.outcome_token, value.usage_reconciliation_token];
   if (new Set(credentials).size !== credentials.length) {
     context.addIssue({
       code: 'custom',
@@ -289,6 +292,29 @@ export const runnerOutcomeInputSchema = z.object({
 }).strict();
 
 export type RunnerOutcomeInput = z.infer<typeof runnerOutcomeInputSchema>;
+
+export const runnerUsageEvidenceInputSchema = z.object({
+  usage_request_id: z.uuid(),
+  usage_sequence: z.number().int().min(1).max(1_000_000),
+  reservation_id: z.uuid(),
+  claim_id: z.uuid(),
+  outcome_id: z.uuid(),
+  operation_id: id,
+  effect_id: id,
+  binding_digest_sha256: digest,
+  usage_reconciliation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  next_usage_reconciliation_token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict().superRefine((value, context) => {
+  if (value.usage_reconciliation_token === value.next_usage_reconciliation_token) {
+    context.addIssue({
+      code: 'custom',
+      path: ['next_usage_reconciliation_token'],
+      message: 'Current and next usage-reconciliation credentials must be distinct.',
+    });
+  }
+});
+
+export type RunnerUsageEvidenceInput = z.infer<typeof runnerUsageEvidenceInputSchema>;
 
 export const cancellationInputSchema = z.object({
   reservation_id: z.uuid(),
@@ -397,6 +423,8 @@ export interface RunnerClaimReceipt {
   heartbeat_token_sha256: string;
   start_observation_token_sha256: string;
   outcome_token_sha256: string;
+  usage_reconciliation_token_sha256: string;
+  provider_usage_correlation_id: string;
   launch_attempt_id: string;
   fencing_generation: number;
   transport_state: 'attested-not-deployed';
@@ -519,6 +547,46 @@ export type RunnerOutcomeResult =
   | { settled: true; receipt: RunnerOutcomeReceipt; blockers: [] }
   | { settled: false; receipt: null; blockers: string[] };
 
+export interface RunnerUsageEvidenceReceipt {
+  schema_version: 'starlight.runner_usage_evidence.v1';
+  usage_evidence_id: string;
+  usage_request_id: string;
+  usage_sequence: number;
+  provider_event_id: string;
+  reservation_id: string;
+  claim_id: string;
+  outcome_id: string;
+  operation_id: string;
+  effect_id: string;
+  binding_digest_sha256: string;
+  provider_id: string;
+  provider_account_ref: string;
+  provider_usage_correlation_id: string;
+  meter_id: string;
+  evidence_ref: string;
+  evidence_sha256: string;
+  usage_started_at: string;
+  usage_ended_at: string;
+  statement_finalized_at: string | null;
+  evidence_observed_at: string;
+  accepted_at: string;
+  statement_status: 'provisional' | 'final';
+  currency: 'USD';
+  cumulative_cost_usd: string;
+  authorized_cost_usd: string;
+  budget_breach_observed: boolean;
+  actual_usage_reconciled: false;
+  budget_commitment_released: false;
+  released_cost_usd: '0.000000';
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  workload_effect_observed: false;
+}
+
+export type RunnerUsageEvidenceResult =
+  | { recorded: true; receipt: RunnerUsageEvidenceReceipt; blockers: [] }
+  | { recorded: false; receipt: null; blockers: string[] };
+
 export type CancellationResult =
   | { cancelled: true; reservation_id: string; state: 'cancelled'; already_terminal: boolean; released_cost_usd: number; blockers: [] }
   | { cancelled: false; reservation_id: string; state: null | 'expired' | 'stop-requested'; already_terminal: boolean; released_cost_usd: 0; blockers: string[] };
@@ -539,6 +607,7 @@ export interface OperationAuthorityStore {
   reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult>;
   observeRunnerStart(input: RunnerStartObservationInput): Promise<RunnerStartObservationResult>;
   settleRunnerOutcome(input: RunnerOutcomeInput): Promise<RunnerOutcomeResult>;
+  recordRunnerUsageEvidence(input: RunnerUsageEvidenceInput): Promise<RunnerUsageEvidenceResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -771,6 +840,19 @@ export class OperationAuthority {
       return { settled: false, receipt: null, blockers: ['A durable authority store is required.'] };
     }
     return this.store.settleRunnerOutcome(parsed.data);
+  }
+
+  async recordRunnerUsageEvidence(input: unknown): Promise<RunnerUsageEvidenceResult> {
+    const parsed = runnerUsageEvidenceInputSchema.safeParse(input);
+    if (!parsed.success) {
+      const at = new Date().toISOString();
+      await this.store.recordDenial('0'.repeat(64), 'invalid-operation', at, ['Runner usage-evidence request is invalid.']);
+      return { recorded: false, receipt: null, blockers: ['Runner usage-evidence request is invalid.'] };
+    }
+    if (!this.store.durable) {
+      return { recorded: false, receipt: null, blockers: ['A durable authority store is required.'] };
+    }
+    return this.store.recordRunnerUsageEvidence(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {
