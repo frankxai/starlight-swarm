@@ -2051,9 +2051,10 @@ test('records authenticated provider usage evidence without releasing committed 
       const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
       assert.equal(settled.settled, true, settled.blockers.join(' '));
       if (!settled.settled) return;
-      const denied = await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
+      const request = runnerUsageRequest(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
-      ));
+      );
+      const denied = await h.authority.recordRunnerUsageEvidence(request);
       assert.equal(denied.recorded, false);
       assert.match(denied.blockers.join(' '), /database authority is not configured/i);
       const rows = await h.pool.rows(`SELECT b.committed_usd,host.authorized_slots
@@ -2074,6 +2075,14 @@ test('records authenticated provider usage evidence without releasing committed 
         released_cost_usd: '0.000000',
         verifier_handoff_completed: false,
       });
+
+      const unavailableAuditPool: AuthoritySqlPool = {
+        connect: async () => { throw new Error('Audit pool unavailable.'); },
+      };
+      const unavailableAuditAuthority = new PostgresOperationAuthorityStore(unavailableAuditPool);
+      const stillDenied = await unavailableAuditAuthority.recordRunnerUsageEvidence(request);
+      assert.equal(stillDenied.recorded, false);
+      assert.match(stillDenied.blockers.join(' '), /database authority is not configured/i);
     } finally { await h.pool.close(); }
   });
 

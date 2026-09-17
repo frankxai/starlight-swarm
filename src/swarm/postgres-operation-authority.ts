@@ -1538,8 +1538,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
     blocker: string,
     verifierHandoffCompleted = true,
   ): Promise<void> {
-    const auditClient = await this.pool.connect();
+    let auditClient: AuthoritySqlClient | undefined;
     try {
+      auditClient = await this.pool.connect();
       await auditClient.query('BEGIN');
       await auditClient.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
       if (!await lockAuthority(auditClient)) {
@@ -1558,8 +1559,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       );
       await auditClient.query('COMMIT');
     } catch {
-      try { await auditClient.query('ROLLBACK'); } catch { /* the primary refusal remains authoritative */ }
-    } finally { auditClient.release?.(); }
+      if (auditClient) {
+        try { await auditClient.query('ROLLBACK'); } catch { /* the primary refusal remains authoritative */ }
+      }
+    } finally { auditClient?.release?.(); }
   }
 
   async putHostEvidence(evidence: TrustedHostEvidence): Promise<void> {
