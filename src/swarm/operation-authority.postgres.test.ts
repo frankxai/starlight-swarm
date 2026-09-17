@@ -36,6 +36,7 @@ const secondNextUsageToken = 'W'.repeat(43);
 const competingUsageToken = 'X'.repeat(43);
 const nextHeartbeatToken = 'N'.repeat(43);
 const competingHeartbeatToken = 'M'.repeat(43);
+let currentRunnerLaunchAttemptId = 'postgres-launch-attempt-001';
 const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
   valid: true,
   session: {
@@ -56,7 +57,7 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => {
       runtime_id: 'postgres-test-runtime',
       host_id: 'postgres-test-host',
       channel_binding_sha256: '9'.repeat(64),
-      launch_attempt_id: 'postgres-launch-attempt-001',
+      launch_attempt_id: currentRunnerLaunchAttemptId,
       fencing_generation: 1,
       observed_at: new Date(now).toISOString(),
       access_review_expires_at: new Date(now + 10 * 60_000).toISOString(),
@@ -142,6 +143,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   await store.initialize();
 
   const prepare = async () => {
+    currentRunnerLaunchAttemptId = 'postgres-launch-attempt-001';
     currentStartEvidence = undefined;
     currentOutcomeEvidence = undefined;
     currentUsageEvidence = undefined;
@@ -298,6 +300,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   };
 
   const claimForHeartbeat = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    currentRunnerLaunchAttemptId = `postgres-launch-attempt-${suffix}`;
     const claimInput = await authorize(h, suffix);
     const claimed = await h.authority.claimRunnerStart(claimInput);
     assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
@@ -316,6 +319,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   };
 
   const claimForStartObservation = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    currentRunnerLaunchAttemptId = `postgres-launch-attempt-${suffix}`;
     const claimInput = await authorize(h, suffix);
     const claimed = await h.authority.claimRunnerStart(claimInput);
     assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
@@ -334,7 +338,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       runtime_id: 'postgres-test-runtime',
       host_id: 'postgres-test-host',
       channel_binding_sha256: '9'.repeat(64),
-      launch_attempt_id: 'postgres-launch-attempt-001',
+      launch_attempt_id: currentRunnerLaunchAttemptId,
       fencing_generation: 1,
       process_instance_sha256: 'b'.repeat(64),
       evidence_ref: 'postgres-runtime-start-evidence-001',
@@ -356,6 +360,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   };
 
   const claimForNeverStartedOutcome = async (h: Awaited<ReturnType<typeof prepare>>, suffix: string) => {
+    currentRunnerLaunchAttemptId = `postgres-launch-attempt-${suffix}`;
     const claimInput = await authorize(h, suffix);
     const claimed = await h.authority.claimRunnerStart(claimInput);
     assert.equal(claimed.claimed, true, claimed.blockers.join(' '));
@@ -376,7 +381,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       runtime_id: 'postgres-test-runtime',
       host_id: 'postgres-test-host',
       channel_binding_sha256: '9'.repeat(64),
-      launch_attempt_id: 'postgres-launch-attempt-001',
+      launch_attempt_id: currentRunnerLaunchAttemptId,
       fencing_generation: 1,
       process_instance_sha256: null,
       start_observation_id: null,
@@ -1135,7 +1140,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       const finalizedAt = new Date().toISOString();
       currentUsageEvidence = {
         ...currentUsageEvidence,
-        provider_event_id: '00000000-0000-4000-8000-000000000976',
+        provider_event_id: '00000000-0000-4000-8000-000000000b76',
         evidence_ref: 'postgres-usage-evidence-76-final',
         evidence_sha256: 'f'.repeat(62) + '76',
         statement_status: 'final',
@@ -1436,6 +1441,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
         swarm_authority_budgets,swarm_authority_prepared_operations,
         swarm_authority_budget_holds,swarm_authority_budget_windows,
+        swarm_authority_usage_evidence,swarm_authority_usage_tokens,swarm_authority_heartbeat_tokens,
         swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
       const now = new Date();
       const issuedAt = now.toISOString();
