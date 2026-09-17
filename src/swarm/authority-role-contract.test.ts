@@ -270,6 +270,21 @@ test('attests a separate no-table-access provider verifier role', async () => {
   } finally { await db.close(); }
 });
 
+test('provider verifier rejects executable authority in another user schema', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE SCHEMA verifier_escape;
+    CREATE FUNCTION verifier_escape.unreviewed() RETURNS BOOLEAN LANGUAGE sql SECURITY DEFINER
+      AS 'SELECT TRUE';
+    GRANT USAGE ON SCHEMA verifier_escape TO starlight_usage_verifier;
+    GRANT EXECUTE ON FUNCTION verifier_escape.unreviewed() TO starlight_usage_verifier;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /schemas outside the public verifier boundary/i);
+  } finally { await db.close(); }
+});
+
 test('provider verifier attestation rejects transitive refusal-helper drift', async (t) => {
   const probes = [
     ['body', `CREATE OR REPLACE FUNCTION public.starlight_record_usage_refusal(jsonb,text)

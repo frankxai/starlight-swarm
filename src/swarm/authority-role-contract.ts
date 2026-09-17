@@ -373,6 +373,17 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
     USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT.database_grants)) {
     blockers.push('Usage-evidence database grants do not exactly match the verifier contract.');
   }
+  const unexpectedSchemaAccess = await client.query(`
+    SELECT n.nspname FROM pg_namespace n
+    WHERE n.nspname <> 'public' AND n.nspname <> 'information_schema'
+      AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+      AND (has_schema_privilege(current_user,n.oid,'USAGE')
+        OR has_schema_privilege(current_user,n.oid,'CREATE'))
+    LIMIT 1
+  `);
+  if (unexpectedSchemaAccess.rows.length) {
+    blockers.push('Usage-evidence database role must not access schemas outside the public verifier boundary.');
+  }
   const relationAuthority = await client.query(`
     SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
     CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER')) p(privilege_type)
