@@ -2927,6 +2927,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await client.query('COMMIT');
       return runnerClaimDenied(blocker);
     };
+    const rollbackAndDeny = async (blocker: string): Promise<RunnerClaimResult> => {
+      await client.query('ROLLBACK');
+      await client.query('BEGIN');
+      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
+      return deny(blocker);
+    };
     const receiptFrom = (row: Record<string, unknown>): RunnerClaimReceipt => ({
       schema_version: 'starlight.runner_claim_acceptance.v1',
       claim_id: String(row.runner_claim_id),
@@ -3312,7 +3318,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       );
       const initialization = initialized.rows[0]?.result as { ok?: boolean; blocker?: string } | undefined;
       if (initialization?.ok !== true) {
-        return await deny(initialization?.blocker ?? 'Runner usage stream could not be initialized.');
+        return await rollbackAndDeny(initialization?.blocker ?? 'Runner usage stream could not be initialized.');
       }
       const claimed = await client.query(
         `SELECT * FROM swarm_authority_reservations WHERE reservation_id=$1::uuid FOR UPDATE`,

@@ -1499,6 +1499,36 @@ test('runner claim is transport-attested, replay-safe, and remains not-started',
   } finally { await h.pool.close(); }
 });
 
+test('usage-stream initialization refusal rolls back runner claim authority', async () => {
+  const h = await harness(binding(), {}, runnerSessionAttestor);
+  try {
+    const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
+    const futureObservedAt = new Date(Date.now() + 30_000).toISOString();
+    await h.pool.execute(`UPDATE swarm_authority_broker_principals
+      SET observed_at='${futureObservedAt}'::timestamptz,
+          evidence=jsonb_set(evidence,'{observed_at}',to_jsonb('${futureObservedAt}'::text))`);
+
+    const denied = await h.authority.claimRunnerStart(
+      runnerClaim(h, reservation, redeemed.receipt.redemption_id),
+    );
+    assert.equal(denied.claimed, false);
+    assert.match(denied.blockers.join(' '), /broker principal is unavailable/i);
+    const rows = await h.pool.rows(`SELECT state,runner_claim_id,heartbeat_token_sha256,
+      usage_reconciliation_token_sha256 FROM swarm_authority_reservations`);
+    assert.deepEqual(rows[0], {
+      state: 'start-authorized-not-observed',
+      runner_claim_id: null,
+      heartbeat_token_sha256: null,
+      usage_reconciliation_token_sha256: null,
+    });
+    assert.equal((await h.pool.rows('SELECT * FROM swarm_authority_heartbeat_tokens')).length, 0);
+    assert.equal((await h.pool.rows('SELECT * FROM swarm_authority_usage_tokens')).length, 0);
+    assert.equal((await h.pool.rows(
+      "SELECT event FROM swarm_authority_audit WHERE event='runner-claim-denied'",
+    )).length, 1);
+  } finally { await h.pool.close(); }
+});
+
 test('runner heartbeat rotates credentials, renews once, and never proves execution', async () => {
   const h = await harness(binding(), {}, runnerSessionAttestor);
   try {
