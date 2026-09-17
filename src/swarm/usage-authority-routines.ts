@@ -200,11 +200,40 @@ DECLARE
   breach BOOLEAN;
   collision BOOLEAN;
   invoker_superuser BOOLEAN;
+  append_routine_oid pg_catalog.oid;
+  append_routine_owner_oid pg_catalog.oid;
+  invoker_oid pg_catalog.oid;
+  unexpected_execute_entries INTEGER;
+  invoker_execute_entries INTEGER;
   accepted_at pg_catalog.timestamptz;
   presented_digest TEXT;
   next_digest TEXT;
 BEGIN
   SELECT pg_catalog.clock_timestamp() INTO accepted_at;
+  SELECT proc.oid,proc.proowner INTO append_routine_oid,append_routine_owner_oid
+    FROM pg_catalog.pg_proc proc
+    JOIN pg_catalog.pg_namespace ns ON ns.oid=proc.pronamespace
+   WHERE ns.nspname='public' AND proc.proname='starlight_append_runner_usage_evidence'
+     AND pg_catalog.pg_get_function_identity_arguments(proc.oid)='jsonb';
+  SELECT role.oid INTO invoker_oid FROM pg_catalog.pg_roles role WHERE role.rolname=session_user;
+  IF append_routine_oid IS NULL OR invoker_oid IS NULL THEN
+    RETURN public.starlight_record_usage_refusal(p,'Usage verifier routine identity is missing or ambiguous.');
+  END IF;
+  SELECT
+    pg_catalog.count(*) FILTER (WHERE acl.privilege_type='EXECUTE'
+      AND (acl.grantee NOT IN (append_routine_owner_oid,invoker_oid)
+        OR (acl.grantee=invoker_oid AND acl.is_grantable)))::pg_catalog.int4,
+    pg_catalog.count(*) FILTER (WHERE acl.privilege_type='EXECUTE'
+      AND acl.grantee=invoker_oid AND acl.is_grantable=FALSE)::pg_catalog.int4
+    INTO unexpected_execute_entries,invoker_execute_entries
+    FROM pg_catalog.pg_proc proc
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(proc.proacl,pg_catalog.acldefault('f',proc.proowner))) acl
+   WHERE proc.oid=append_routine_oid;
+  IF unexpected_execute_entries <> 0 OR invoker_execute_entries <> 1 THEN
+    RETURN public.starlight_record_usage_refusal(p,
+      'Usage verifier routine execution grants do not identify one sole non-grantable verifier.');
+  END IF;
   IF NOT (p ?& ARRAY['usage_evidence_id','usage_request_id','usage_sequence','provider_event_id','reservation_id',
       'claim_id','outcome_id','operation_id','effect_id','binding_digest_sha256','role_contract_digest_sha256',
       'verifier_database_role','verifier_database_name','verifier_role_contract_sha256',

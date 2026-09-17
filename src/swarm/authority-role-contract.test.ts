@@ -285,6 +285,25 @@ test('provider verifier rejects executable authority in another user schema', as
   } finally { await db.close(); }
 });
 
+test('append routine itself rejects an additional executable grantee', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE ROLE starlight_rogue_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    GRANT USAGE ON SCHEMA public TO starlight_rogue_verifier;
+    GRANT EXECUTE ON FUNCTION public.starlight_append_runner_usage_evidence(jsonb)
+      TO starlight_rogue_verifier;
+  `);
+  try {
+    await db.exec('RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION starlight_rogue_verifier;');
+    const refused = await db.query<{ result: { ok: boolean; blocker: string; audited: boolean } }>(
+      `SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb) AS result`,
+    );
+    assert.equal(refused.rows[0]?.result.ok, false);
+    assert.equal(refused.rows[0]?.result.audited, true);
+    assert.match(refused.rows[0]?.result.blocker ?? '', /one sole non-grantable verifier/i);
+  } finally { await db.close(); }
+});
+
 test('provider verifier attestation rejects transitive refusal-helper drift', async (t) => {
   const probes = [
     ['body', `CREATE OR REPLACE FUNCTION public.starlight_record_usage_refusal(jsonb,text)
