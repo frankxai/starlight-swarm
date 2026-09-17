@@ -2060,6 +2060,20 @@ test('records authenticated provider usage evidence without releasing committed 
         FROM swarm_authority_budgets b,swarm_authority_hosts host`);
       assert.deepEqual([Number(rows[0].committed_usd), Number(rows[0].authorized_slots)], [0.25, 1]);
       assert.equal((await h.pool.rows('SELECT * FROM swarm_authority_usage_evidence')).length, 0);
+      const audit = await h.pool.rows(
+        "SELECT detail FROM swarm_authority_audit WHERE event='runner-usage-evidence-denied' ORDER BY seq DESC LIMIT 1",
+      );
+      assert.equal(audit.length, 1);
+      assert.deepEqual(audit[0]?.detail, {
+        reservation_id: reservation.reservation_id,
+        claim_id: claim.receipt.claim_id,
+        outcome_id: settled.receipt.outcome_id,
+        usage_request_id: '00000000-0000-4000-8000-000000000a01',
+        usage_sequence: 1,
+        blockers: ['Dedicated usage-evidence database authority is not configured.'],
+        released_cost_usd: '0.000000',
+        verifier_handoff_completed: false,
+      });
     } finally { await h.pool.close(); }
   });
 

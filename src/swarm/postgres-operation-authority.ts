@@ -1536,6 +1536,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   private async recordRunnerUsageEvidenceRefusal(
     request: RunnerUsageEvidenceInput,
     blocker: string,
+    verifierHandoffCompleted = true,
   ): Promise<void> {
     const auditClient = await this.pool.connect();
     try {
@@ -1552,7 +1553,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
           reservation_id: request.reservation_id, claim_id: request.claim_id,
           outcome_id: request.outcome_id, usage_request_id: request.usage_request_id,
           usage_sequence: request.usage_sequence, blockers: [blocker], released_cost_usd: '0.000000',
-          verifier_handoff_completed: true,
+          verifier_handoff_completed: verifierHandoffCompleted,
         })],
       );
       await auditClient.query('COMMIT');
@@ -4418,10 +4419,12 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   async recordRunnerUsageEvidence(input: RunnerUsageEvidenceInput): Promise<RunnerUsageEvidenceResult> {
     const parsed = runnerUsageEvidenceInputSchema.safeParse(input);
     if (!parsed.success) return runnerUsageEvidenceDenied('Runner usage-evidence request is invalid.');
-    if (!this.usageEvidencePool) {
-      return runnerUsageEvidenceDenied('Dedicated usage-evidence database authority is not configured.');
-    }
     const request = parsed.data;
+    if (!this.usageEvidencePool) {
+      const blocker = 'Dedicated usage-evidence database authority is not configured.';
+      await this.recordRunnerUsageEvidenceRefusal(request, blocker, false);
+      return runnerUsageEvidenceDenied(blocker);
+    }
     const client = await this.pool.connect();
     let brokerTransactionOpen = false;
     let brokerClientReleased = false;
