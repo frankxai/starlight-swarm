@@ -318,8 +318,10 @@ BEGIN
     RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage evidence is stale or future-dated.');
   END IF;
 
+  -- The authority control-row lock above serializes this routine globally. Do not
+  -- require UPDATE privilege on immutable evidence merely to take a second lock.
   SELECT * INTO prior FROM public.swarm_authority_usage_evidence
-   WHERE usage_request_id=(p->>'usage_request_id')::pg_catalog.uuid FOR UPDATE;
+   WHERE usage_request_id=(p->>'usage_request_id')::pg_catalog.uuid;
   IF FOUND THEN
     IF prior.reservation_id=(p->>'reservation_id')::pg_catalog.uuid
        AND prior.claim_id=(p->>'claim_id')::pg_catalog.uuid AND prior.outcome_id=(p->>'outcome_id')::pg_catalog.uuid
@@ -349,7 +351,7 @@ BEGIN
   END IF;
 
   SELECT * INTO latest FROM public.swarm_authority_usage_evidence
-   WHERE reservation_id=r.reservation_id ORDER BY usage_sequence DESC LIMIT 1 FOR UPDATE;
+   WHERE reservation_id=r.reservation_id ORDER BY usage_sequence DESC LIMIT 1;
   prior_sequence := CASE WHEN FOUND THEN latest.usage_sequence ELSE 0 END;
   IF latest.statement_status='final' THEN
     RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','A final provider usage statement is already recorded.');
