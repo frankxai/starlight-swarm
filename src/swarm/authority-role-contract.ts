@@ -422,7 +422,7 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
         initial.initprivs IS NULL
         AND n.nspname='information_schema'
         AND c.oid < 16384
-        AND c.relkind='v'
+        AND c.relkind IN ('r','v')
         AND actual.grantee=0
         AND actual.privilege_type='SELECT'
         AND actual.is_grantable=FALSE
