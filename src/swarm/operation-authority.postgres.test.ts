@@ -1203,7 +1203,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         usage_request_id: null,
         blockers: ['Runner usage-evidence append input is invalid.'],
         direct_function_refusal: true,
-        authenticated_database_role: 'starlight_usage_verifier',
+        authenticated_database_role: 'starlight_postgres_usage_verifier',
         authenticated_database_name: database.rows[0]?.name,
         released_cost_usd: '0.000000',
       });
