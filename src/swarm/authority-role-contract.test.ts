@@ -285,6 +285,28 @@ test('provider verifier rejects executable authority in another user schema', as
   } finally { await db.close(); }
 });
 
+test('provider verifier rejects non-default system-routine execution authority', async () => {
+  const db = await restrictedUsageDatabase(`
+    GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO starlight_usage_verifier;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /non-default system-routine execution authority/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects a PUBLIC grant restored on an initially restricted system routine', async () => {
+  const db = await restrictedUsageDatabase(`
+    GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /non-default system-routine execution authority/i);
+  } finally { await db.close(); }
+});
+
 test('append routine itself rejects an additional executable grantee', async () => {
   const db = await restrictedUsageDatabase(`
     CREATE ROLE starlight_rogue_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -332,6 +354,27 @@ test('provider verifier attestation rejects transitive refusal-helper drift', as
       } finally { await db.close(); }
     });
   }
+});
+
+test('provider verifier requires only the exact append/refusal surface with one safe owner', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE ROLE starlight_refusal_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    CREATE ROLE starlight_overload_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ALTER FUNCTION public.starlight_record_usage_refusal(jsonb,text) OWNER TO starlight_refusal_owner;
+    REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(jsonb,text) FROM PUBLIC;
+    CREATE FUNCTION public.starlight_record_usage_refusal(text,text)
+      RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
+    ALTER FUNCTION public.starlight_record_usage_refusal(text,text) OWNER TO starlight_overload_owner;
+    REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(text,text) FROM PUBLIC;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /exactly the append and refusal routines/i);
+    assert.match(result.blockers.join(' '), /append and refusal routines must share one safe owner/i);
+  } finally { await db.close(); }
 });
 
 test('rejects every direct or PUBLIC column grant on the provider verifier', async (t) => {

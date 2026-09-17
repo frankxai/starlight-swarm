@@ -384,6 +384,27 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   if (unexpectedSchemaAccess.rows.length) {
     blockers.push('Usage-evidence database role must not access schemas outside the public verifier boundary.');
   }
+  const unexpectedSystemRoutineAuthority = await client.query(`
+    SELECT 1
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid=p.pronamespace
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=p.oid AND initial.classoid='pg_proc'::regclass AND initial.objsubid=0
+    CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND actual.privilege_type='EXECUTE'
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault('f',p.proowner))) baseline
+        WHERE baseline.grantee=actual.grantee
+          AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable
+      )
+    LIMIT 1
+  `);
+  if (unexpectedSystemRoutineAuthority.rows.length) {
+    blockers.push('Usage-evidence database role must not gain non-default system-routine execution authority.');
+  }
   const relationAuthority = await client.query(`
     SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
     CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER')) p(privilege_type)
@@ -425,7 +446,8 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   const authorityRoutines = await client.query(`
     SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' AS routine_name,
       p.prosecdef,p.prosrc,COALESCE(array_to_string(p.proconfig,','),'') AS proconfig,
-      owner.rolname AS owner_name,owner.rolcanlogin,owner.rolsuper,owner.rolcreaterole,owner.rolcreatedb,
+      owner.oid AS owner_oid,owner.rolname AS owner_name,owner.rolcanlogin,owner.rolsuper,
+      owner.rolcreaterole,owner.rolcreatedb,
       owner.rolreplication,owner.rolbypassrls,owner.rolinherit,
       (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE member=owner.oid) AS owner_outbound,
       (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE roleid=owner.oid) AS owner_inbound,
@@ -457,7 +479,13 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
       ('starlight_record_usage_refusal','starlight_append_runner_usage_evidence')
     ORDER BY routine_name
   `);
-  for (const identity of [USAGE_REFUSAL_ROUTINE, USAGE_EVIDENCE_APPEND_ROUTINE]) {
+  const expectedAuthorityRoutineIdentities = [USAGE_REFUSAL_ROUTINE, USAGE_EVIDENCE_APPEND_ROUTINE];
+  const exactAuthorityRoutines = authorityRoutines.rows.filter((routine) =>
+    expectedAuthorityRoutineIdentities.includes(String(routine.routine_name)));
+  if (authorityRoutines.rows.length !== 2 || exactAuthorityRoutines.length !== 2) {
+    blockers.push('Usage authority surface must contain exactly the append and refusal routines.');
+  }
+  for (const identity of expectedAuthorityRoutineIdentities) {
     const expected = USAGE_AUTHORITY_ROUTINES.find((candidate) => candidate.identity === identity);
     const actual = authorityRoutines.rows.find((candidate) => String(candidate.routine_name) === identity);
     if (!expected || !actual || actual.prosecdef !== true
@@ -473,6 +501,10 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
       || actual.public_execute === true || String(actual.owner_name) === databaseRole) {
       blockers.push(`Usage authority routine ${identity} is missing, drifted, publicly executable, or unsafely owned.`);
     }
+  }
+  const authorityRoutineOwners = new Set(exactAuthorityRoutines.map((routine) => String(routine.owner_oid)));
+  if (exactAuthorityRoutines.length === 2 && authorityRoutineOwners.size !== 1) {
+    blockers.push('Usage authority append and refusal routines must share one safe owner.');
   }
   if (blockers.length) return { valid: false, session: null, blockers };
   return {
