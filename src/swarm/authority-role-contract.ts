@@ -406,7 +406,9 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
     blockers.push('Usage-evidence database role must not gain non-default system-routine execution authority.');
   }
   const unexpectedSystemRelationAuthority = await client.query(`
-    SELECT 1
+    SELECT n.nspname,c.relname,c.oid::TEXT AS relation_oid,c.relkind,
+      actual.privilege_type,actual.grantee::TEXT AS grantee,actual.is_grantable,
+      initial.initprivs IS NULL AS initial_privileges_missing
     FROM pg_class c
     JOIN pg_namespace n ON n.oid=c.relnamespace
     LEFT JOIN pg_init_privs initial
@@ -426,7 +428,8 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
     LIMIT 1
   `);
   if (unexpectedSystemRelationAuthority.rows.length) {
-    blockers.push('Usage-evidence database role must not gain non-default system-relation or sequence authority.');
+    const relation = unexpectedSystemRelationAuthority.rows[0];
+    blockers.push(`Usage-evidence database role must not gain non-default system-relation or sequence authority: ${String(relation?.nspname)}.${String(relation?.relname)} oid=${String(relation?.relation_oid)} kind=${String(relation?.relkind)} privilege=${String(relation?.privilege_type)} grantee=${String(relation?.grantee)} grantable=${String(relation?.is_grantable)} initial-missing=${String(relation?.initial_privileges_missing)}.`);
   }
   const unexpectedSystemColumnAuthority = await client.query(`
     SELECT 1
