@@ -4660,10 +4660,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         ok?: boolean; blocker?: string; audited?: boolean; row?: Record<string, unknown>;
       } | undefined;
       if (appendResult?.ok !== true || !appendResult.row) {
-        // The SECURITY DEFINER routine records sanitized denials itself so direct callers
-        // cannot bypass the audit trail. Commit only that denial row; no authority mutation
-        // occurs before a false routine result. Transport/query failures still roll back and
-        // are audited through the broker path below.
+        // Preserve the routine's sanitized denial in the managed verifier path. PostgreSQL
+        // cannot force a caller-controlled transaction to commit, so arbitrary direct SQL is
+        // outside this audit guarantee. No authority mutation occurs before a false result.
         await usageClient.query(appendResult?.audited === true ? 'COMMIT' : 'ROLLBACK');
         usageTransactionOpen = false;
         usageClient.release?.();

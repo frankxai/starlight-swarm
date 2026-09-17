@@ -25,6 +25,19 @@ async function restrictedDatabase(extra = '') {
   return db;
 }
 
+async function restrictedUsageDatabase(extra = '') {
+  const db = new PGlite();
+  await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
+  await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_usage_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
+    ${usageEvidenceDatabaseRoleGrantSql('starlight_usage_verifier')}
+    ${extra}
+    SET SESSION AUTHORIZATION starlight_usage_verifier;`);
+  return db;
+}
+
 test('attests one direct-login broker role with only the exact redemption grants', async () => {
   const db = await restrictedDatabase();
   try {
@@ -239,14 +252,7 @@ test('the restricted role can execute the redemption SQL surface but not control
 });
 
 test('attests a separate no-table-access provider verifier role', async () => {
-  const db = new PGlite();
-  await db.exec(`${OPERATION_AUTHORITY_MIGRATION_SQL}
-    CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
-    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
-    CREATE ROLE starlight_usage_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
-    REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
-    ${usageEvidenceDatabaseRoleGrantSql('starlight_usage_verifier')}
-    SET SESSION AUTHORIZATION starlight_usage_verifier;`);
+  const db = await restrictedUsageDatabase();
   try {
     const result = await attestUsageEvidenceDatabaseSession(db);
     assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
@@ -262,6 +268,30 @@ test('attests a separate no-table-access provider verifier role', async () => {
     assert.equal(invalid.rows[0]?.result.audited, true);
     assert.match(invalid.rows[0]?.result.blocker ?? '', /input is invalid/i);
   } finally { await db.close(); }
+});
+
+test('provider verifier attestation rejects transitive refusal-helper drift', async (t) => {
+  const probes = [
+    ['body', `CREATE OR REPLACE FUNCTION public.starlight_record_usage_refusal(jsonb,text)
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+      AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`],
+    ['owner', 'ALTER FUNCTION public.starlight_record_usage_refusal(jsonb,text) OWNER TO starlight_usage_verifier;'],
+    ['PUBLIC execute', 'GRANT EXECUTE ON FUNCTION public.starlight_record_usage_refusal(jsonb,text) TO PUBLIC;'],
+    ['owner-held overload', `CREATE FUNCTION public.starlight_record_usage_refusal(text,text)
+      RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
+      ALTER FUNCTION public.starlight_record_usage_refusal(text,text) OWNER TO starlight_authority_owner;
+      REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(text,text) FROM PUBLIC;`],
+  ] as const;
+  for (const [name, mutation] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(mutation);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), /usage authority routine|routine grants/i);
+      } finally { await db.close(); }
+    });
+  }
 });
 
 test('rejects every direct or PUBLIC column grant on the provider verifier', async (t) => {

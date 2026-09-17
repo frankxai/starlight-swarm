@@ -48,6 +48,7 @@ BEGIN
     pg_catalog.clock_timestamp(),pg_catalog.jsonb_build_object(
       'reservation_id',audit_reservation_id,'usage_request_id',audit_request_id,
       'blockers',pg_catalog.jsonb_build_array(blocker),'direct_function_refusal',TRUE,
+      'authenticated_database_role',session_user,'authenticated_database_name',pg_catalog.current_database(),
       'released_cost_usd','0.000000'));
   RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker',blocker,'audited',TRUE);
 END`;
@@ -180,6 +181,11 @@ BEGIN
     (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
   VALUES (token_digest,r.reservation_id,0,r.runner_claim_request_id,accepted_at,'claim');
   RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',FALSE);
+EXCEPTION
+  WHEN invalid_datetime_format OR datetime_field_overflow OR invalid_text_representation
+       OR numeric_value_out_of_range THEN
+    RETURN public.starlight_record_usage_refusal(p,
+      'Runner usage-stream initialization contains semantically invalid typed values.');
 END`;
 
 export const USAGE_EVIDENCE_APPEND_BODY = String.raw`
@@ -496,6 +502,11 @@ BEGIN
         'released_cost_usd','0.000000','actual_usage_reconciled',FALSE));
   END IF;
   RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',FALSE,'row',pg_catalog.to_jsonb(inserted));
+EXCEPTION
+  WHEN invalid_datetime_format OR datetime_field_overflow OR invalid_text_representation
+       OR numeric_value_out_of_range THEN
+    RETURN public.starlight_record_usage_refusal(p,
+      'Runner usage evidence contains semantically invalid typed values.');
 END`;
 
 export const USAGE_AUTHORITY_ROUTINES = Object.freeze([

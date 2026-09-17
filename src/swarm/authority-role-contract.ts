@@ -411,30 +411,44 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   if (!sameSet(actualRoutines, USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT.routine_grants)) {
     blockers.push('Usage-evidence routine grants do not exactly match the verifier contract.');
   }
-  const routine = await client.query(`
-    SELECT p.prosecdef,p.prosrc,COALESCE(array_to_string(p.proconfig,','),'') AS proconfig,
+  const authorityRoutines = await client.query(`
+    SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' AS routine_name,
+      p.prosecdef,p.prosrc,COALESCE(array_to_string(p.proconfig,','),'') AS proconfig,
       owner.rolname AS owner_name,owner.rolcanlogin,owner.rolsuper,owner.rolcreaterole,owner.rolcreatedb,
       owner.rolreplication,owner.rolbypassrls,owner.rolinherit,
       (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE member=owner.oid) AS owner_outbound,
       (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE roleid=owner.oid) AS owner_inbound,
       has_schema_privilege(owner.rolname,'public','CREATE') AS owner_schema_create,
       has_database_privilege(owner.rolname,current_database(),'CREATE') AS owner_database_create,
+      EXISTS (SELECT 1 FROM pg_class owned_class WHERE owned_class.relowner=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_namespace owned_schema WHERE owned_schema.nspowner=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_database owned_database WHERE owned_database.datdba=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_proc owned_proc JOIN pg_namespace owned_ns ON owned_ns.oid=owned_proc.pronamespace
+             WHERE owned_proc.proowner=owner.oid AND (owned_ns.nspname<>'public'
+               OR owned_proc.proname||'('||pg_get_function_identity_arguments(owned_proc.oid)||')' NOT IN
+                 ('starlight_record_usage_refusal(jsonb, text)','starlight_initialize_runner_usage_stream(jsonb)',
+                  'starlight_append_runner_usage_evidence(jsonb)')))
+        AS owner_has_unreviewed_objects,
       has_function_privilege('public',p.oid,'EXECUTE') AS public_execute
     FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner
-    WHERE n.nspname='public' AND p.proname='starlight_append_runner_usage_evidence'
-      AND pg_get_function_identity_arguments(p.oid)='jsonb'
+    WHERE n.nspname='public' AND p.proname IN
+      ('starlight_record_usage_refusal','starlight_append_runner_usage_evidence')
+    ORDER BY routine_name
   `);
-  const expected = USAGE_AUTHORITY_ROUTINES.find((candidate) => candidate.identity === USAGE_EVIDENCE_APPEND_ROUTINE);
-  const actual = routine.rows[0];
-  if (routine.rows.length !== 1 || !expected || actual.prosecdef !== true
-    || sha256Digest(String(actual.prosrc).trim()) !== expected.body_sha256
-    || String(actual.proconfig).replace(/\s/g, '') !== 'search_path=pg_catalog,public'
-    || actual.rolcanlogin !== false || actual.rolsuper !== false || actual.rolcreaterole !== false
-    || actual.rolcreatedb !== false || actual.rolreplication !== false || actual.rolbypassrls !== false
-    || actual.rolinherit !== false || Number(actual.owner_outbound) !== 0 || Number(actual.owner_inbound) !== 0
-    || actual.owner_schema_create !== false || actual.owner_database_create !== false
-    || actual.public_execute === true || String(actual.owner_name) === databaseRole) {
-    blockers.push('Usage-evidence append routine is missing, drifted, publicly executable, or unsafely owned.');
+  for (const identity of [USAGE_REFUSAL_ROUTINE, USAGE_EVIDENCE_APPEND_ROUTINE]) {
+    const expected = USAGE_AUTHORITY_ROUTINES.find((candidate) => candidate.identity === identity);
+    const actual = authorityRoutines.rows.find((candidate) => String(candidate.routine_name) === identity);
+    if (!expected || !actual || actual.prosecdef !== true
+      || sha256Digest(String(actual.prosrc).trim()) !== expected.body_sha256
+      || String(actual.proconfig).replace(/\s/g, '') !== 'search_path=pg_catalog,public'
+      || actual.rolcanlogin !== false || actual.rolsuper !== false || actual.rolcreaterole !== false
+      || actual.rolcreatedb !== false || actual.rolreplication !== false || actual.rolbypassrls !== false
+      || actual.rolinherit !== false || Number(actual.owner_outbound) !== 0 || Number(actual.owner_inbound) !== 0
+      || actual.owner_schema_create !== false || actual.owner_database_create !== false
+      || actual.owner_has_unreviewed_objects !== false
+      || actual.public_execute === true || String(actual.owner_name) === databaseRole) {
+      blockers.push(`Usage authority routine ${identity} is missing, drifted, publicly executable, or unsafely owned.`);
+    }
   }
   if (blockers.length) return { valid: false, session: null, blockers };
   return {

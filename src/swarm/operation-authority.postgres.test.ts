@@ -1197,11 +1197,14 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         `SELECT detail FROM swarm_authority_audit
           WHERE event='runner-usage-evidence-denied' ORDER BY seq DESC LIMIT 1`,
       );
+      const database = await pool.query('SELECT current_database() AS name');
       assert.deepEqual(directAudit.rows[0]?.detail, {
         reservation_id: null,
         usage_request_id: null,
         blockers: ['Runner usage-evidence append input is invalid.'],
         direct_function_refusal: true,
+        authenticated_database_role: 'starlight_usage_verifier',
+        authenticated_database_name: database.rows[0]?.name,
         released_cost_usd: '0.000000',
       });
 
