@@ -251,10 +251,15 @@ test('attests a separate no-table-access provider verifier role', async () => {
     const result = await attestUsageEvidenceDatabaseSession(db);
     assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
     await assert.rejects(db.query('SELECT * FROM swarm_authority_reservations'), /permission denied/i);
-    const invalid = await db.query<{ result: { ok: boolean; blocker: string } }>(
+    await assert.rejects(
+      db.query(`SELECT public.starlight_record_usage_refusal('{}'::jsonb,'forged')`),
+      /permission denied/i,
+    );
+    const invalid = await db.query<{ result: { ok: boolean; blocker: string; audited: boolean } }>(
       `SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb) AS result`,
     );
     assert.equal(invalid.rows[0]?.result.ok, false);
+    assert.equal(invalid.rows[0]?.result.audited, true);
     assert.match(invalid.rows[0]?.result.blocker ?? '', /input is invalid/i);
   } finally { await db.close(); }
 });

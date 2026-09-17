@@ -1188,6 +1188,23 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         /permission denied/i,
       );
 
+      const directDenied = await verifierRolePool.query(
+        `SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb) AS result`,
+      );
+      assert.equal(directDenied.rows[0]?.result?.ok, false);
+      assert.equal(directDenied.rows[0]?.result?.audited, true);
+      const directAudit = await pool.query(
+        `SELECT detail FROM swarm_authority_audit
+          WHERE event='runner-usage-evidence-denied' ORDER BY seq DESC LIMIT 1`,
+      );
+      assert.deepEqual(directAudit.rows[0]?.detail, {
+        reservation_id: null,
+        usage_request_id: null,
+        blockers: ['Runner usage-evidence append input is invalid.'],
+        direct_function_refusal: true,
+        released_cost_usd: '0.000000',
+      });
+
       const results = await Promise.all([
         first.recordRunnerUsageEvidence(usage),
         second.recordRunnerUsageEvidence(usage),

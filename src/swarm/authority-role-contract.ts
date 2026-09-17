@@ -4,6 +4,7 @@ import {
   USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT,
   USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT_SHA256,
   USAGE_EVIDENCE_APPEND_ROUTINE,
+  USAGE_REFUSAL_ROUTINE,
   USAGE_STREAM_INITIALIZE_ROUTINE,
 } from './usage-authority-routines';
 export {
@@ -287,13 +288,14 @@ export const attestBrokerDatabaseSession: BrokerDatabaseSessionAttestor = async 
              OR EXISTS (SELECT 1 FROM pg_proc owned_proc JOIN pg_namespace owned_ns ON owned_ns.oid=owned_proc.pronamespace
                   WHERE owned_proc.proowner=owner.oid AND (owned_ns.nspname<>'public'
                     OR owned_proc.proname||'('||pg_get_function_identity_arguments(owned_proc.oid)||')' NOT IN
-                      ('starlight_initialize_runner_usage_stream(jsonb)','starlight_append_runner_usage_evidence(jsonb)')))
+                      ('starlight_record_usage_refusal(jsonb, text)','starlight_initialize_runner_usage_stream(jsonb)',
+                       'starlight_append_runner_usage_evidence(jsonb)')))
              AS owner_has_unreviewed_objects,
            has_function_privilege('public',p.oid,'EXECUTE') AS public_execute
     FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
     JOIN pg_roles owner ON owner.oid=p.proowner
     WHERE n.nspname='public' AND p.proname IN
-      ('starlight_initialize_runner_usage_stream','starlight_append_runner_usage_evidence')
+      ('starlight_record_usage_refusal','starlight_initialize_runner_usage_stream','starlight_append_runner_usage_evidence')
     ORDER BY routine_name
   `);
   const routineMetadata = usageRoutines.rows.map((routine) => ({
@@ -509,8 +511,10 @@ export function usageAuthorityRoutineOwnerGrantSql(untrustedRole: string): strin
     `GRANT UPDATE (updated_at) ON swarm_authority_control TO ${role};`,
     `GRANT UPDATE (usage_reconciliation_token_sha256,provider_usage_correlation_id) ON swarm_authority_reservations TO ${role};`,
     `GRANT USAGE ON SEQUENCE swarm_authority_audit_seq_seq TO ${role};`,
+    `ALTER FUNCTION public.${USAGE_REFUSAL_ROUTINE} OWNER TO ${role};`,
     `ALTER FUNCTION public.${USAGE_STREAM_INITIALIZE_ROUTINE} OWNER TO ${role};`,
     `ALTER FUNCTION public.${USAGE_EVIDENCE_APPEND_ROUTINE} OWNER TO ${role};`,
+    `REVOKE ALL ON FUNCTION public.${USAGE_REFUSAL_ROUTINE} FROM PUBLIC;`,
     `REVOKE ALL ON FUNCTION public.${USAGE_STREAM_INITIALIZE_ROUTINE} FROM PUBLIC;`,
     `REVOKE ALL ON FUNCTION public.${USAGE_EVIDENCE_APPEND_ROUTINE} FROM PUBLIC;`,
   ].join('\n');

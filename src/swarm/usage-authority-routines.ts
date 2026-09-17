@@ -15,6 +15,42 @@ export const USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT_SHA256 = sha256Digest(
 
 export const USAGE_STREAM_INITIALIZE_ROUTINE = 'starlight_initialize_runner_usage_stream(jsonb)';
 export const USAGE_EVIDENCE_APPEND_ROUTINE = 'starlight_append_runner_usage_evidence(jsonb)';
+export const USAGE_REFUSAL_ROUTINE = 'starlight_record_usage_refusal(jsonb, text)';
+
+export const USAGE_REFUSAL_BODY = String.raw`
+DECLARE
+  p ALIAS FOR $1;
+  blocker ALIAS FOR $2;
+  audit_operation_id TEXT := 'invalid-operation';
+  audit_binding_digest CHAR(64) := pg_catalog.repeat('0',64);
+  audit_reservation_id TEXT := NULL;
+  audit_request_id TEXT := NULL;
+BEGIN
+  IF pg_catalog.jsonb_typeof(p)='object' THEN
+    IF p->>'reservation_id' IS NOT NULL AND p->>'reservation_id' ~
+        '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      audit_reservation_id := p->>'reservation_id';
+      SELECT operation_id,binding_digest_sha256 INTO audit_operation_id,audit_binding_digest
+        FROM public.swarm_authority_reservations
+       WHERE reservation_id=audit_reservation_id::pg_catalog.uuid;
+      IF NOT FOUND THEN
+        audit_operation_id := 'invalid-operation';
+        audit_binding_digest := pg_catalog.repeat('0',64);
+      END IF;
+    END IF;
+    IF p->>'usage_request_id' IS NOT NULL AND p->>'usage_request_id' ~
+        '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      audit_request_id := p->>'usage_request_id';
+    END IF;
+  END IF;
+  INSERT INTO public.swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+  VALUES ('runner-usage-evidence-denied',audit_operation_id,audit_binding_digest,
+    pg_catalog.clock_timestamp(),pg_catalog.jsonb_build_object(
+      'reservation_id',audit_reservation_id,'usage_request_id',audit_request_id,
+      'blockers',pg_catalog.jsonb_build_array(blocker),'direct_function_refusal',TRUE,
+      'released_cost_usd','0.000000'));
+  RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker',blocker,'audited',TRUE);
+END`;
 
 export const USAGE_STREAM_INITIALIZE_BODY = String.raw`
 DECLARE
@@ -40,12 +76,12 @@ BEGIN
      OR p->>'binding_digest_sha256' !~ '^[a-f0-9]{64}$'
      OR p->>'usage_reconciliation_token' !~ '^[A-Za-z0-9_-]{43}$'
      OR p->>'provider_usage_correlation_id' !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$' THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-stream initialization input is invalid.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-stream initialization input is invalid.');
   END IF;
   token_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p->>'usage_reconciliation_token','UTF8')),'hex');
   PERFORM 1 FROM public.swarm_authority_control WHERE singleton=TRUE FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Authority serialization control row is missing or ambiguous.');
+    RETURN public.starlight_record_usage_refusal(p,'Authority serialization control row is missing or ambiguous.');
   END IF;
   SELECT * INTO r FROM public.swarm_authority_reservations
    WHERE reservation_id=(p->>'reservation_id')::pg_catalog.uuid FOR UPDATE;
@@ -55,16 +91,16 @@ BEGIN
      OR r.operation_id IS DISTINCT FROM p->>'operation_id'
      OR r.binding_digest_sha256 IS DISTINCT FROM p->>'binding_digest_sha256'
      OR r.broker_role_contract_sha256 IS NULL THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner claim is not eligible for usage-stream initialization.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner claim is not eligible for usage-stream initialization.');
   END IF;
   IF r.binding_database_sha256 IS DISTINCT FROM
       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(r.binding::pg_catalog.text,'UTF8')),'hex') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Stored operation binding is not database-canonical.');
+    RETURN public.starlight_record_usage_refusal(p,'Stored operation binding is not database-canonical.');
   END IF;
   SELECT rolsuper INTO invoker_superuser FROM pg_catalog.pg_roles WHERE rolname=session_user;
   IF invoker_superuser IS NOT TRUE AND (session_user <> r.broker_database_role
       OR pg_catalog.current_database() <> r.broker_database_name) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Authenticated broker session does not own this runner claim.');
+    RETURN public.starlight_record_usage_refusal(p,'Authenticated broker session does not own this runner claim.');
   END IF;
   SELECT * INTO principal FROM public.swarm_authority_broker_principals
    WHERE database_role=r.broker_database_role AND database_name=r.broker_database_name;
@@ -85,7 +121,7 @@ BEGIN
      OR principal.observed_at > accepted_at
      OR accepted_at-principal.observed_at > pg_catalog.make_interval(secs => 300)
      OR principal.access_review_expires_at <= accepted_at THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Broker principal is unavailable, expired, disabled, or drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Broker principal is unavailable, expired, disabled, or drifted.');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM public.swarm_authority_prepared_operations o
       WHERE o.operation_id=r.operation_id AND o.binding_digest_sha256=r.binding_digest_sha256 AND o.state='ready')
@@ -93,14 +129,14 @@ BEGIN
       WHERE v.ref IN ('operation:'||r.operation_id,'effect:'||r.effect_id,'runner:'||r.runner_id,
         'runtime:'||r.runner_runtime_id,'host:'||r.runner_host_id,
         'broker-principal:'||r.broker_database_name||':'||r.broker_database_role)) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-stream authority is cancelled or revoked.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-stream authority is cancelled or revoked.');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM public.swarm_authority_budgets b WHERE b.receipt_id=r.budget_receipt_id
       AND b.committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(pg_catalog.sum(q.reserved_cost_usd),0::pg_catalog.numeric)
         FROM public.swarm_authority_reservations q WHERE q.budget_receipt_id=r.budget_receipt_id
           AND q.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed',
                           'stop-requested','runner-never-started-observed','runner-terminal-observed'))) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Committed receipt budget authority is missing or inconsistent.');
+    RETURN public.starlight_record_usage_refusal(p,'Committed receipt budget authority is missing or inconsistent.');
   END IF;
   IF r.usage_reconciliation_token_sha256 IS NOT NULL OR r.provider_usage_correlation_id IS NOT NULL THEN
     IF r.usage_reconciliation_token_sha256 = token_digest
@@ -110,7 +146,7 @@ BEGIN
             AND t.sequence=0 AND t.issued_by_request_id=r.runner_claim_request_id AND t.kind='claim') THEN
       RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',TRUE);
     END IF;
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-stream initialization drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-stream initialization drifted.');
   END IF;
   SELECT EXISTS (
     SELECT 1 FROM public.swarm_authority_usage_tokens WHERE token_sha256=token_digest
@@ -126,11 +162,11 @@ BEGIN
         OR q.runner_outcome_presented_token_sha256=token_digest
   ) INTO collision;
   IF collision THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Usage-reconciliation credential was already issued.');
+    RETURN public.starlight_record_usage_refusal(p,'Usage-reconciliation credential was already issued.');
   END IF;
   IF EXISTS (SELECT 1 FROM public.swarm_authority_reservations q
       WHERE q.provider_usage_correlation_id=p->>'provider_usage_correlation_id') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Provider usage correlation is already bound to another reservation.');
+    RETURN public.starlight_record_usage_refusal(p,'Provider usage correlation is already bound to another reservation.');
   END IF;
   UPDATE public.swarm_authority_reservations
      SET usage_reconciliation_token_sha256=token_digest,
@@ -138,7 +174,7 @@ BEGIN
    WHERE reservation_id=r.reservation_id
      AND usage_reconciliation_token_sha256 IS NULL AND provider_usage_correlation_id IS NULL;
   IF NOT FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-stream initialization lost its authority race.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-stream initialization lost its authority race.');
   END IF;
   INSERT INTO public.swarm_authority_usage_tokens
     (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
@@ -222,7 +258,7 @@ BEGIN
           'runtime_id','host_id','launch_attempt_id','provider_id','provider_account_ref',
           'provider_usage_correlation_id','meter_id','evidence_ref','issuer','key_id')
           AND field.value !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{2,159}$') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-evidence append input is invalid.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-evidence append input is invalid.');
   END IF;
   IF (p->>'usage_started_at')::pg_catalog.timestamptz > (p->>'usage_ended_at')::pg_catalog.timestamptz
      OR (p->>'usage_ended_at')::pg_catalog.timestamptz > (p->>'evidence_observed_at')::pg_catalog.timestamptz
@@ -231,18 +267,18 @@ BEGIN
        OR (p->>'statement_finalized_at')::pg_catalog.timestamptz < (p->>'usage_ended_at')::pg_catalog.timestamptz
        OR (p->>'statement_finalized_at')::pg_catalog.timestamptz > (p->>'evidence_observed_at')::pg_catalog.timestamptz))
      OR (p->>'statement_status'='provisional' AND (p->>'statement_finalized_at') IS NOT NULL) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-evidence chronology or finality is invalid.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-evidence chronology or finality is invalid.');
   END IF;
   SELECT rolsuper INTO invoker_superuser FROM pg_catalog.pg_roles WHERE rolname=session_user;
   IF invoker_superuser IS NOT TRUE AND (session_user <> p->>'verifier_database_role'
       OR pg_catalog.current_database() <> p->>'verifier_database_name') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Authenticated usage verifier session does not match the attested caller.');
+    RETURN public.starlight_record_usage_refusal(p,'Authenticated usage verifier session does not match the attested caller.');
   END IF;
   presented_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p->>'usage_reconciliation_token','UTF8')),'hex');
   next_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p->>'next_usage_reconciliation_token','UTF8')),'hex');
   PERFORM 1 FROM public.swarm_authority_control WHERE singleton=TRUE FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Authority serialization control row is missing or ambiguous.');
+    RETURN public.starlight_record_usage_refusal(p,'Authority serialization control row is missing or ambiguous.');
   END IF;
   SELECT *, (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::pg_catalog.numeric) AS cost_matches_binding
     INTO r FROM public.swarm_authority_reservations
@@ -250,20 +286,20 @@ BEGIN
      AND runner_claim_id=(p->>'claim_id')::pg_catalog.uuid
      AND runner_outcome_id=(p->>'outcome_id')::pg_catalog.uuid FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Settled runner outcome does not exist.');
+    RETURN public.starlight_record_usage_refusal(p,'Settled runner outcome does not exist.');
   END IF;
   IF r.operation_id IS DISTINCT FROM p->>'operation_id' OR r.effect_id IS DISTINCT FROM p->>'effect_id'
      OR r.binding_digest_sha256 IS DISTINCT FROM p->>'binding_digest_sha256'
      OR r.broker_role_contract_sha256 IS DISTINCT FROM p->>'role_contract_digest_sha256'
      OR r.state NOT IN ('runner-never-started-observed','runner-terminal-observed') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage request does not match a settled operation.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage request does not match a settled operation.');
   END IF;
   IF r.binding_database_sha256 IS DISTINCT FROM
       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(r.binding::pg_catalog.text,'UTF8')),'hex') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Stored operation binding is not database-canonical.');
+    RETURN public.starlight_record_usage_refusal(p,'Stored operation binding is not database-canonical.');
   END IF;
   IF r.cost_matches_binding IS NOT TRUE OR r.committed_cost_usd IS DISTINCT FROM r.reserved_cost_usd THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Stored operation or committed cost is invalid or drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Stored operation or committed cost is invalid or drifted.');
   END IF;
   IF r.provider_usage_correlation_id IS DISTINCT FROM p->>'provider_usage_correlation_id'
      OR r.runner_id IS DISTINCT FROM p->>'runner_id'
@@ -275,7 +311,7 @@ BEGIN
      OR r.runner_launch_attempt_id IS DISTINCT FROM p->>'launch_attempt_id'
      OR r.runner_fencing_generation IS DISTINCT FROM (p->>'fencing_generation')::pg_catalog.int4
      OR r.runner_process_instance_sha256 IS DISTINCT FROM p->>'process_instance_sha256' THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage evidence is bound to another execution generation.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage evidence is bound to another execution generation.');
   END IF;
   SELECT * INTO principal FROM public.swarm_authority_broker_principals
    WHERE database_role=r.broker_database_role AND database_name=r.broker_database_name;
@@ -296,26 +332,26 @@ BEGIN
      OR principal.observed_at > accepted_at
      OR accepted_at-principal.observed_at > pg_catalog.make_interval(secs => 300)
      OR principal.access_review_expires_at <= accepted_at THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Broker principal is unavailable, expired, disabled, or drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Broker principal is unavailable, expired, disabled, or drifted.');
   END IF;
   IF EXISTS (SELECT 1 FROM public.swarm_authority_revocations v
       WHERE v.ref IN ('operation:'||r.operation_id,'effect:'||r.effect_id,'runner:'||r.runner_id,
                       'runtime:'||r.runner_runtime_id,'host:'||r.runner_host_id,
                       'broker-principal:'||r.broker_database_name||':'||r.broker_database_role)) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage authority is revoked.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage authority is revoked.');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM public.swarm_authority_prepared_operations o
       WHERE o.operation_id=r.operation_id AND o.binding_digest_sha256=r.binding_digest_sha256 AND o.state='ready') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Prepared operation is unavailable or cancelled.');
+    RETURN public.starlight_record_usage_refusal(p,'Prepared operation is unavailable or cancelled.');
   END IF;
   IF (p->>'usage_started_at')::pg_catalog.timestamptz < r.runner_claim_accepted_at
      OR (p->>'usage_ended_at')::pg_catalog.timestamptz > r.runner_outcome_at THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage interval falls outside the authenticated execution interval.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage interval falls outside the authenticated execution interval.');
   END IF;
   IF (p->>'evidence_observed_at')::pg_catalog.timestamptz > accepted_at
      OR accepted_at-(p->>'evidence_observed_at')::pg_catalog.timestamptz > pg_catalog.make_interval(secs => 60)
      OR (p->>'access_review_expires_at')::pg_catalog.timestamptz <= accepted_at THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage evidence is stale or future-dated.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage evidence is stale or future-dated.');
   END IF;
 
   -- The authority control-row lock above serializes this routine globally. Do not
@@ -347,23 +383,23 @@ BEGIN
        AND prior.issuer=p->>'issuer' AND prior.key_id=p->>'key_id' AND prior.authn_kind=p->>'authn_kind' THEN
       RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',TRUE,'row',pg_catalog.to_jsonb(prior));
     END IF;
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-evidence retry drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-evidence retry drifted.');
   END IF;
 
   SELECT * INTO latest FROM public.swarm_authority_usage_evidence
    WHERE reservation_id=r.reservation_id ORDER BY usage_sequence DESC LIMIT 1;
   prior_sequence := CASE WHEN FOUND THEN latest.usage_sequence ELSE 0 END;
   IF latest.statement_status='final' THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','A final provider usage statement is already recorded.');
+    RETURN public.starlight_record_usage_refusal(p,'A final provider usage statement is already recorded.');
   END IF;
   IF (p->>'usage_sequence')::pg_catalog.int4 <> prior_sequence + 1 THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Runner usage-evidence sequence is stale, skipped, or already consumed.');
+    RETURN public.starlight_record_usage_refusal(p,'Runner usage-evidence sequence is stale, skipped, or already consumed.');
   END IF;
   IF r.usage_reconciliation_token_sha256 IS DISTINCT FROM presented_digest
      OR NOT EXISTS (SELECT 1 FROM public.swarm_authority_usage_tokens t
         WHERE t.token_sha256=presented_digest AND t.reservation_id=r.reservation_id
           AND t.sequence=prior_sequence) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Usage-reconciliation credential is invalid or already rotated.');
+    RETURN public.starlight_record_usage_refusal(p,'Usage-reconciliation credential is invalid or already rotated.');
   END IF;
   IF prior_sequence > 0 AND (latest.provider_id IS DISTINCT FROM p->>'provider_id'
      OR latest.verifier_database_role IS DISTINCT FROM p->>'verifier_database_role'
@@ -378,12 +414,12 @@ BEGIN
      OR latest.usage_ended_at > (p->>'usage_ended_at')::pg_catalog.timestamptz
      OR latest.next_token_sha256 IS DISTINCT FROM presented_digest
      OR latest.cumulative_cost_usd > (p->>'cumulative_cost_usd')::pg_catalog.numeric) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Provider usage stream identity, key, interval, cost, or token chain drifted.');
+    RETURN public.starlight_record_usage_refusal(p,'Provider usage stream identity, key, interval, cost, or token chain drifted.');
   END IF;
   IF EXISTS (SELECT 1 FROM public.swarm_authority_usage_evidence e
       WHERE e.provider_event_id=(p->>'provider_event_id')::pg_catalog.uuid
          OR e.evidence_ref=p->>'evidence_ref' OR e.evidence_sha256=p->>'evidence_sha256') THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Provider usage evidence is already bound to another request.');
+    RETURN public.starlight_record_usage_refusal(p,'Provider usage evidence is already bound to another request.');
   END IF;
   SELECT EXISTS (
     SELECT 1 FROM public.swarm_authority_usage_tokens WHERE token_sha256=next_digest
@@ -399,7 +435,7 @@ BEGIN
         OR q.runner_outcome_presented_token_sha256=next_digest
   ) INTO collision;
   IF collision THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Next usage-reconciliation credential was already issued.');
+    RETURN public.starlight_record_usage_refusal(p,'Next usage-reconciliation credential was already issued.');
   END IF;
   IF NOT (SELECT pg_catalog.count(*)=2 AND pg_catalog.count(DISTINCT w.kind)=2
       FROM public.swarm_authority_budget_holds h
@@ -415,14 +451,14 @@ BEGIN
            WHERE qh.window_id=w.window_id AND q.state IN
              ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested',
               'runner-never-started-observed','runner-terminal-observed'))) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Committed aggregate budget authority is missing or inconsistent.');
+    RETURN public.starlight_record_usage_refusal(p,'Committed aggregate budget authority is missing or inconsistent.');
   END IF;
   IF NOT EXISTS (SELECT 1 FROM public.swarm_authority_budgets b WHERE b.receipt_id=r.budget_receipt_id
       AND b.committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(pg_catalog.sum(q.reserved_cost_usd),0::pg_catalog.numeric)
         FROM public.swarm_authority_reservations q WHERE q.budget_receipt_id=r.budget_receipt_id
           AND q.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed',
                           'stop-requested','runner-never-started-observed','runner-terminal-observed'))) THEN
-    RETURN pg_catalog.jsonb_build_object('ok',FALSE,'blocker','Committed receipt budget authority is missing or inconsistent.');
+    RETURN public.starlight_record_usage_refusal(p,'Committed receipt budget authority is missing or inconsistent.');
   END IF;
   breach := (p->>'cumulative_cost_usd')::pg_catalog.numeric > r.committed_cost_usd
          OR (r.runner_outcome_kind='never-started' AND (p->>'cumulative_cost_usd')::pg_catalog.numeric <> 0);
@@ -463,11 +499,16 @@ BEGIN
 END`;
 
 export const USAGE_AUTHORITY_ROUTINES = Object.freeze([
+  { identity: USAGE_REFUSAL_ROUTINE, body_sha256: sha256Digest(USAGE_REFUSAL_BODY.trim()) },
   { identity: USAGE_STREAM_INITIALIZE_ROUTINE, body_sha256: sha256Digest(USAGE_STREAM_INITIALIZE_BODY.trim()) },
   { identity: USAGE_EVIDENCE_APPEND_ROUTINE, body_sha256: sha256Digest(USAGE_EVIDENCE_APPEND_BODY.trim()) },
 ]);
 
 export const USAGE_AUTHORITY_ROUTINE_SQL = `
+CREATE OR REPLACE FUNCTION public.starlight_record_usage_refusal(pg_catalog.jsonb,pg_catalog.text)
+RETURNS pg_catalog.jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+AS $usage_refusal$${USAGE_REFUSAL_BODY}$usage_refusal$;
+REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(pg_catalog.jsonb,pg_catalog.text) FROM PUBLIC;
 CREATE OR REPLACE FUNCTION public.starlight_initialize_runner_usage_stream(pg_catalog.jsonb)
 RETURNS pg_catalog.jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
 AS $usage_stream_initialize$${USAGE_STREAM_INITIALIZE_BODY}$usage_stream_initialize$;
