@@ -277,6 +277,12 @@ test('provider verifier attestation rejects transitive refusal-helper drift', as
       AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`],
     ['owner', 'ALTER FUNCTION public.starlight_record_usage_refusal(jsonb,text) OWNER TO starlight_usage_verifier;'],
     ['PUBLIC execute', 'GRANT EXECUTE ON FUNCTION public.starlight_record_usage_refusal(jsonb,text) TO PUBLIC;'],
+    ['extra append grantee', `CREATE ROLE starlight_rogue_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+      GRANT EXECUTE ON FUNCTION public.starlight_append_runner_usage_evidence(jsonb)
+        TO starlight_rogue_verifier;`],
+    ['verifier grant option', `GRANT EXECUTE ON FUNCTION
+      public.starlight_append_runner_usage_evidence(jsonb) TO starlight_usage_verifier WITH GRANT OPTION;`],
     ['owner-held overload', `CREATE FUNCTION public.starlight_record_usage_refusal(text,text)
       RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
       ALTER FUNCTION public.starlight_record_usage_refusal(text,text) OWNER TO starlight_authority_owner;

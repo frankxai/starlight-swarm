@@ -420,6 +420,17 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
       (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE roleid=owner.oid) AS owner_inbound,
       has_schema_privilege(owner.rolname,'public','CREATE') AS owner_schema_create,
       has_database_privilege(owner.rolname,current_database(),'CREATE') AS owner_database_create,
+      (SELECT COUNT(*)::INTEGER
+         FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl
+        WHERE acl.privilege_type='EXECUTE'
+          AND (acl.grantee NOT IN (p.proowner,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+            OR (acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND acl.is_grantable)))
+        AS unexpected_execute_entries,
+      (SELECT COUNT(*)::INTEGER
+         FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl
+        WHERE acl.privilege_type='EXECUTE'
+          AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+          AND acl.is_grantable=FALSE) AS verifier_execute_entries,
       EXISTS (SELECT 1 FROM pg_class owned_class WHERE owned_class.relowner=owner.oid)
         OR EXISTS (SELECT 1 FROM pg_namespace owned_schema WHERE owned_schema.nspowner=owner.oid)
         OR EXISTS (SELECT 1 FROM pg_database owned_database WHERE owned_database.datdba=owner.oid)
@@ -445,6 +456,8 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
       || actual.rolcreatedb !== false || actual.rolreplication !== false || actual.rolbypassrls !== false
       || actual.rolinherit !== false || Number(actual.owner_outbound) !== 0 || Number(actual.owner_inbound) !== 0
       || actual.owner_schema_create !== false || actual.owner_database_create !== false
+      || Number(actual.unexpected_execute_entries) !== 0
+      || Number(actual.verifier_execute_entries) !== (identity === USAGE_EVIDENCE_APPEND_ROUTINE ? 1 : 0)
       || actual.owner_has_unreviewed_objects !== false
       || actual.public_execute === true || String(actual.owner_name) === databaseRole) {
       blockers.push(`Usage authority routine ${identity} is missing, drifted, publicly executable, or unsafely owned.`);
