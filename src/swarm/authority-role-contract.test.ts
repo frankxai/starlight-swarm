@@ -28,6 +28,18 @@ async function restrictedDatabase(extra = '') {
 async function restrictedUsageDatabase(extra = '') {
   const db = new PGlite();
   await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
+  // PGlite omits the initdb-time information_schema relation ACL baselines that
+  // PostgreSQL records in pg_init_privs. Seed only this clean, ephemeral test
+  // catalog so production attestation can remain fail-closed when they are absent.
+  await db.exec(`INSERT INTO pg_init_privs (objoid,classoid,objsubid,privtype,initprivs)
+    SELECT c.oid,'pg_class'::regclass,0,'i',c.relacl
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='information_schema' AND c.relacl IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_init_privs initial
+        WHERE initial.objoid=c.oid AND initial.classoid='pg_class'::regclass
+          AND initial.objsubid=0
+      );`);
   await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
     CREATE ROLE starlight_usage_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
@@ -304,6 +316,48 @@ test('provider verifier rejects a PUBLIC grant restored on an initially restrict
     const result = await attestUsageEvidenceDatabaseSession(db);
     assert.equal(result.valid, false);
     assert.match(result.blockers.join(' '), /non-default system-routine execution authority/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects non-default system relation, column, and sequence authority', async (t) => {
+  const probes = [
+    ['direct relation', 'GRANT SELECT ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-relation or sequence authority/i],
+    ['PUBLIC relation', 'GRANT SELECT ON pg_catalog.pg_authid TO PUBLIC',
+      /non-default system-relation or sequence authority/i],
+    ['direct relation grant option',
+      'GRANT SELECT ON pg_catalog.pg_authid TO starlight_usage_verifier WITH GRANT OPTION',
+      /non-default system-relation or sequence authority/i],
+    ['system relation MAINTAIN', 'GRANT MAINTAIN ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-relation or sequence authority/i],
+    ['direct column', 'GRANT SELECT (rolpassword) ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-column authority/i],
+    ['system sequence', `CREATE SEQUENCE pg_catalog.starlight_verifier_escape_seq;
+      GRANT USAGE ON SEQUENCE pg_catalog.starlight_verifier_escape_seq TO starlight_usage_verifier`,
+      /non-default system-relation or sequence authority/i],
+    ['TOAST relation', 'GRANT SELECT ON pg_toast.pg_toast_1255 TO PUBLIC',
+      /non-default system-relation or sequence authority/i],
+  ] as const;
+  for (const [name, mutation, expected] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(`${mutation};`);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), expected);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('provider verifier rejects MAINTAIN authority on public tables', async () => {
+  const db = await restrictedUsageDatabase(
+    'GRANT MAINTAIN ON swarm_authority_reservations TO starlight_usage_verifier;',
+  );
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /no authority-table privileges/i);
   } finally { await db.close(); }
 });
 

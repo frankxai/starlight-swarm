@@ -405,9 +405,55 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   if (unexpectedSystemRoutineAuthority.rows.length) {
     blockers.push('Usage-evidence database role must not gain non-default system-routine execution authority.');
   }
+  const unexpectedSystemRelationAuthority = await client.query(`
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=0
+    CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault(
+      CASE WHEN c.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,c.relowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND c.relkind IN ('r','p','v','m','f','S','t')
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault(
+          CASE WHEN c.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,c.relowner))) baseline
+        WHERE baseline.grantee=actual.grantee
+          AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable
+      )
+    LIMIT 1
+  `);
+  if (unexpectedSystemRelationAuthority.rows.length) {
+    blockers.push('Usage-evidence database role must not gain non-default system-relation or sequence authority.');
+  }
+  const unexpectedSystemColumnAuthority = await client.query(`
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=a.attnum
+    CROSS JOIN LATERAL aclexplode(COALESCE(a.attacl,acldefault('c',c.relowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND c.relkind IN ('r','p','v','m','f','t')
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault('c',c.relowner))) baseline
+        WHERE baseline.grantee=actual.grantee
+          AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable
+      )
+    LIMIT 1
+  `);
+  if (unexpectedSystemColumnAuthority.rows.length) {
+    blockers.push('Usage-evidence database role must not gain non-default system-column authority.');
+  }
   const relationAuthority = await client.query(`
     SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-    CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER')) p(privilege_type)
+    CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER'),
+      ('MAINTAIN')) p(privilege_type)
     WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
       AND has_table_privilege(current_user,c.oid,p.privilege_type) LIMIT 1
   `);

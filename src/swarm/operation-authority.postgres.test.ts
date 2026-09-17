@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 
 import { OperationAuthority, signApprovalReceipt, signBudgetReceipt, type OperationBinding } from './operation-authority';
 import {
@@ -18,6 +18,7 @@ import {
 import { sha256Digest } from './runtime-digest';
 import {
   BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  attestUsageEvidenceDatabaseSession,
   brokerDatabaseRoleGrantSql,
   usageAuthorityRoutineOwnerGrantSql,
   usageEvidenceDatabaseRoleGrantSql,
@@ -1227,6 +1228,33 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       const state = await pool.query(`SELECT b.committed_usd,h.authorized_slots
         FROM swarm_authority_budgets b,swarm_authority_hosts h`);
       assert.deepEqual([Number(state.rows[0].committed_usd), Number(state.rows[0].authorized_slots)], [0.25, 1]);
+    });
+
+    await t.test('real verifier attestation rejects a system-catalog relation grant', async () => {
+      let client: PoolClient | undefined;
+      let grantApplied = false;
+      try {
+        await pool.query('GRANT SELECT ON pg_catalog.pg_authid TO starlight_postgres_usage_verifier');
+        grantApplied = true;
+        client = await verifierRolePool.connect();
+        const attestation = await attestUsageEvidenceDatabaseSession({
+          query: async (sql, values) => {
+            assert.ok(client);
+            const result = await client.query(sql, values);
+            return { rows: result.rows as Record<string, unknown>[] };
+          },
+        });
+        assert.equal(attestation.valid, false);
+        assert.match(attestation.blockers.join(' '), /non-default system-relation or sequence authority/i);
+      } finally {
+        try {
+          client?.release();
+        } finally {
+          if (grantApplied) {
+            await pool.query('REVOKE SELECT ON pg_catalog.pg_authid FROM starlight_postgres_usage_verifier');
+          }
+        }
+      }
     });
 
     await t.test('usage evidence versus broker disable never releases committed authority', async () => {
