@@ -337,6 +337,10 @@ test('provider verifier rejects non-default system relation, column, and sequenc
       /non-default system-relation or sequence authority/i],
     ['TOAST relation', 'GRANT SELECT ON pg_toast.pg_toast_1255 TO PUBLIC',
       /non-default system-relation or sequence authority/i],
+    ['new information_schema view', `CREATE VIEW information_schema.starlight_verifier_leak
+        AS SELECT rolpassword FROM pg_catalog.pg_authid;
+      GRANT SELECT ON information_schema.starlight_verifier_leak TO PUBLIC`,
+      /non-default system-relation or sequence authority/i],
   ] as const;
   for (const [name, mutation, expected] of probes) {
     await t.test(name, async () => {

@@ -418,6 +418,15 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
     WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
       AND c.relkind IN ('r','p','v','m','f','S','t')
       AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT (
+        initial.initprivs IS NULL
+        AND n.nspname='information_schema'
+        AND c.oid < 16384
+        AND c.relkind='v'
+        AND actual.grantee=0
+        AND actual.privilege_type='SELECT'
+        AND actual.is_grantable=FALSE
+      )
       AND NOT EXISTS (
         SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault(
           CASE WHEN c.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,c.relowner))) baseline
