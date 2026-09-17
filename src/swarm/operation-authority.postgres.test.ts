@@ -18,6 +18,9 @@ import {
 import { sha256Digest } from './runtime-digest';
 import {
   BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  brokerDatabaseRoleGrantSql,
+  usageAuthorityRoutineOwnerGrantSql,
+  usageEvidenceDatabaseRoleGrantSql,
   type BrokerDatabaseSessionAttestor,
 } from './authority-role-contract';
 
@@ -41,7 +44,7 @@ const brokerSessionAttestor: BrokerDatabaseSessionAttestor = async () => ({
   valid: true,
   session: {
     database_role: 'starlight_postgres_test_broker',
-    database_name: 'starlight_postgres_test',
+    database_name: 'starlight_test',
     contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
   },
   blockers: [],
@@ -139,8 +142,54 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       };
     },
   };
-  const store = new PostgresOperationAuthorityStore(authorityPool, storeOptions);
+  const usageStoreOptions = {
+    ...storeOptions, usageEvidencePool: authorityPool, usageEvidenceSessionAttestor: brokerSessionAttestor,
+  };
+  const store = new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions);
   await store.initialize();
+
+  // Ephemeral CI-only roles; these credentials never leave the disposable test database.
+  const brokerPassword = 'postgres-broker-test-only';
+  const verifierPassword = 'postgres-verifier-test-only';
+  await pool.query(`
+    REVOKE CREATE,TEMPORARY ON DATABASE starlight_test FROM PUBLIC;
+    CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_postgres_test_broker LOGIN PASSWORD '${brokerPassword}'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    GRANT CONNECT,TEMPORARY ON DATABASE starlight_test TO starlight_postgres_test_broker;
+    ${brokerDatabaseRoleGrantSql('starlight_postgres_test_broker')}
+    CREATE ROLE starlight_postgres_usage_verifier LOGIN PASSWORD '${verifierPassword}'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    GRANT CONNECT ON DATABASE starlight_test TO starlight_postgres_usage_verifier;
+    ${usageEvidenceDatabaseRoleGrantSql('starlight_postgres_usage_verifier')}
+  `);
+  const connectionFor = (role: string, password: string) => {
+    const parsed = new URL(databaseUrl!);
+    parsed.username = role;
+    parsed.password = password;
+    return parsed.toString();
+  };
+  const brokerRolePool = new Pool({
+    connectionString: connectionFor('starlight_postgres_test_broker', brokerPassword), max: 8,
+  });
+  const verifierRolePool = new Pool({
+    connectionString: connectionFor('starlight_postgres_usage_verifier', verifierPassword), max: 8,
+  });
+  const adaptPool = (rolePool: Pool): AuthoritySqlPool => ({
+    connect: async () => {
+      const client = await rolePool.connect();
+      return {
+        query: async (sql, values) => {
+          const result = await client.query(sql, values);
+          return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+        },
+        release: () => client.release(),
+      };
+    },
+  });
+  const brokerRoleAuthorityPool = adaptPool(brokerRolePool);
+  const verifierRoleAuthorityPool = adaptPool(verifierRolePool);
 
   const prepare = async () => {
     currentRunnerLaunchAttemptId = 'postgres-launch-attempt-001';
@@ -159,7 +208,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     const brokerEvidence = {
       schema_version: 'starlight.broker_principal_evidence.v1',
       database_role: 'starlight_postgres_test_broker',
-      database_name: 'starlight_postgres_test',
+      database_name: 'starlight_test',
       broker_execution_identity: 'postgres-broker-001',
       broker_identity_evidence_ref: 'postgres-broker-evidence-001',
       authn_kind: 'postgres-session-role',
@@ -215,7 +264,9 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       budgetIssuers: { [budget.issuer]: { [budget.key_id]: budgetSecret } },
     };
     const authority = new OperationAuthority(store, keyring);
-    const secondAuthority = new OperationAuthority(new PostgresOperationAuthorityStore(authorityPool, storeOptions), keyring);
+    const secondAuthority = new OperationAuthority(
+      new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions), keyring,
+    );
     const admitted = await authority.admit({
       binding: operation,
       approval_receipt: approval,
@@ -1114,6 +1165,48 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(events.rowCount, 1);
     });
 
+    await t.test('real broker and no-table verifier roles serialize append without privilege escape', async () => {
+      const h = await prepare();
+      const usage = await settleForUsageEvidence(h, '80');
+      const realOptions = { runnerUsageEvidenceAttestor, usageEvidencePool: verifierRoleAuthorityPool };
+      const first = new PostgresOperationAuthorityStore(brokerRoleAuthorityPool, realOptions);
+      const second = new PostgresOperationAuthorityStore(brokerRoleAuthorityPool, realOptions);
+
+      await assert.rejects(
+        brokerRolePool.query("SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb)"),
+        /permission denied/i,
+      );
+      await assert.rejects(
+        verifierRolePool.query('SELECT * FROM swarm_authority_reservations'),
+        /permission denied/i,
+      );
+      await assert.rejects(
+        verifierRolePool.query(`UPDATE swarm_authority_reservations
+          SET usage_reconciliation_token_sha256=repeat('f',64) WHERE FALSE`),
+        /permission denied/i,
+      );
+
+      const results = await Promise.all([
+        first.recordRunnerUsageEvidence(usage),
+        second.recordRunnerUsageEvidence(usage),
+      ]);
+      assert.ok(results.every((result) => result.recorded),
+        results.flatMap((result) => result.blockers).join(' '));
+      const ids = results.flatMap((result) => result.recorded ? [result.receipt.usage_evidence_id] : []);
+      assert.equal(new Set(ids).size, 1);
+      const evidence = await pool.query('SELECT usage_sequence FROM swarm_authority_usage_evidence');
+      assert.deepEqual(evidence.rows.map((row) => Number(row.usage_sequence)), [1]);
+
+      const wrongToken = await first.recordRunnerUsageEvidence({
+        ...usage, usage_reconciliation_token: competingUsageToken,
+      });
+      assert.equal(wrongToken.recorded, false);
+      assert.match(wrongToken.blockers.join(' '), /retry drifted|credential is invalid/i);
+      const state = await pool.query(`SELECT b.committed_usd,h.authorized_slots
+        FROM swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.deepEqual([Number(state.rows[0].committed_usd), Number(state.rows[0].authorized_slots)], [0.25, 1]);
+    });
+
     await t.test('usage evidence versus broker disable never releases committed authority', async () => {
       const h = await prepare();
       const usage = await settleForUsageEvidence(h, '75');
@@ -1462,7 +1555,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         secret_readiness: true, access_review_expires_at: expires,
         allowed_capabilities: base.capabilities,
       });
-      const secondStore = new PostgresOperationAuthorityStore(authorityPool, storeOptions);
+      const secondStore = new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions);
       const authorities = [store, secondStore].map((authorityStore) => new OperationAuthority(authorityStore, {
         approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
         budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } },
@@ -1518,6 +1611,8 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(Number(releasedHost.rows[0].reserved_slots), 0);
     });
   } finally {
+    await brokerRolePool.end();
+    await verifierRolePool.end();
     await pool.end();
   }
 });
