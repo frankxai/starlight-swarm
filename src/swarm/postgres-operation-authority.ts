@@ -1,5145 +1,1583 @@
-import { createHash, randomUUID } from 'node:crypto';
-
-import {
-  cancellationInputSchema,
-  consumptionInputSchema,
-  operationBindingSchema,
-  runnerClaimInputSchema,
-  runnerHeartbeatExpiryInputSchema,
-  runnerHeartbeatInputSchema,
-  runnerOutcomeInputSchema,
-  runnerUsageEvidenceInputSchema,
-  runnerStartObservationInputSchema,
-  startLeaseInputSchema,
-  startRedemptionInputSchema,
-} from './operation-authority';
-import { sha256Digest } from './runtime-digest';
-import { USAGE_AUTHORITY_ROUTINE_SQL } from './usage-authority-routines';
-import {
-  attestBrokerDatabaseSession,
-  attestUsageEvidenceDatabaseSession,
-  BROKER_DATABASE_ROLE_CONTRACT_SHA256,
-  type BrokerDatabaseSessionAttestor,
-  type UsageEvidenceDatabaseSessionAttestor,
-} from './authority-role-contract';
-import type {
-  AdmissionReservation,
-  AdmissionResult,
-  AtomicAdmissionRequest,
-  BudgetWindowEvidence,
-  CancellationInput,
-  CancellationResult,
-  ConsumptionInput,
-  ConsumptionReceipt,
-  ConsumptionResult,
-  OperationAuthorityStore,
-  RunnerClaimInput,
-  RunnerClaimReceipt,
-  RunnerClaimResult,
-  RunnerHeartbeatInput,
-  RunnerHeartbeatExpiryInput,
-  RunnerHeartbeatExpiryResult,
-  RunnerHeartbeatReceipt,
-  RunnerHeartbeatResult,
-  RunnerOutcomeInput,
-  RunnerOutcomeReceipt,
-  RunnerOutcomeResult,
-  RunnerUsageEvidenceInput,
-  RunnerUsageEvidenceReceipt,
-  RunnerUsageEvidenceResult,
-  RunnerStartObservationInput,
-  RunnerStartObservationReceipt,
-  RunnerStartObservationResult,
-  StartLeaseInput,
-  StartLeaseReceipt,
-  StartLeaseResult,
-  StartRedemptionInput,
-  StartRedemptionReceipt,
-  StartRedemptionResult,
-  TrustedHostEvidence,
-} from './operation-authority';
-import { z } from 'zod';
-
-const controlId = z.string().min(3).max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
-const controlTime = z.iso.datetime({ offset: true });
-const budgetWindowSchema = z.object({
-  window_id: controlId,
-  policy_id: controlId,
-  kind: z.enum(['policy', 'daily']),
-  starts_at: controlTime,
-  ends_at: controlTime,
-  currency: z.literal('USD'),
-  hard_limit_usd: z.number().finite().nonnegative().max(10_000_000),
-}).strict().refine((value) => Date.parse(value.starts_at) < Date.parse(value.ends_at), {
-  message: 'Budget window must end after it starts.', path: ['ends_at'],
-});
-export type BudgetWindowRegistrationResult =
-  | { registered: true; already_registered: boolean; blockers: [] }
-  | { registered: false; already_registered: false; blockers: string[] };
-const revocationRefsSchema = z.array(z.string().min(5).max(500)).min(1).max(12);
-const hostEvidenceSchema = z.object({
-  host_id: controlId,
-  observed_at: controlTime,
-  status: z.enum(['ready', 'degraded', 'offline']),
-  capacity_slots: z.number().int().nonnegative().max(10_000),
-  secret_readiness: z.boolean(),
-  access_review_expires_at: controlTime,
-  allowed_capabilities: z.array(z.string().min(3).max(160).regex(/^[a-z0-9][a-z0-9._:-]*$/)).max(64),
-}).strict().superRefine((value, context) => {
-  if (new Set(value.allowed_capabilities).size !== value.allowed_capabilities.length) {
-    context.addIssue({ code: 'custom', path: ['allowed_capabilities'], message: 'Host capabilities must be unique.' });
-  }
-});
-
-const databaseRole = z.string().min(3).max(63).regex(/^[a-z][a-z0-9_]*$/);
-const databaseName = z.string().min(1).max(63).regex(/^[A-Za-z0-9_.-]+$/);
-export const brokerPrincipalEvidenceSchema = z.object({
-  schema_version: z.literal('starlight.broker_principal_evidence.v1'),
-  database_role: databaseRole,
-  database_name: databaseName,
-  broker_execution_identity: controlId,
-  broker_identity_evidence_ref: controlId,
-  authn_kind: z.literal('postgres-session-role'),
-  role_contract_digest_sha256: z.literal(BROKER_DATABASE_ROLE_CONTRACT_SHA256),
-  observed_at: controlTime,
-  access_review_expires_at: controlTime,
-  state: z.enum(['ready', 'disabled']),
-}).strict().refine((value) => Date.parse(value.observed_at) < Date.parse(value.access_review_expires_at), {
-  message: 'Broker access review must expire after evidence observation.', path: ['access_review_expires_at'],
-});
-export type TrustedBrokerPrincipalEvidence = z.infer<typeof brokerPrincipalEvidenceSchema>;
-
-export interface AttestedRunnerSession {
-  runner_id: string;
-  runner_identity_evidence_ref: string;
-  runner_instance_id: string;
-  runtime_id: string;
-  host_id: string;
-  channel_binding_sha256: string;
-  launch_attempt_id: string;
-  fencing_generation: number;
-  observed_at: string;
-  access_review_expires_at: string;
-}
-
-const runnerSessionSchema = z.object({
-  runner_id: controlId,
-  runner_identity_evidence_ref: controlId,
-  runner_instance_id: controlId,
-  runtime_id: controlId,
-  host_id: controlId,
-  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  launch_attempt_id: controlId,
-  fencing_generation: z.number().int().min(1).max(1_000_000_000),
-  observed_at: controlTime,
-  access_review_expires_at: controlTime,
-}).strict().refine((value) => Date.parse(value.observed_at) < Date.parse(value.access_review_expires_at), {
-  message: 'Runner access review must expire after evidence observation.', path: ['access_review_expires_at'],
-});
-
-export type RunnerSessionAttestation =
-  | { valid: true; session: AttestedRunnerSession; blockers: [] }
-  | { valid: false; session: null; blockers: string[] };
-
-export type RunnerSessionAttestor = (client: AuthoritySqlClient) => Promise<RunnerSessionAttestation>;
-
-const denyUnconfiguredRunnerSession: RunnerSessionAttestor = async () => ({
-  valid: false,
-  session: null,
-  blockers: ['Runner transport attestor is not configured.'],
-});
-
-export const runnerStartEvidenceSchema = z.object({
-  schema_version: z.literal('starlight.runner_start_evidence.v1'),
-  reservation_id: z.uuid(),
-  claim_id: z.uuid(),
-  operation_id: controlId,
-  effect_id: controlId,
-  binding_digest_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  runner_id: controlId,
-  runner_identity_evidence_ref: controlId,
-  runner_instance_id: controlId,
-  runtime_id: controlId,
-  host_id: controlId,
-  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  launch_attempt_id: controlId,
-  fencing_generation: z.number().int().min(1).max(1_000_000_000),
-  process_instance_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  evidence_ref: controlId,
-  evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  process_started_at: controlTime,
-  observed_at: controlTime,
-  access_review_expires_at: controlTime,
-  state: z.literal('start-observed'),
-}).strict().superRefine((value, context) => {
-  if (Date.parse(value.process_started_at) > Date.parse(value.observed_at)) {
-    context.addIssue({ code: 'custom', path: ['process_started_at'], message: 'Process start cannot follow its observation.' });
-  }
-  if (Date.parse(value.observed_at) >= Date.parse(value.access_review_expires_at)) {
-    context.addIssue({ code: 'custom', path: ['access_review_expires_at'], message: 'Start-evidence access review must remain live after observation.' });
-  }
-});
-
-export type RunnerStartEvidence = z.infer<typeof runnerStartEvidenceSchema>;
-export type RunnerStartEvidenceAttestation =
-  | { valid: true; evidence: RunnerStartEvidence; blockers: [] }
-  | { valid: false; evidence: null; blockers: string[] };
-export type RunnerStartEvidenceAttestor = (client: AuthoritySqlClient) => Promise<RunnerStartEvidenceAttestation>;
-
-const denyUnconfiguredRunnerStartEvidence: RunnerStartEvidenceAttestor = async () => ({
-  valid: false,
-  evidence: null,
-  blockers: ['Runner start-evidence attestor is not configured.'],
-});
-
-const runnerOutcomeCommon = {
-  schema_version: z.literal('starlight.runner_outcome_evidence.v1'),
-  outcome_event_id: z.uuid(),
-  reservation_id: z.uuid(),
-  claim_id: z.uuid(),
-  operation_id: controlId,
-  effect_id: controlId,
-  binding_digest_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  runner_id: controlId,
-  runner_identity_evidence_ref: controlId,
-  runner_instance_id: controlId,
-  runtime_id: controlId,
-  host_id: controlId,
-  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  launch_attempt_id: controlId,
-  fencing_generation: z.number().int().min(1).max(1_000_000_000),
-  evidence_ref: controlId,
-  evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  outcome_at: controlTime,
-  observed_at: controlTime,
-  access_review_expires_at: controlTime,
-  restart_fenced: z.literal(true),
-  launch_queue_closed: z.literal(true),
-  descendants_quiesced: z.literal(true),
-  remote_stop_confirmed: z.boolean(),
-};
-
-export const runnerOutcomeEvidenceSchema = z.discriminatedUnion('outcome_kind', [
-  z.object({
-    ...runnerOutcomeCommon,
-    outcome_kind: z.literal('never-started'),
-    process_instance_sha256: z.null(),
-    start_observation_id: z.null(),
-    start_evidence_ref: z.null(),
-    start_evidence_sha256: z.null(),
-    process_started_at: z.null(),
-    exit_disposition: z.null(),
-  }).strict(),
-  z.object({
-    ...runnerOutcomeCommon,
-    outcome_kind: z.literal('process-terminal'),
-    process_instance_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    start_observation_id: z.uuid(),
-    start_evidence_ref: controlId,
-    start_evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    process_started_at: controlTime,
-    exit_disposition: z.enum(['exited-zero', 'exited-nonzero', 'signal', 'supervisor-killed', 'unknown']),
-  }).strict(),
-]).superRefine((value, context) => {
-  if (Date.parse(value.outcome_at) > Date.parse(value.observed_at)) {
-    context.addIssue({ code: 'custom', path: ['outcome_at'], message: 'Runner outcome cannot follow its observation.' });
-  }
-  if (Date.parse(value.observed_at) >= Date.parse(value.access_review_expires_at)) {
-    context.addIssue({ code: 'custom', path: ['access_review_expires_at'], message: 'Outcome-evidence access review must remain live after observation.' });
-  }
-});
-
-export type RunnerOutcomeEvidence = z.infer<typeof runnerOutcomeEvidenceSchema>;
-export type RunnerOutcomeEvidenceAttestation =
-  | { valid: true; evidence: RunnerOutcomeEvidence; blockers: [] }
-  | { valid: false; evidence: null; blockers: string[] };
-export type RunnerOutcomeEvidenceAttestor = (client: AuthoritySqlClient) => Promise<RunnerOutcomeEvidenceAttestation>;
-
-const denyUnconfiguredRunnerOutcomeEvidence: RunnerOutcomeEvidenceAttestor = async () => ({
-  valid: false,
-  evidence: null,
-  blockers: ['Runner outcome-evidence attestor is not configured.'],
-});
-
-const exactUsd = z.string().regex(/^(0|[1-9][0-9]{0,7})\.[0-9]{6}$/);
-const exactProviderUsdV2 = z.string().regex(/^(0|[1-9][0-9]{0,7})\.[0-9]{12}$/);
-const runnerUsageEvidenceBaseSchema = z.object({
-  provider_event_id: z.uuid(),
-  reservation_id: z.uuid(),
-  claim_id: z.uuid(),
-  outcome_id: z.uuid(),
-  operation_id: controlId,
-  effect_id: controlId,
-  binding_digest_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  runner_id: controlId,
-  runner_identity_evidence_ref: controlId,
-  runner_instance_id: controlId,
-  runtime_id: controlId,
-  host_id: controlId,
-  channel_binding_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  launch_attempt_id: controlId,
-  fencing_generation: z.number().int().min(1).max(1_000_000_000),
-  process_instance_sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
-  provider_id: controlId,
-  provider_account_ref: controlId,
-  provider_usage_correlation_id: controlId,
-  meter_id: controlId,
-  evidence_ref: controlId,
-  evidence_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  usage_started_at: controlTime,
-  usage_ended_at: controlTime,
-  statement_status: z.enum(['provisional', 'final']),
-  statement_finalized_at: controlTime.nullable(),
-  observed_at: controlTime,
-  access_review_expires_at: controlTime,
-  currency: z.literal('USD'),
-  authn_kind: z.literal('provider-signed-statement'),
-  issuer: controlId,
-  key_id: controlId,
-}).strict();
-export const runnerUsageEvidenceSchema = z.discriminatedUnion('schema_version', [
-  runnerUsageEvidenceBaseSchema.extend({
-    schema_version: z.literal('starlight.runner_usage_provider_evidence.v1'),
-    cumulative_cost_usd: exactUsd,
-  }),
-  runnerUsageEvidenceBaseSchema.extend({
-    schema_version: z.literal('starlight.runner_usage_provider_evidence.v2'),
-    cumulative_cost_usd: exactProviderUsdV2,
-  }),
-]).superRefine((value, context) => {
-  const started = Date.parse(value.usage_started_at);
-  const ended = Date.parse(value.usage_ended_at);
-  const observed = Date.parse(value.observed_at);
-  if (started > ended) {
-    context.addIssue({ code: 'custom', path: ['usage_started_at'], message: 'Usage start cannot follow usage end.' });
-  }
-  if (ended > observed) {
-    context.addIssue({ code: 'custom', path: ['usage_ended_at'], message: 'Usage end cannot follow evidence observation.' });
-  }
-  if (observed >= Date.parse(value.access_review_expires_at)) {
-    context.addIssue({ code: 'custom', path: ['access_review_expires_at'], message: 'Usage-evidence access review must remain live.' });
-  }
-  if (value.statement_status === 'final') {
-    if (value.statement_finalized_at === null
-      || Date.parse(value.statement_finalized_at) < ended
-      || Date.parse(value.statement_finalized_at) > observed) {
-      context.addIssue({ code: 'custom', path: ['statement_finalized_at'], message: 'Final statement time must follow usage and precede observation.' });
-    }
-  } else if (value.statement_finalized_at !== null) {
-    context.addIssue({ code: 'custom', path: ['statement_finalized_at'], message: 'Provisional evidence cannot claim finalization.' });
-  }
-});
-
-export type RunnerUsageEvidence = z.infer<typeof runnerUsageEvidenceSchema>;
-export type RunnerUsageEvidenceAttestation =
-  | { valid: true; evidence: RunnerUsageEvidence; blockers: [] }
-  | { valid: false; evidence: null; blockers: string[] };
-export type RunnerUsageEvidenceAttestor = (client: AuthoritySqlClient) => Promise<RunnerUsageEvidenceAttestation>;
-
-const denyUnconfiguredRunnerUsageEvidence: RunnerUsageEvidenceAttestor = async () => ({
-  valid: false,
-  evidence: null,
-  blockers: ['Runner usage-evidence attestor is not configured.'],
-});
-
-export const OPERATION_AUTHORITY_MIGRATION_SQL = `
-CREATE TABLE IF NOT EXISTS swarm_authority_revocations (
-  ref TEXT PRIMARY KEY, revoked_at TIMESTAMPTZ NOT NULL, reason TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_control (
-  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-INSERT INTO swarm_authority_control (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING;
-CREATE OR REPLACE FUNCTION starlight_authority_lock() RETURNS BOOLEAN
-LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $authority_lock$
-DECLARE locked BOOLEAN;
-BEGIN
-  SELECT singleton INTO locked FROM public.swarm_authority_control WHERE singleton=TRUE FOR UPDATE;
-  RETURN COALESCE(locked,FALSE);
-END
-$authority_lock$;
-REVOKE ALL ON FUNCTION starlight_authority_lock() FROM PUBLIC;
-CREATE TABLE IF NOT EXISTS swarm_authority_hosts (
-  host_id TEXT PRIMARY KEY, evidence JSONB NOT NULL, observed_at TIMESTAMPTZ NOT NULL,
-  capacity_slots INTEGER NOT NULL CHECK (capacity_slots >= 0),
-  reserved_slots INTEGER NOT NULL DEFAULT 0 CHECK (reserved_slots >= 0),
-  authorized_slots INTEGER NOT NULL DEFAULT 0 CHECK (authorized_slots >= 0),
-  CHECK (reserved_slots + authorized_slots <= capacity_slots)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_budgets (
-  receipt_id TEXT PRIMARY KEY, hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
-  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
-  committed_usd NUMERIC NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
-  CHECK (reserved_usd + committed_usd <= hard_limit_usd)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_budget_windows (
-  window_id TEXT PRIMARY KEY, policy_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('policy','daily')),
-  starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL,
-  currency CHAR(3) NOT NULL CHECK (currency='USD'),
-  hard_limit_usd NUMERIC NOT NULL CHECK (hard_limit_usd >= 0),
-  reserved_usd NUMERIC NOT NULL DEFAULT 0 CHECK (reserved_usd >= 0),
-  committed_usd NUMERIC NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
-  CHECK (reserved_usd + committed_usd <= hard_limit_usd),
-  CHECK (ends_at > starts_at)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_prepared_operations (
-  operation_id TEXT PRIMARY KEY, binding_digest_sha256 CHAR(64) NOT NULL,
-  registered_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL CHECK (state IN ('ready','cancelled'))
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_broker_principals (
-  database_role TEXT NOT NULL, database_name TEXT NOT NULL,
-  broker_execution_identity TEXT NOT NULL UNIQUE, broker_identity_evidence_ref TEXT NOT NULL UNIQUE,
-  authn_kind TEXT NOT NULL CHECK (authn_kind='postgres-session-role'),
-  role_contract_digest_sha256 CHAR(64) NOT NULL,
-  observed_at TIMESTAMPTZ NOT NULL, access_review_expires_at TIMESTAMPTZ NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('ready','disabled')), evidence JSONB NOT NULL,
-  PRIMARY KEY (database_role,database_name), CHECK (access_review_expires_at > observed_at)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_reservations (
-  reservation_id UUID PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE, effect_id TEXT NOT NULL UNIQUE,
-  binding_digest_sha256 CHAR(64) NOT NULL, binding JSONB NOT NULL,
-  binding_database_sha256 CHAR(64) NOT NULL,
-  revocation_refs JSONB NOT NULL,
-  consume_token_sha256 CHAR(64) NOT NULL, cancel_token_sha256 CHAR(64) NOT NULL,
-  approval_receipt_id TEXT NOT NULL,
-  budget_receipt_id TEXT NOT NULL, host_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL,
-  reserved_at TIMESTAMPTZ NOT NULL, reservation_expires_at TIMESTAMPTZ NOT NULL,
-  max_host_evidence_age_ms INTEGER NOT NULL CHECK (max_host_evidence_age_ms BETWEEN 1000 AND 3600000),
-  consumption_id UUID UNIQUE, consumed_at TIMESTAMPTZ, lease_claim_token_sha256 CHAR(64),
-  lease_id UUID, start_request_id UUID, lease_issued_at TIMESTAMPTZ,
-  lease_expires_at TIMESTAMPTZ, lease_duration_ms INTEGER,
-  redemption_token_sha256 CHAR(64), control_token_sha256 CHAR(64),
-  broker_execution_identity TEXT, broker_identity_evidence_ref TEXT,
-  broker_database_role TEXT, broker_database_name TEXT, broker_role_contract_sha256 CHAR(64),
-  redemption_id UUID, redemption_request_id UUID, start_authorized_at TIMESTAMPTZ,
-  committed_cost_usd NUMERIC,
-  runner_claim_id UUID, runner_claim_request_id UUID, runner_claim_accepted_at TIMESTAMPTZ,
-  runner_claim_expires_at TIMESTAMPTZ, runner_evidence_observed_at TIMESTAMPTZ,
-  runner_access_review_expires_at TIMESTAMPTZ, runner_id TEXT, runner_identity_evidence_ref TEXT,
-  runner_instance_id TEXT, runner_runtime_id TEXT, runner_host_id TEXT,
-  runner_channel_binding_sha256 CHAR(64), heartbeat_token_sha256 CHAR(64),
-  start_observation_token_sha256 CHAR(64), outcome_token_sha256 CHAR(64),
-  usage_reconciliation_token_sha256 CHAR(64), provider_usage_correlation_id TEXT,
-  runner_launch_attempt_id TEXT, runner_fencing_generation INTEGER,
-  runner_revocation_refs JSONB,
-  runner_heartbeat_id UUID, runner_heartbeat_request_id UUID UNIQUE,
-  runner_heartbeat_sequence INTEGER, runner_heartbeat_accepted_at TIMESTAMPTZ,
-  runner_heartbeat_presented_token_sha256 CHAR(64),
-  runner_start_observation_id UUID, runner_start_observation_request_id UUID UNIQUE,
-  runner_start_observation_accepted_at TIMESTAMPTZ,
-  runner_start_evidence_observed_at TIMESTAMPTZ, runner_process_started_at TIMESTAMPTZ,
-  runner_process_instance_sha256 CHAR(64) UNIQUE, runner_start_evidence_ref TEXT UNIQUE,
-  runner_start_evidence_sha256 CHAR(64) UNIQUE,
-  runner_start_presented_token_sha256 CHAR(64),
-  runner_outcome_id UUID, runner_outcome_request_id UUID UNIQUE, runner_outcome_event_id UUID UNIQUE,
-  runner_outcome_kind TEXT, runner_outcome_accepted_at TIMESTAMPTZ,
-  runner_outcome_at TIMESTAMPTZ, runner_outcome_evidence_observed_at TIMESTAMPTZ,
-  runner_outcome_evidence_ref TEXT UNIQUE, runner_outcome_evidence_sha256 CHAR(64) UNIQUE,
-  runner_outcome_presented_token_sha256 CHAR(64), runner_exit_disposition TEXT,
-  runner_remote_stop_confirmed BOOLEAN,
-  state TEXT NOT NULL CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'))
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_heartbeat_tokens (
-  token_sha256 CHAR(64) PRIMARY KEY, reservation_id UUID NOT NULL,
-  sequence INTEGER NOT NULL CHECK (sequence >= 0),
-  issued_by_request_id UUID NOT NULL, issued_at TIMESTAMPTZ NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('claim','heartbeat')),
-  UNIQUE (reservation_id,sequence)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_usage_tokens (
-  token_sha256 CHAR(64) PRIMARY KEY, reservation_id UUID NOT NULL,
-  sequence INTEGER NOT NULL CHECK (sequence >= 0),
-  issued_by_request_id UUID NOT NULL, issued_at TIMESTAMPTZ NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('claim','usage-evidence')),
-  UNIQUE (reservation_id,sequence)
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_usage_evidence (
-  usage_evidence_id UUID PRIMARY KEY, usage_request_id UUID NOT NULL UNIQUE,
-  usage_sequence INTEGER NOT NULL CHECK (usage_sequence >= 1),
-  evidence_schema_version TEXT NOT NULL,
-  provider_event_id UUID NOT NULL UNIQUE, reservation_id UUID NOT NULL,
-  claim_id UUID NOT NULL, outcome_id UUID NOT NULL,
-  operation_id TEXT NOT NULL, effect_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
-  verifier_database_role TEXT NOT NULL, verifier_database_name TEXT NOT NULL,
-  verifier_role_contract_sha256 CHAR(64) NOT NULL,
-  provider_id TEXT NOT NULL, provider_account_ref TEXT NOT NULL,
-  provider_usage_correlation_id TEXT NOT NULL, meter_id TEXT NOT NULL,
-  evidence_ref TEXT NOT NULL UNIQUE, evidence_sha256 CHAR(64) NOT NULL UNIQUE,
-  usage_started_at TIMESTAMPTZ NOT NULL, usage_ended_at TIMESTAMPTZ NOT NULL,
-  statement_status TEXT NOT NULL CHECK (statement_status IN ('provisional','final')),
-  statement_finalized_at TIMESTAMPTZ,
-  evidence_observed_at TIMESTAMPTZ NOT NULL, accepted_at TIMESTAMPTZ NOT NULL,
-  currency CHAR(3) NOT NULL CHECK (currency='USD'),
-  cumulative_cost_usd NUMERIC(20,12) NOT NULL CHECK (cumulative_cost_usd >= 0),
-  authorized_cost_usd NUMERIC(20,6) NOT NULL CHECK (authorized_cost_usd >= 0),
-  budget_breach_observed BOOLEAN NOT NULL,
-  presented_token_sha256 CHAR(64) NOT NULL,
-  next_token_sha256 CHAR(64) NOT NULL,
-  issuer TEXT NOT NULL, key_id TEXT NOT NULL,
-  authn_kind TEXT NOT NULL CHECK (authn_kind='provider-signed-statement'),
-  CONSTRAINT swarm_authority_usage_evidence_schema_version_check CHECK (
-    evidence_schema_version IN ('starlight.runner_usage_provider_evidence.v1','starlight.runner_usage_provider_evidence.v2')
-  ),
-  UNIQUE (reservation_id,usage_sequence),
-  CHECK (usage_started_at <= usage_ended_at),
-  CHECK (usage_ended_at <= evidence_observed_at),
-  CHECK ((statement_status='final' AND statement_finalized_at IS NOT NULL
-      AND usage_ended_at <= statement_finalized_at AND statement_finalized_at <= evidence_observed_at)
-    OR (statement_status='provisional' AND statement_finalized_at IS NULL))
-);
-CREATE TABLE IF NOT EXISTS swarm_authority_budget_holds (
-  reservation_id UUID NOT NULL, window_id TEXT NOT NULL, reserved_cost_usd NUMERIC NOT NULL CHECK (reserved_cost_usd >= 0),
-  PRIMARY KEY (reservation_id,window_id)
-);
-ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS verifier_database_role TEXT
-  NOT NULL DEFAULT 'legacy-unattested';
-ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS verifier_database_name TEXT
-  NOT NULL DEFAULT 'legacy-unattested';
-ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS verifier_role_contract_sha256 CHAR(64)
-  NOT NULL DEFAULT '${'0'.repeat(64)}';
-ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS evidence_schema_version TEXT
-  NOT NULL DEFAULT 'starlight.runner_usage_provider_evidence.v1';
-ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_database_role DROP DEFAULT;
-ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_database_name DROP DEFAULT;
-ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_role_contract_sha256 DROP DEFAULT;
-ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN evidence_schema_version DROP DEFAULT;
-DO $usage_evidence_schema_constraint$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint
-      WHERE conname='swarm_authority_usage_evidence_schema_version_check'
-        AND conrelid='public.swarm_authority_usage_evidence'::regclass) THEN
-    ALTER TABLE swarm_authority_usage_evidence ADD CONSTRAINT
-      swarm_authority_usage_evidence_schema_version_check CHECK (
-        evidence_schema_version IN ('starlight.runner_usage_provider_evidence.v1',
-          'starlight.runner_usage_provider_evidence.v2')
-      );
-  END IF;
-END
-$usage_evidence_schema_constraint$;
-DO $usage_cost_precision_migration$
-DECLARE
-  stored_precision INTEGER;
-  stored_scale INTEGER;
-BEGIN
-  SELECT numeric_precision,numeric_scale INTO stored_precision,stored_scale
-    FROM information_schema.columns
-   WHERE table_schema='public' AND table_name='swarm_authority_usage_evidence'
-     AND column_name='cumulative_cost_usd';
-  IF stored_precision=20 AND stored_scale=6 THEN
-    IF EXISTS (SELECT 1 FROM swarm_authority_usage_evidence
-        WHERE cumulative_cost_usd<0 OR cumulative_cost_usd>=100000000::numeric) THEN
-      RAISE EXCEPTION 'legacy provider usage cost cannot migrate to the v2 precision envelope';
-    END IF;
-    ALTER TABLE swarm_authority_usage_evidence
-      ALTER COLUMN cumulative_cost_usd TYPE NUMERIC(20,12)
-      USING cumulative_cost_usd::NUMERIC(20,12);
-  ELSIF stored_precision IS DISTINCT FROM 20 OR stored_scale IS DISTINCT FROM 12 THEN
-    RAISE EXCEPTION 'provider usage cost precision is unexpected: NUMERIC(%,%)',stored_precision,stored_scale;
-  END IF;
-END
-$usage_cost_precision_migration$;
-CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
-  operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
-  at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
-);
-
--- Upgrade the earlier, never-deployed PR #24 reservation-only schema. Its rows
--- cannot be safely consumed because no bearer digest or durable binding exists,
--- so they are cancelled as replay tombstones and their per-receipt holds released.
-ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS capacity_slots INTEGER;
-ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS reserved_slots INTEGER;
-ALTER TABLE swarm_authority_hosts ADD COLUMN IF NOT EXISTS authorized_slots INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE swarm_authority_budgets ADD COLUMN IF NOT EXISTS committed_usd NUMERIC NOT NULL DEFAULT 0;
-ALTER TABLE swarm_authority_budget_windows ADD COLUMN IF NOT EXISTS committed_usd NUMERIC NOT NULL DEFAULT 0;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS binding JSONB;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS binding_database_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS revocation_refs JSONB;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS consume_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS cancel_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS max_host_evidence_age_ms INTEGER;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS consumption_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_claim_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_issued_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS lease_duration_ms INTEGER;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS control_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_execution_identity TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_identity_evidence_ref TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_database_role TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_database_name TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS broker_role_contract_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS redemption_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_authorized_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS committed_cost_usd NUMERIC;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_accepted_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_claim_expires_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_evidence_observed_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_access_review_expires_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_identity_evidence_ref TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_instance_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_runtime_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_host_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_channel_binding_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS heartbeat_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS start_observation_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS outcome_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS usage_reconciliation_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS provider_usage_correlation_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_launch_attempt_id TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_fencing_generation INTEGER;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_revocation_refs JSONB;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_sequence INTEGER;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_accepted_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_heartbeat_presented_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_observation_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_observation_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_observation_accepted_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_evidence_observed_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_process_started_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_process_instance_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_evidence_ref TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_evidence_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_start_presented_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_request_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_event_id UUID;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_kind TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_accepted_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_observed_at TIMESTAMPTZ;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_ref TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_evidence_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_outcome_presented_token_sha256 CHAR(64);
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_exit_disposition TEXT;
-ALTER TABLE swarm_authority_reservations ADD COLUMN IF NOT EXISTS runner_remote_stop_confirmed BOOLEAN;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_request_unique
-  ON swarm_authority_reservations (runner_outcome_request_id) WHERE runner_outcome_request_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_event_unique
-  ON swarm_authority_reservations (runner_outcome_event_id) WHERE runner_outcome_event_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_evidence_ref_unique
-  ON swarm_authority_reservations (runner_outcome_evidence_ref) WHERE runner_outcome_evidence_ref IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_evidence_sha_unique
-  ON swarm_authority_reservations (runner_outcome_evidence_sha256) WHERE runner_outcome_evidence_sha256 IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_token_unique
-  ON swarm_authority_reservations (outcome_token_sha256) WHERE outcome_token_sha256 IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_usage_token_unique
-  ON swarm_authority_reservations (usage_reconciliation_token_sha256)
-  WHERE usage_reconciliation_token_sha256 IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_provider_usage_correlation_unique
-  ON swarm_authority_reservations (provider_usage_correlation_id)
-  WHERE provider_usage_correlation_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_launch_attempt_unique
-  ON swarm_authority_reservations (runner_launch_attempt_id) WHERE runner_launch_attempt_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_outcome_id_unique
-  ON swarm_authority_reservations (runner_outcome_id) WHERE runner_outcome_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_heartbeat_request_unique
-  ON swarm_authority_reservations (runner_heartbeat_request_id)
-  WHERE runner_heartbeat_request_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_start_request_unique
-  ON swarm_authority_reservations (runner_start_observation_request_id)
-  WHERE runner_start_observation_request_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_process_unique
-  ON swarm_authority_reservations (runner_process_instance_sha256)
-  WHERE runner_process_instance_sha256 IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_start_evidence_ref_unique
-  ON swarm_authority_reservations (runner_start_evidence_ref)
-  WHERE runner_start_evidence_ref IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_runner_start_evidence_unique
-  ON swarm_authority_reservations (runner_start_evidence_sha256)
-  WHERE runner_start_evidence_sha256 IS NOT NULL;
-
--- A grant-contract digest change cannot silently inherit an already-authorized
--- runner. Quarantine existing positive authority and retain committed ledgers
--- until a separately reviewed recovery path exists.
-WITH quarantined AS (
-  UPDATE swarm_authority_reservations SET state='stop-requested'
-  WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-    AND broker_role_contract_sha256 IS DISTINCT FROM '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
-  RETURNING reservation_id,operation_id,binding_digest_sha256
-)
-INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-SELECT 'stop-requested',operation_id,binding_digest_sha256,clock_timestamp(),
-  jsonb_build_object('reservation_id',reservation_id,'reason','broker role contract changed during migration',
-    'execution_state','unknown','released_cost_usd',0)
-FROM quarantined;
-
-INSERT INTO swarm_authority_heartbeat_tokens
-  (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
-SELECT heartbeat_token_sha256,reservation_id,COALESCE(runner_heartbeat_sequence,0),
-  COALESCE(runner_heartbeat_request_id,runner_claim_request_id),
-  COALESCE(runner_heartbeat_accepted_at,runner_claim_accepted_at),
-  CASE WHEN runner_heartbeat_sequence IS NULL THEN 'claim' ELSE 'heartbeat' END
-FROM swarm_authority_reservations r
-WHERE heartbeat_token_sha256 IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM swarm_authority_heartbeat_tokens t
-    WHERE t.token_sha256=r.heartbeat_token_sha256
-  );
-
-DO $heartbeat_token_integrity$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_reservations r
-    LEFT JOIN swarm_authority_heartbeat_tokens t
-      ON t.token_sha256=r.heartbeat_token_sha256
-    WHERE r.heartbeat_token_sha256 IS NOT NULL AND (
-      t.token_sha256 IS NULL OR t.reservation_id<>r.reservation_id
-      OR t.sequence<>COALESCE(r.runner_heartbeat_sequence,0)
-    )
-  ) THEN
-    RAISE EXCEPTION 'current heartbeat credential history is missing or inconsistent';
-  END IF;
-END
-$heartbeat_token_integrity$;
-
-INSERT INTO swarm_authority_usage_tokens
-  (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
-SELECT r.usage_reconciliation_token_sha256,r.reservation_id,
-  COALESCE((SELECT MAX(e.usage_sequence) FROM swarm_authority_usage_evidence e
-    WHERE e.reservation_id=r.reservation_id),0),
-  COALESCE((SELECT e.usage_request_id FROM swarm_authority_usage_evidence e
-    WHERE e.reservation_id=r.reservation_id ORDER BY e.usage_sequence DESC LIMIT 1),r.runner_claim_request_id),
-  COALESCE((SELECT e.accepted_at FROM swarm_authority_usage_evidence e
-    WHERE e.reservation_id=r.reservation_id ORDER BY e.usage_sequence DESC LIMIT 1),r.runner_claim_accepted_at),
-  CASE WHEN EXISTS (SELECT 1 FROM swarm_authority_usage_evidence e
-    WHERE e.reservation_id=r.reservation_id) THEN 'usage-evidence' ELSE 'claim' END
-FROM swarm_authority_reservations r
-WHERE r.usage_reconciliation_token_sha256 IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM swarm_authority_usage_tokens t
-    WHERE t.token_sha256=r.usage_reconciliation_token_sha256);
-
-DO $usage_token_integrity$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_reservations r
-    LEFT JOIN swarm_authority_usage_tokens t
-      ON t.token_sha256=r.usage_reconciliation_token_sha256
-    WHERE r.usage_reconciliation_token_sha256 IS NOT NULL AND (
-      t.token_sha256 IS NULL OR t.reservation_id<>r.reservation_id
-      OR t.sequence<>COALESCE((SELECT MAX(e.usage_sequence)
-        FROM swarm_authority_usage_evidence e WHERE e.reservation_id=r.reservation_id),0)
-    )
-  ) THEN
-    RAISE EXCEPTION 'current usage credential history is missing or inconsistent';
-  END IF;
-END
-$usage_token_integrity$;
-
-DO $usage_evidence_integrity$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_usage_evidence e
-    LEFT JOIN swarm_authority_reservations r ON r.reservation_id=e.reservation_id
-    WHERE r.reservation_id IS NULL
-      OR r.state NOT IN ('runner-never-started-observed','runner-terminal-observed')
-      OR e.claim_id IS DISTINCT FROM r.runner_claim_id
-      OR e.outcome_id IS DISTINCT FROM r.runner_outcome_id
-      OR e.operation_id IS DISTINCT FROM r.operation_id
-      OR e.effect_id IS DISTINCT FROM r.effect_id
-      OR e.binding_digest_sha256 IS DISTINCT FROM r.binding_digest_sha256
-      OR e.provider_usage_correlation_id IS DISTINCT FROM r.provider_usage_correlation_id
-      OR e.authorized_cost_usd IS DISTINCT FROM r.committed_cost_usd
-      OR e.evidence_schema_version NOT IN ('starlight.runner_usage_provider_evidence.v1',
-        'starlight.runner_usage_provider_evidence.v2')
-      OR (e.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
-        AND e.cumulative_cost_usd<>trunc(e.cumulative_cost_usd,6))
-      OR e.cumulative_cost_usd>=100000000::numeric
-      OR e.usage_started_at < date_trunc('milliseconds',r.runner_claim_accepted_at)
-      OR e.usage_ended_at > date_trunc('milliseconds',r.runner_outcome_at)
-      OR e.budget_breach_observed IS DISTINCT FROM (
-        e.cumulative_cost_usd > e.authorized_cost_usd
-        OR (r.runner_outcome_kind='never-started' AND e.cumulative_cost_usd<>0::numeric)
-      )
-  ) THEN
-    RAISE EXCEPTION 'provider usage evidence binding or breach attribution is inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_usage_evidence
-    GROUP BY reservation_id
-    HAVING MIN(usage_sequence)<>1 OR MAX(usage_sequence)<>COUNT(*)
-      OR COUNT(*) FILTER (WHERE statement_status='final')>1
-  ) THEN
-    RAISE EXCEPTION 'provider usage evidence sequence or finality is inconsistent';
-  END IF;
-  IF EXISTS (
-    WITH ordered AS (
-      SELECT e.*,
-        LAG(provider_id) OVER chain AS prior_provider_id,
-        LAG(evidence_schema_version) OVER chain AS prior_evidence_schema_version,
-        LAG(provider_account_ref) OVER chain AS prior_provider_account_ref,
-        LAG(provider_usage_correlation_id) OVER chain AS prior_correlation,
-        LAG(meter_id) OVER chain AS prior_meter_id,
-        LAG(currency) OVER chain AS prior_currency,
-        LAG(authn_kind) OVER chain AS prior_authn_kind,
-        LAG(issuer) OVER chain AS prior_issuer,
-        LAG(key_id) OVER chain AS prior_key_id,
-        LAG(usage_started_at) OVER chain AS prior_usage_started_at,
-        LAG(usage_ended_at) OVER chain AS prior_usage_ended_at,
-        LAG(cumulative_cost_usd) OVER chain AS prior_cumulative_cost_usd,
-        LAG(statement_status) OVER chain AS prior_statement_status
-      FROM swarm_authority_usage_evidence e
-      WINDOW chain AS (PARTITION BY reservation_id ORDER BY usage_sequence)
-    )
-    SELECT 1 FROM ordered WHERE usage_sequence>1 AND (
-      provider_id IS DISTINCT FROM prior_provider_id
-      OR evidence_schema_version IS DISTINCT FROM prior_evidence_schema_version
-      OR provider_account_ref IS DISTINCT FROM prior_provider_account_ref
-      OR provider_usage_correlation_id IS DISTINCT FROM prior_correlation
-      OR meter_id IS DISTINCT FROM prior_meter_id
-      OR currency IS DISTINCT FROM prior_currency
-      OR authn_kind IS DISTINCT FROM prior_authn_kind
-      OR issuer IS DISTINCT FROM prior_issuer
-      OR key_id IS DISTINCT FROM prior_key_id
-      OR usage_started_at IS DISTINCT FROM prior_usage_started_at
-      OR usage_ended_at < prior_usage_ended_at
-      OR cumulative_cost_usd < prior_cumulative_cost_usd
-      OR prior_statement_status='final'
-    )
-  ) THEN
-    RAISE EXCEPTION 'provider usage evidence stream drifted or regressed';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_usage_evidence e
-    LEFT JOIN swarm_authority_usage_tokens presented
-      ON presented.reservation_id=e.reservation_id
-      AND presented.sequence=e.usage_sequence-1
-      AND presented.token_sha256=e.presented_token_sha256
-    LEFT JOIN swarm_authority_usage_tokens next_token
-      ON next_token.reservation_id=e.reservation_id
-      AND next_token.sequence=e.usage_sequence
-      AND next_token.token_sha256=e.next_token_sha256
-      AND next_token.issued_by_request_id=e.usage_request_id
-    WHERE presented.token_sha256 IS NULL OR next_token.token_sha256 IS NULL
-  ) THEN
-    RAISE EXCEPTION 'provider usage evidence token chain is missing or inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_usage_tokens t
-    LEFT JOIN (
-      SELECT reservation_id,COALESCE(MAX(usage_sequence),0)+1 AS expected_tokens
-      FROM swarm_authority_usage_evidence GROUP BY reservation_id
-    ) evidence ON evidence.reservation_id=t.reservation_id
-    GROUP BY t.reservation_id,evidence.expected_tokens
-    HAVING COUNT(*)<>COALESCE(evidence.expected_tokens,1)
-  ) THEN
-    RAISE EXCEPTION 'provider usage token history has missing or excess entries';
-  END IF;
-END
-$usage_evidence_integrity$;
-
-DO $migration$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM (
-      SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
-      FROM swarm_authority_reservations WHERE consume_token_sha256 IS NULL GROUP BY budget_receipt_id
-    ) legacy LEFT JOIN swarm_authority_budgets b ON b.receipt_id=legacy.budget_receipt_id
-    WHERE b.receipt_id IS NULL OR legacy.cost < 0 OR b.reserved_usd < legacy.cost
-  ) THEN
-    RAISE EXCEPTION 'legacy reservation budget ledger is inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_reservations r
-    LEFT JOIN swarm_authority_hosts h ON h.host_id=r.host_id
-    WHERE r.consume_token_sha256 IS NULL AND (
-      h.host_id IS NULL OR jsonb_typeof(h.evidence->'available_slots') <> 'number'
-      OR (h.evidence->>'available_slots')::INTEGER < 0
-    )
-  ) THEN
-    RAISE EXCEPTION 'legacy reservation host ledger is inconsistent';
-  END IF;
-END
-$migration$;
-
-UPDATE swarm_authority_budgets b SET reserved_usd=b.reserved_usd-legacy.cost
-FROM (
-  SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
-  FROM swarm_authority_reservations WHERE consume_token_sha256 IS NULL GROUP BY budget_receipt_id
-) legacy WHERE b.receipt_id=legacy.budget_receipt_id;
-UPDATE swarm_authority_hosts h SET
-  capacity_slots=COALESCE((h.evidence->>'available_slots')::INTEGER,0)+legacy.slots,
-  reserved_slots=0,
-  evidence=(h.evidence-'available_slots') || jsonb_build_object(
-    'capacity_slots',COALESCE((h.evidence->>'available_slots')::INTEGER,0)+legacy.slots
-  )
-FROM (
-  SELECT host_id,COUNT(*)::INTEGER AS slots
-  FROM swarm_authority_reservations WHERE consume_token_sha256 IS NULL GROUP BY host_id
-) legacy WHERE h.host_id=legacy.host_id AND h.capacity_slots IS NULL;
-UPDATE swarm_authority_hosts SET
-  capacity_slots=COALESCE(capacity_slots,(evidence->>'capacity_slots')::INTEGER,(evidence->>'available_slots')::INTEGER,0),
-  reserved_slots=COALESCE(reserved_slots,0),
-  evidence=(evidence-'available_slots') || jsonb_build_object(
-    'capacity_slots',COALESCE(capacity_slots,(evidence->>'capacity_slots')::INTEGER,(evidence->>'available_slots')::INTEGER,0)
-  );
-
-ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_state_check;
-INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-SELECT 'cancelled',operation_id,binding_digest_sha256,clock_timestamp(),
-  jsonb_build_object('reservation_id',reservation_id,'reason','legacy reservation lacked lifecycle credentials')
-FROM swarm_authority_reservations WHERE consume_token_sha256 IS NULL;
-UPDATE swarm_authority_reservations SET state='cancelled',binding='{}'::jsonb,revocation_refs='[]'::jsonb,
-  consume_token_sha256=repeat('0',64),cancel_token_sha256=repeat('0',64),max_host_evidence_age_ms=300000
-WHERE consume_token_sha256 IS NULL;
-
--- Legacy reservation rows have now been tombstoned with a concrete binding,
--- so the database can enforce its own checksum for every current and future row.
-UPDATE swarm_authority_reservations
-   SET binding_database_sha256=encode(sha256(convert_to(binding::text,'UTF8')),'hex')
- WHERE binding IS NOT NULL AND binding_database_sha256 IS NULL;
-ALTER TABLE swarm_authority_reservations ALTER COLUMN binding_database_sha256 SET NOT NULL;
-DO $binding_database_digest_constraint$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_constraint
-     WHERE conrelid='public.swarm_authority_reservations'::pg_catalog.regclass
-       AND conname='swarm_authority_reservations_binding_database_digest_check'
-  ) THEN
-    ALTER TABLE public.swarm_authority_reservations
-      ADD CONSTRAINT swarm_authority_reservations_binding_database_digest_check
-      CHECK (binding_database_sha256=encode(sha256(convert_to(binding::text,'UTF8')),'hex'));
-  END IF;
-END
-$binding_database_digest_constraint$;
-
--- A lifecycle reservation created before aggregate-window binding cannot be
--- grandfathered safely. Cancel the non-started hold and reconcile it exactly.
-DO $aggregate_migration$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM (
-      SELECT r.budget_receipt_id,SUM(r.reserved_cost_usd) AS cost
-      FROM swarm_authority_reservations r
-      WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-        AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id)
-      GROUP BY budget_receipt_id
-    ) pending LEFT JOIN swarm_authority_budgets b ON b.receipt_id=pending.budget_receipt_id
-    WHERE b.receipt_id IS NULL OR pending.cost < 0 OR b.reserved_usd < pending.cost
-  ) THEN
-    RAISE EXCEPTION 'pre-aggregate reservation budget ledger is inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM (
-      SELECT r.host_id,COUNT(*)::INTEGER AS slots
-      FROM swarm_authority_reservations r
-      WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-        AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds b WHERE b.reservation_id=r.reservation_id)
-      GROUP BY host_id
-    ) pending LEFT JOIN swarm_authority_hosts h ON h.host_id=pending.host_id
-    WHERE h.host_id IS NULL OR h.reserved_slots < pending.slots
-  ) THEN
-    RAISE EXCEPTION 'pre-aggregate reservation host ledger is inconsistent';
-  END IF;
-END
-$aggregate_migration$;
-UPDATE swarm_authority_budgets b SET reserved_usd=b.reserved_usd-pending.cost
-FROM (
-  SELECT r.budget_receipt_id,SUM(r.reserved_cost_usd) AS cost
-  FROM swarm_authority_reservations r
-  WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-    AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id)
-  GROUP BY budget_receipt_id
-) pending WHERE b.receipt_id=pending.budget_receipt_id;
-UPDATE swarm_authority_hosts h SET reserved_slots=reserved_slots-pending.slots
-FROM (
-  SELECT r.host_id,COUNT(*)::INTEGER AS slots
-  FROM swarm_authority_reservations r
-  WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-    AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds b WHERE b.reservation_id=r.reservation_id)
-  GROUP BY host_id
-) pending WHERE h.host_id=pending.host_id;
-INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-SELECT 'reservation-cancelled',operation_id,binding_digest_sha256,clock_timestamp(),
-  jsonb_build_object('reservation_id',reservation_id,'reason','reservation predated aggregate budget binding','released_cost_usd',reserved_cost_usd)
-FROM swarm_authority_reservations r
-WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-  AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id);
-UPDATE swarm_authority_reservations r SET state='cancelled'
-WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-  AND NOT EXISTS (SELECT 1 FROM swarm_authority_budget_holds h WHERE h.reservation_id=r.reservation_id);
-
--- Leases issued before redemption and control credentials existed cannot be
--- credential-grafted safely. They never authorized a runner, so cancel them as
--- replay tombstones and release their still-reserved resources exactly once.
-DO $legacy_lease_migration$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM (
-      SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
-      FROM swarm_authority_reservations
-      WHERE state='leased-not-started'
-        AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-          OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
-      GROUP BY budget_receipt_id
-    ) legacy LEFT JOIN swarm_authority_budgets b ON b.receipt_id=legacy.budget_receipt_id
-    WHERE b.receipt_id IS NULL OR legacy.cost < 0 OR b.reserved_usd < legacy.cost
-  ) THEN
-    RAISE EXCEPTION 'legacy start lease budget ledger is inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM (
-      SELECT host_id,COUNT(*)::INTEGER AS slots
-      FROM swarm_authority_reservations
-      WHERE state='leased-not-started'
-        AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-          OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
-      GROUP BY host_id
-    ) legacy LEFT JOIN swarm_authority_hosts h ON h.host_id=legacy.host_id
-    WHERE h.host_id IS NULL OR h.reserved_slots < legacy.slots
-  ) THEN
-    RAISE EXCEPTION 'legacy start lease host ledger is inconsistent';
-  END IF;
-END
-$legacy_lease_migration$;
-UPDATE swarm_authority_budgets b SET reserved_usd=reserved_usd-legacy.cost
-FROM (
-  SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
-  FROM swarm_authority_reservations
-  WHERE state='leased-not-started'
-    AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-      OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
-  GROUP BY budget_receipt_id
-) legacy WHERE b.receipt_id=legacy.budget_receipt_id;
-UPDATE swarm_authority_budget_windows w SET reserved_usd=reserved_usd-legacy.cost
-FROM (
-  SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
-  FROM swarm_authority_budget_holds h
-  JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
-  WHERE r.state='leased-not-started'
-    AND (r.redemption_token_sha256 IS NULL OR r.control_token_sha256 IS NULL
-      OR r.broker_execution_identity IS NULL OR r.broker_identity_evidence_ref IS NULL)
-  GROUP BY h.window_id
-) legacy WHERE w.window_id=legacy.window_id AND w.reserved_usd >= legacy.cost;
-UPDATE swarm_authority_hosts h SET reserved_slots=reserved_slots-legacy.slots
-FROM (
-  SELECT host_id,COUNT(*)::INTEGER AS slots
-  FROM swarm_authority_reservations
-  WHERE state='leased-not-started'
-    AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-      OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL)
-  GROUP BY host_id
-) legacy WHERE h.host_id=legacy.host_id AND h.reserved_slots >= legacy.slots;
-INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-SELECT 'reservation-cancelled',operation_id,binding_digest_sha256,clock_timestamp(),
-  jsonb_build_object('reservation_id',reservation_id,'lease_id',lease_id,
-    'reason','lease predated redemption and control credentials','released_cost_usd',reserved_cost_usd)
-FROM swarm_authority_reservations
-WHERE state='leased-not-started'
-  AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-    OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL);
-UPDATE swarm_authority_reservations SET state='cancelled'
-WHERE state='leased-not-started'
-  AND (redemption_token_sha256 IS NULL OR control_token_sha256 IS NULL
-    OR broker_execution_identity IS NULL OR broker_identity_evidence_ref IS NULL);
-
--- Earlier start-authorized rows did not bind the authenticated database
--- principal. Preserve their conservative committed ledgers, but quarantine
--- them so they can never be returned as current positive authority.
-INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-SELECT 'stop-requested',operation_id,binding_digest_sha256,clock_timestamp(),
-  jsonb_build_object('reservation_id',reservation_id,
-    'reason','start authorization predated authenticated broker database principal',
-    'execution_state','unknown','released_cost_usd',0)
-FROM swarm_authority_reservations
-WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-  AND (num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3
-    OR broker_role_contract_sha256 <> '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}');
-UPDATE swarm_authority_reservations SET state='stop-requested'
-WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-  AND (num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256) <> 3
-    OR broker_role_contract_sha256 <> '${BROKER_DATABASE_ROLE_CONTRACT_SHA256}');
-
--- Any attributed active reservation must be bound to exactly one policy and one
--- daily window for its signed policy, and every aggregate ledger must reconcile
--- exactly to the active holds. Partial or fabricated attribution fails migration.
-DO $aggregate_integrity$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_reservations r
-    LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
-    LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-    WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-    GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd
-    HAVING COUNT(h.window_id) <> 2
-      OR r.reserved_cost_usd IS DISTINCT FROM (r.binding->>'requested_cost_usd')::numeric
-      OR COUNT(DISTINCT w.kind) <> 2
-      OR COUNT(*) FILTER (WHERE w.kind='policy') <> 1
-      OR COUNT(*) FILTER (WHERE w.kind='daily') <> 1
-      OR COUNT(*) FILTER (WHERE w.policy_id IS DISTINCT FROM r.binding->>'budget_policy_id'
-        OR w.currency IS DISTINCT FROM 'USD' OR h.reserved_cost_usd IS DISTINCT FROM r.reserved_cost_usd) > 0
-  ) THEN
-    RAISE EXCEPTION 'active aggregate budget attribution is inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_budget_windows w
-    LEFT JOIN (
-      SELECT h.window_id,SUM(h.reserved_cost_usd) AS held
-      FROM swarm_authority_budget_holds h
-      JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
-      WHERE r.state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-      GROUP BY h.window_id
-    ) active ON active.window_id=w.window_id
-    WHERE w.reserved_usd IS DISTINCT FROM COALESCE(active.held,0)
-  ) THEN
-    RAISE EXCEPTION 'aggregate budget window ledger does not reconcile to active holds';
-  END IF;
-END
-$aggregate_integrity$;
-
-DO $start_authority_integrity$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_reservations r
-    LEFT JOIN swarm_authority_budgets b ON b.receipt_id=r.budget_receipt_id
-    LEFT JOIN swarm_authority_hosts host ON host.host_id=r.host_id
-    LEFT JOIN swarm_authority_budget_holds h ON h.reservation_id=r.reservation_id
-    LEFT JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-    WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
-    GROUP BY r.reservation_id,r.binding,r.reserved_cost_usd,r.committed_cost_usd,
-      b.receipt_id,host.host_id
-    HAVING b.receipt_id IS NULL OR host.host_id IS NULL
-      OR r.host_id IS DISTINCT FROM r.binding->>'host_id'
-      OR r.reserved_cost_usd IS DISTINCT FROM (r.binding->>'requested_cost_usd')::numeric
-      OR r.committed_cost_usd IS DISTINCT FROM r.reserved_cost_usd
-      OR COUNT(h.window_id) <> 2 OR COUNT(DISTINCT w.kind) <> 2
-      OR COUNT(*) FILTER (WHERE w.kind='policy') <> 1
-      OR COUNT(*) FILTER (WHERE w.kind='daily') <> 1
-      OR COUNT(*) FILTER (WHERE w.policy_id IS DISTINCT FROM r.binding->>'budget_policy_id'
-        OR w.currency IS DISTINCT FROM 'USD'
-        OR h.reserved_cost_usd IS DISTINCT FROM r.reserved_cost_usd) > 0
-  ) THEN
-    RAISE EXCEPTION 'authorized operation attribution is missing, ambiguous, or inconsistent';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_budgets b
-    LEFT JOIN (
-      SELECT budget_receipt_id,SUM(reserved_cost_usd) AS cost
-      FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
-      GROUP BY budget_receipt_id
-    ) committed ON committed.budget_receipt_id=b.receipt_id
-    WHERE b.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
-  ) THEN
-    RAISE EXCEPTION 'committed receipt budget ledger does not reconcile';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_budget_windows w
-    LEFT JOIN (
-      SELECT h.window_id,SUM(h.reserved_cost_usd) AS cost
-      FROM swarm_authority_budget_holds h
-      JOIN swarm_authority_reservations r ON r.reservation_id=h.reservation_id
-      WHERE r.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed')
-      GROUP BY h.window_id
-    ) committed ON committed.window_id=w.window_id
-    WHERE w.committed_usd IS DISTINCT FROM COALESCE(committed.cost,0)
-  ) THEN
-    RAISE EXCEPTION 'committed aggregate budget ledger does not reconcile';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM swarm_authority_hosts h
-    LEFT JOIN (
-      SELECT host_id,COUNT(*)::INTEGER AS slots
-      FROM swarm_authority_reservations
-      WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed')
-      GROUP BY host_id
-    ) authorized ON authorized.host_id=h.host_id
-    WHERE h.authorized_slots IS DISTINCT FROM COALESCE(authorized.slots,0)
-      OR h.reserved_slots + h.authorized_slots > h.capacity_slots
-  ) THEN
-    RAISE EXCEPTION 'authorized host ledger does not reconcile';
-  END IF;
-END
-$start_authority_integrity$;
-
-DO $aggregate_constraints$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_budget_holds_reservation_fk') THEN
-    ALTER TABLE swarm_authority_budget_holds ADD CONSTRAINT swarm_authority_budget_holds_reservation_fk
-      FOREIGN KEY (reservation_id) REFERENCES swarm_authority_reservations(reservation_id);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_budget_holds_window_fk') THEN
-    ALTER TABLE swarm_authority_budget_holds ADD CONSTRAINT swarm_authority_budget_holds_window_fk
-      FOREIGN KEY (window_id) REFERENCES swarm_authority_budget_windows(window_id);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_usage_tokens_reservation_fk') THEN
-    ALTER TABLE swarm_authority_usage_tokens ADD CONSTRAINT swarm_authority_usage_tokens_reservation_fk
-      FOREIGN KEY (reservation_id) REFERENCES swarm_authority_reservations(reservation_id);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='swarm_authority_usage_evidence_reservation_fk') THEN
-    ALTER TABLE swarm_authority_usage_evidence ADD CONSTRAINT swarm_authority_usage_evidence_reservation_fk
-      FOREIGN KEY (reservation_id) REFERENCES swarm_authority_reservations(reservation_id);
-  END IF;
-END
-$aggregate_constraints$;
-
-ALTER TABLE swarm_authority_hosts ALTER COLUMN capacity_slots SET NOT NULL;
-ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET DEFAULT 0;
-ALTER TABLE swarm_authority_hosts ALTER COLUMN reserved_slots SET NOT NULL;
-ALTER TABLE swarm_authority_hosts ALTER COLUMN authorized_slots SET DEFAULT 0;
-ALTER TABLE swarm_authority_hosts ALTER COLUMN authorized_slots SET NOT NULL;
-ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_capacity_slots_check;
-ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_capacity_slots_check CHECK (capacity_slots >= 0);
-ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_reserved_slots_check;
-ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_reserved_slots_check CHECK (reserved_slots >= 0);
-ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_authorized_slots_check;
-ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_authorized_slots_check CHECK (authorized_slots >= 0);
-ALTER TABLE swarm_authority_hosts DROP CONSTRAINT IF EXISTS swarm_authority_hosts_total_slots_check;
-ALTER TABLE swarm_authority_hosts ADD CONSTRAINT swarm_authority_hosts_total_slots_check CHECK (reserved_slots + authorized_slots <= capacity_slots);
-ALTER TABLE swarm_authority_budgets DROP CONSTRAINT IF EXISTS swarm_authority_budgets_total_usd_check;
-ALTER TABLE swarm_authority_budgets ADD CONSTRAINT swarm_authority_budgets_total_usd_check CHECK (reserved_usd + committed_usd <= hard_limit_usd);
-ALTER TABLE swarm_authority_budget_windows DROP CONSTRAINT IF EXISTS swarm_authority_budget_windows_total_usd_check;
-ALTER TABLE swarm_authority_budget_windows ADD CONSTRAINT swarm_authority_budget_windows_total_usd_check CHECK (reserved_usd + committed_usd <= hard_limit_usd);
-ALTER TABLE swarm_authority_reservations ALTER COLUMN binding SET NOT NULL;
-ALTER TABLE swarm_authority_reservations ALTER COLUMN revocation_refs SET NOT NULL;
-ALTER TABLE swarm_authority_reservations ALTER COLUMN consume_token_sha256 SET NOT NULL;
-ALTER TABLE swarm_authority_reservations ALTER COLUMN cancel_token_sha256 SET NOT NULL;
-ALTER TABLE swarm_authority_reservations ALTER COLUMN max_host_evidence_age_ms SET NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_lease_id_uq
-  ON swarm_authority_reservations(lease_id) WHERE lease_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_start_request_id_uq
-  ON swarm_authority_reservations(start_request_id) WHERE start_request_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_id_uq
-  ON swarm_authority_reservations(redemption_id) WHERE redemption_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_redemption_request_id_uq
-  ON swarm_authority_reservations(redemption_request_id) WHERE redemption_request_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_runner_claim_id_uq
-  ON swarm_authority_reservations(runner_claim_id) WHERE runner_claim_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_reservations_runner_claim_request_id_uq
-  ON swarm_authority_reservations(runner_claim_request_id) WHERE runner_claim_request_id IS NOT NULL;
-ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_lease_fields_check;
-ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_lease_fields_check CHECK (
-  num_nonnulls(lease_id,start_request_id,lease_issued_at,lease_expires_at,lease_duration_ms) IN (0,5)
-  AND (lease_id IS NULL OR (
-    lease_duration_ms BETWEEN 1000 AND 900000
-    AND lease_expires_at=lease_issued_at+(lease_duration_ms*INTERVAL '1 millisecond')
-  ))
-  AND (state <> 'reserved-not-started' OR (lease_id IS NULL AND lease_claim_token_sha256 IS NULL))
-  AND (state IN ('cancelled','expired') OR consume_token_sha256 <> cancel_token_sha256)
-  AND (state <> 'consumed-not-started' OR (
-    lease_id IS NULL
-    AND (lease_claim_token_sha256 IS NULL OR (
-      consume_token_sha256 <> lease_claim_token_sha256
-      AND cancel_token_sha256 <> lease_claim_token_sha256
-    ))
-  ))
-  AND (state <> 'leased-not-started' OR (
-    lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
-    AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
-    AND cancel_token_sha256 <> lease_claim_token_sha256
-    AND cancel_token_sha256 <> redemption_token_sha256
-    AND cancel_token_sha256 <> control_token_sha256
-    AND consume_token_sha256 <> lease_claim_token_sha256
-    AND consume_token_sha256 <> redemption_token_sha256
-    AND consume_token_sha256 <> control_token_sha256
-    AND lease_claim_token_sha256 <> redemption_token_sha256
-    AND lease_claim_token_sha256 <> control_token_sha256
-    AND redemption_token_sha256 <> control_token_sha256
-  ))
-  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed') OR (
-    lease_id IS NOT NULL AND lease_claim_token_sha256 IS NOT NULL
-    AND num_nonnulls(redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref)=4
-    AND cancel_token_sha256 <> lease_claim_token_sha256
-    AND cancel_token_sha256 <> redemption_token_sha256
-    AND cancel_token_sha256 <> control_token_sha256
-    AND consume_token_sha256 <> lease_claim_token_sha256
-    AND consume_token_sha256 <> redemption_token_sha256
-    AND consume_token_sha256 <> control_token_sha256
-    AND lease_claim_token_sha256 <> redemption_token_sha256
-    AND lease_claim_token_sha256 <> control_token_sha256
-    AND redemption_token_sha256 <> control_token_sha256
-    AND num_nonnulls(redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd)=4
-    AND committed_cost_usd=reserved_cost_usd
-  ))
-  AND (state NOT IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed') OR (
-    num_nonnulls(broker_database_role,broker_database_name,broker_role_contract_sha256)=3
-    AND broker_role_contract_sha256='${BROKER_DATABASE_ROLE_CONTRACT_SHA256}'
-  ))
-  AND (state NOT IN ('runner-claimed-not-started','runner-start-observed','runner-never-started-observed','runner-terminal-observed') OR (
-    num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
-      runner_evidence_observed_at,runner_access_review_expires_at,
-      runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
-      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,outcome_token_sha256,
-      runner_launch_attempt_id,runner_fencing_generation,runner_revocation_refs)=18
-    AND num_nonnulls(usage_reconciliation_token_sha256,provider_usage_correlation_id) IN (0,2)
-    AND runner_claim_expires_at > runner_claim_accepted_at
-    AND runner_access_review_expires_at > runner_evidence_observed_at
-    AND runner_claim_expires_at <= runner_access_review_expires_at
-    AND runner_runtime_id=binding->>'runtime_id'
-    AND runner_host_id=host_id
-    AND runner_id=binding->>'execution_identity'
-    AND runner_identity_evidence_ref=binding->>'identity_evidence_ref'
-    AND heartbeat_token_sha256 <> consume_token_sha256
-    AND heartbeat_token_sha256 <> cancel_token_sha256
-    AND heartbeat_token_sha256 <> lease_claim_token_sha256
-    AND heartbeat_token_sha256 <> redemption_token_sha256
-    AND heartbeat_token_sha256 <> control_token_sha256
-    AND start_observation_token_sha256 <> consume_token_sha256
-    AND start_observation_token_sha256 <> cancel_token_sha256
-    AND start_observation_token_sha256 <> lease_claim_token_sha256
-    AND start_observation_token_sha256 <> redemption_token_sha256
-    AND start_observation_token_sha256 <> control_token_sha256
-    AND start_observation_token_sha256 <> heartbeat_token_sha256
-    AND outcome_token_sha256 <> consume_token_sha256
-    AND outcome_token_sha256 <> cancel_token_sha256
-    AND outcome_token_sha256 <> lease_claim_token_sha256
-    AND outcome_token_sha256 <> redemption_token_sha256
-    AND outcome_token_sha256 <> control_token_sha256
-    AND outcome_token_sha256 <> heartbeat_token_sha256
-    AND outcome_token_sha256 <> start_observation_token_sha256
-    AND usage_reconciliation_token_sha256 <> consume_token_sha256
-    AND usage_reconciliation_token_sha256 <> cancel_token_sha256
-    AND usage_reconciliation_token_sha256 <> lease_claim_token_sha256
-    AND usage_reconciliation_token_sha256 <> redemption_token_sha256
-    AND usage_reconciliation_token_sha256 <> control_token_sha256
-    AND usage_reconciliation_token_sha256 <> heartbeat_token_sha256
-    AND usage_reconciliation_token_sha256 <> start_observation_token_sha256
-    AND usage_reconciliation_token_sha256 <> outcome_token_sha256
-    AND runner_fencing_generation >= 1
-    AND jsonb_typeof(runner_revocation_refs) = 'array'
-    AND (num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
-      runner_heartbeat_sequence,runner_heartbeat_accepted_at,
-      runner_heartbeat_presented_token_sha256)=0 OR (
-      num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
-        runner_heartbeat_sequence,runner_heartbeat_accepted_at,
-        runner_heartbeat_presented_token_sha256)=5
-      AND runner_heartbeat_sequence >= 1
-      AND runner_heartbeat_accepted_at >= runner_claim_accepted_at
-      AND runner_claim_expires_at > runner_heartbeat_accepted_at
-      AND runner_heartbeat_presented_token_sha256 <> heartbeat_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> consume_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> cancel_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> lease_claim_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> redemption_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> control_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> start_observation_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> outcome_token_sha256
-      AND runner_heartbeat_presented_token_sha256 <> usage_reconciliation_token_sha256
-    ))
-  ))
-  AND (state NOT IN ('runner-start-observed','runner-terminal-observed') OR (
-    num_nonnulls(runner_start_observation_id,runner_start_observation_request_id,
-      runner_start_observation_accepted_at,runner_start_evidence_observed_at,
-      runner_process_started_at,runner_process_instance_sha256,runner_start_evidence_ref,
-      runner_start_evidence_sha256,runner_start_presented_token_sha256)=9
-    AND runner_process_started_at >= runner_claim_accepted_at
-    AND runner_process_started_at <= runner_start_evidence_observed_at
-    AND runner_start_evidence_observed_at <= runner_start_observation_accepted_at
-    AND runner_start_observation_accepted_at < runner_claim_expires_at
-    AND runner_start_presented_token_sha256=start_observation_token_sha256
-  ))
-  AND (state NOT IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','cancelled','expired') OR
-    num_nonnulls(runner_claim_id,runner_claim_request_id,runner_claim_accepted_at,runner_claim_expires_at,
-      runner_evidence_observed_at,runner_access_review_expires_at,
-      runner_id,runner_identity_evidence_ref,runner_instance_id,runner_runtime_id,runner_host_id,
-      runner_channel_binding_sha256,heartbeat_token_sha256,start_observation_token_sha256,outcome_token_sha256,
-      runner_launch_attempt_id,runner_fencing_generation,runner_revocation_refs,
-      usage_reconciliation_token_sha256,provider_usage_correlation_id)=0)
-  AND (state IN ('runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed') OR
-    num_nonnulls(runner_heartbeat_id,runner_heartbeat_request_id,
-      runner_heartbeat_sequence,runner_heartbeat_accepted_at,
-      runner_heartbeat_presented_token_sha256)=0)
-  AND (state IN ('runner-start-observed','runner-terminal-observed','stop-requested') OR
-    num_nonnulls(runner_start_observation_id,runner_start_observation_request_id,
-      runner_start_observation_accepted_at,runner_start_evidence_observed_at,
-      runner_process_started_at,runner_process_instance_sha256,runner_start_evidence_ref,
-      runner_start_evidence_sha256,runner_start_presented_token_sha256)=0)
-  AND (state NOT IN ('runner-never-started-observed','runner-terminal-observed') OR (
-    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
-      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
-      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
-      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
-      runner_remote_stop_confirmed)=11
-    AND runner_outcome_at >= runner_claim_accepted_at
-    AND runner_outcome_at <= runner_outcome_evidence_observed_at
-    AND runner_outcome_evidence_observed_at <= runner_outcome_accepted_at
-    AND runner_outcome_presented_token_sha256=outcome_token_sha256
-    AND ((state='runner-never-started-observed' AND runner_outcome_kind='never-started'
-      AND runner_process_instance_sha256 IS NULL AND runner_exit_disposition IS NULL)
-      OR (state='runner-terminal-observed' AND runner_outcome_kind='process-terminal'
-        AND runner_process_instance_sha256 IS NOT NULL AND runner_exit_disposition IS NOT NULL))
-  ))
-  AND (state IN ('runner-never-started-observed','runner-terminal-observed','stop-requested') OR
-    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
-      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
-      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
-      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
-      runner_exit_disposition,runner_remote_stop_confirmed)=0)
-  AND (state <> 'stop-requested' OR
-    num_nonnulls(runner_outcome_id,runner_outcome_request_id,runner_outcome_event_id,
-      runner_outcome_kind,runner_outcome_accepted_at,runner_outcome_at,
-      runner_outcome_evidence_observed_at,runner_outcome_evidence_ref,
-      runner_outcome_evidence_sha256,runner_outcome_presented_token_sha256,
-      runner_remote_stop_confirmed) IN (0,11))
-  AND (state <> 'stop-requested' OR runner_outcome_id IS NULL
-    OR (runner_outcome_kind='never-started' AND runner_exit_disposition IS NULL))
-);
-ALTER TABLE swarm_authority_reservations DROP CONSTRAINT IF EXISTS swarm_authority_reservations_outcome_values_check;
-ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_outcome_values_check CHECK (
-  (runner_fencing_generation IS NULL OR runner_fencing_generation >= 1)
-  AND (runner_outcome_kind IS NULL OR runner_outcome_kind IN ('never-started','process-terminal'))
-  AND (runner_exit_disposition IS NULL OR runner_exit_disposition IN
-    ('exited-zero','exited-nonzero','signal','supervisor-killed','unknown'))
-);
-ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservations_state_check
-  CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'));
-ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
-ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled'));
-${USAGE_AUTHORITY_ROUTINE_SQL}
-`;
-
-interface SqlResult { rows: Record<string, unknown>[]; rowCount?: number | null }
-export interface AuthoritySqlClient {
-  query(sql: string, values?: unknown[]): Promise<SqlResult>;
-  release?(): void;
-}
-export interface AuthoritySqlPool { connect(): Promise<AuthoritySqlClient> }
-
-export interface PostgresOperationAuthorityOptions {
-  maxBrokerEvidenceAgeMs?: number;
-  brokerSessionAttestor?: BrokerDatabaseSessionAttestor;
-  maxRunnerEvidenceAgeMs?: number;
-  minRunnerHeartbeatIntervalMs?: number;
-  runnerSessionAttestor?: RunnerSessionAttestor;
-  runnerStartEvidenceAttestor?: RunnerStartEvidenceAttestor;
-  runnerOutcomeEvidenceAttestor?: RunnerOutcomeEvidenceAttestor;
-  runnerUsageEvidenceAttestor?: RunnerUsageEvidenceAttestor;
-  usageEvidencePool?: AuthoritySqlPool;
-  usageEvidenceSessionAttestor?: UsageEvidenceDatabaseSessionAttestor;
-}
-
-// These ceilings are also enforced inside the function-only usage authority.
-// Allowing a looser database routine than the configured store would let a
-// direct routine caller bypass the public API's freshness policy.
-export const BROKER_EVIDENCE_MAX_AGE_MS = 5 * 60_000;
-export const RUNNER_EVIDENCE_MAX_AGE_MS = 60_000;
-
-function denial(blocker: string): AdmissionResult {
-  return { admitted: false, reservation: null, blockers: [blocker] };
-}
-
-function consumptionDenied(blocker: string): ConsumptionResult {
-  return { consumed: false, receipt: null, blockers: [blocker] };
-}
-
-function startLeaseDenied(blocker: string): StartLeaseResult {
-  return { leased: false, receipt: null, blockers: [blocker] };
-}
-
-function startRedemptionDenied(blocker: string): StartRedemptionResult {
-  return { redeemed: false, receipt: null, blockers: [blocker] };
-}
-
-function runnerClaimDenied(blocker: string): RunnerClaimResult {
-  return { claimed: false, receipt: null, blockers: [blocker] };
-}
-
-function runnerHeartbeatDenied(blocker: string): RunnerHeartbeatResult {
-  return { accepted: false, receipt: null, blockers: [blocker] };
-}
-
-function runnerStartObservationDenied(blocker: string): RunnerStartObservationResult {
-  return { observed: false, receipt: null, blockers: [blocker] };
-}
-
-function runnerOutcomeDenied(blocker: string): RunnerOutcomeResult {
-  return { settled: false, receipt: null, blockers: [blocker] };
-}
-
-function runnerUsageEvidenceDenied(blocker: string): RunnerUsageEvidenceResult {
-  return { recorded: false, receipt: null, blockers: [blocker] };
-}
-
-function cancellationDenied(
-  reservationId: string,
-  blocker: string,
-  state: null | 'expired' | 'stop-requested' = null,
-  alreadyTerminal = false,
-): CancellationResult {
-  return {
-    cancelled: false,
-    reservation_id: reservationId,
-    state,
-    already_terminal: alreadyTerminal,
-    released_cost_usd: 0,
-    blockers: [blocker],
-  };
-}
-
-function sqlInstant(value: unknown): string {
-  const parsed = value instanceof Date ? value : new Date(String(value));
-  if (!Number.isFinite(parsed.getTime())) throw new Error('Database returned an invalid transaction timestamp.');
-  return parsed.toISOString();
-}
-
-function canonicalUsd(value: unknown): string {
-  const raw = String(value);
-  const match = /^(0|[1-9][0-9]{0,7})(?:\.([0-9]{1,6}))?$/.exec(raw);
-  if (!match) throw new Error('Database returned a non-canonical USD amount.');
-  return `${match[1]}.${(match[2] ?? '').padEnd(6, '0')}`;
-}
-
-function canonicalProviderUsd(
-  value: unknown,
-  schemaVersion: 'starlight.runner_usage_provider_evidence.v1' | 'starlight.runner_usage_provider_evidence.v2',
-): string {
-  const raw = String(value);
-  const match = /^(0|[1-9][0-9]{0,7})(?:\.([0-9]{1,12}))?$/.exec(raw);
-  if (!match) throw new Error('Database returned a provider USD amount outside the precision envelope.');
-  const fractional = (match[2] ?? '').padEnd(12, '0');
-  if (schemaVersion === 'starlight.runner_usage_provider_evidence.v1') {
-    if (!/^0{6}$/.test(fractional.slice(6))) {
-      throw new Error('Database returned a v1 provider USD amount with excess precision.');
-    }
-    return `${match[1]}.${fractional.slice(0, 6)}`;
-  }
-  return `${match[1]}.${fractional}`;
-}
-
-function hostEvidence(row: Record<string, unknown> | undefined): TrustedHostEvidence | null {
-  const parsed = hostEvidenceSchema.safeParse(row?.evidence);
-  return parsed.success ? parsed.data : null;
-}
-
-async function lockAuthority(client: AuthoritySqlClient): Promise<boolean> {
-  const control = await client.query('SELECT starlight_authority_lock() AS locked');
-  return control.rows.length === 1 && control.rows[0]?.locked === true;
-}
-
-async function wallClock(client: AuthoritySqlClient): Promise<string> {
-  // Unlike transaction_timestamp()/NOW(), this advances while a transaction waits for a lock.
-  const result = await client.query('SELECT clock_timestamp() AS now');
-  return sqlInstant(result.rows[0]?.now);
-}
-
-/** PostgreSQL is the concurrency boundary; every mutable admission check runs in one transaction. */
-export class PostgresOperationAuthorityStore implements OperationAuthorityStore {
-  readonly durable = true;
-  private readonly maxBrokerEvidenceAgeMs: number;
-  private readonly brokerSessionAttestor: BrokerDatabaseSessionAttestor;
-  private readonly maxRunnerEvidenceAgeMs: number;
-  private readonly minRunnerHeartbeatIntervalMs: number;
-  private readonly runnerSessionAttestor: RunnerSessionAttestor;
-  private readonly runnerStartEvidenceAttestor: RunnerStartEvidenceAttestor;
-  private readonly runnerOutcomeEvidenceAttestor: RunnerOutcomeEvidenceAttestor;
-  private readonly runnerUsageEvidenceAttestor: RunnerUsageEvidenceAttestor;
-  private readonly usageEvidencePool?: AuthoritySqlPool;
-  private readonly usageEvidenceSessionAttestor: UsageEvidenceDatabaseSessionAttestor;
-
-  constructor(
-    private readonly pool: AuthoritySqlPool,
-    options: PostgresOperationAuthorityOptions = {},
-  ) {
-    this.maxBrokerEvidenceAgeMs = options.maxBrokerEvidenceAgeMs ?? BROKER_EVIDENCE_MAX_AGE_MS;
-    if (this.maxBrokerEvidenceAgeMs !== BROKER_EVIDENCE_MAX_AGE_MS) {
-      throw new Error('Broker evidence age ceiling is fixed at five minutes by database authority policy.');
-    }
-    this.brokerSessionAttestor = options.brokerSessionAttestor ?? attestBrokerDatabaseSession;
-    this.maxRunnerEvidenceAgeMs = options.maxRunnerEvidenceAgeMs ?? RUNNER_EVIDENCE_MAX_AGE_MS;
-    if (this.maxRunnerEvidenceAgeMs !== RUNNER_EVIDENCE_MAX_AGE_MS) {
-      throw new Error('Runner evidence age ceiling is fixed at one minute by database authority policy.');
-    }
-    this.minRunnerHeartbeatIntervalMs = options.minRunnerHeartbeatIntervalMs ?? 1_000;
-    if (!Number.isInteger(this.minRunnerHeartbeatIntervalMs)
-      || this.minRunnerHeartbeatIntervalMs < 1_000 || this.minRunnerHeartbeatIntervalMs > 60_000) {
-      throw new Error('Runner heartbeat interval must be between 1 second and 1 minute.');
-    }
-    this.runnerSessionAttestor = options.runnerSessionAttestor ?? denyUnconfiguredRunnerSession;
-    this.runnerStartEvidenceAttestor = options.runnerStartEvidenceAttestor ?? denyUnconfiguredRunnerStartEvidence;
-    this.runnerOutcomeEvidenceAttestor = options.runnerOutcomeEvidenceAttestor ?? denyUnconfiguredRunnerOutcomeEvidence;
-    this.runnerUsageEvidenceAttestor = options.runnerUsageEvidenceAttestor ?? denyUnconfiguredRunnerUsageEvidence;
-    this.usageEvidencePool = options.usageEvidencePool;
-    this.usageEvidenceSessionAttestor = options.usageEvidenceSessionAttestor ?? attestUsageEvidenceDatabaseSession;
-  }
-
-  async initialize(): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(OPERATION_AUTHORITY_MIGRATION_SQL);
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, 'control-plane', '0'.repeat(64), {
-        action: 'initialize', error: error instanceof Error ? error.message : 'unknown initialization failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  private async recordIntegrityRefusal(
-    client: AuthoritySqlClient,
-    operationId: string,
-    bindingDigestSha256: string,
-    detail: Record<string, unknown>,
-  ): Promise<void> {
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) {
-        await client.query('ROLLBACK');
-        return;
-      }
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [operationId, bindingDigestSha256, await wallClock(client), JSON.stringify({ integrity_refusal: detail })],
-      );
-      await client.query('COMMIT');
-    } catch {
-      try { await client.query('ROLLBACK'); } catch { /* primary failure remains authoritative */ }
-    }
-  }
-
-  /**
-   * The broker transaction is deliberately released before the isolated
-   * verifier runs. Refusals after that handoff still need a durable audit row,
-   * written through a fresh broker transaction without exposing audit-table
-   * authority to the verifier role.
-   */
-  private async recordRunnerUsageEvidenceRefusal(
-    request: RunnerUsageEvidenceInput,
-    blocker: string,
-    verifierHandoffCompleted = true,
-  ): Promise<void> {
-    let auditClient: AuthoritySqlClient | undefined;
-    try {
-      auditClient = await this.pool.connect();
-      await auditClient.query('BEGIN');
-      await auditClient.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(auditClient)) {
-        await auditClient.query('ROLLBACK');
-        return;
-      }
-      await auditClient.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-usage-evidence-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, await wallClock(auditClient), JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          outcome_id: request.outcome_id, usage_request_id: request.usage_request_id,
-          usage_sequence: request.usage_sequence, blockers: [blocker], released_cost_usd: '0.000000',
-          verifier_handoff_completed: verifierHandoffCompleted,
-        })],
-      );
-      await auditClient.query('COMMIT');
-    } catch {
-      if (auditClient) {
-        try { await auditClient.query('ROLLBACK'); } catch { /* the primary refusal remains authoritative */ }
-      }
-    } finally { auditClient?.release?.(); }
-  }
-
-  async putHostEvidence(evidence: TrustedHostEvidence): Promise<void> {
-    const trusted = hostEvidenceSchema.parse(evidence);
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const transactionAt = await wallClock(client);
-      await client.query(
-        `INSERT INTO swarm_authority_hosts (host_id,evidence,observed_at,capacity_slots,reserved_slots,authorized_slots)
-         VALUES ($1,$2::jsonb,$3::timestamptz,$4,0,0)
-         ON CONFLICT (host_id) DO UPDATE SET evidence=EXCLUDED.evidence,
-         observed_at=EXCLUDED.observed_at, capacity_slots=EXCLUDED.capacity_slots`,
-        [trusted.host_id, JSON.stringify(trusted), trusted.observed_at, trusted.capacity_slots],
-      );
-      const quarantined = await client.query(
-        `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-           AND ($2 <> 'ready' OR $3::boolean=FALSE OR $4::timestamptz <= $5::timestamptz
-             OR $4::timestamptz > $5::timestamptz+INTERVAL '1 minute'
-             OR $5::timestamptz-$4::timestamptz > max_host_evidence_age_ms*INTERVAL '1 millisecond'
-             OR NOT (binding->'capabilities' <@ $6::jsonb))
-         RETURNING reservation_id,operation_id,binding_digest_sha256`,
-        [trusted.host_id, trusted.status, trusted.secret_readiness, trusted.observed_at,
-          transactionAt, JSON.stringify(trusted.allowed_capabilities)],
-      );
-      for (const row of quarantined.rows) {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
-            reservation_id: row.reservation_id, reason: 'host evidence became unavailable or drifted',
-            host_id: trusted.host_id, execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-      }
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async putBrokerPrincipalEvidence(evidence: TrustedBrokerPrincipalEvidence): Promise<void> {
-    const trusted = brokerPrincipalEvidenceSchema.parse(evidence);
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const transactionAt = await wallClock(client);
-      await client.query(
-        `INSERT INTO swarm_authority_broker_principals
-         (database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-          authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz,$8::timestamptz,$9,$10::jsonb)
-         ON CONFLICT (database_role,database_name) DO UPDATE SET
-           broker_execution_identity=EXCLUDED.broker_execution_identity,
-           broker_identity_evidence_ref=EXCLUDED.broker_identity_evidence_ref,
-           authn_kind=EXCLUDED.authn_kind,
-           role_contract_digest_sha256=EXCLUDED.role_contract_digest_sha256,
-           observed_at=EXCLUDED.observed_at,
-           access_review_expires_at=EXCLUDED.access_review_expires_at,
-           state=EXCLUDED.state,evidence=EXCLUDED.evidence`,
-        [trusted.database_role, trusted.database_name, trusted.broker_execution_identity,
-          trusted.broker_identity_evidence_ref, trusted.authn_kind, trusted.role_contract_digest_sha256,
-          trusted.observed_at, trusted.access_review_expires_at, trusted.state, JSON.stringify(trusted)],
-      );
-      const quarantined = await client.query(
-        `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE broker_database_role=$1 AND broker_database_name=$2
-           AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-           AND ($3 <> 'ready' OR broker_execution_identity <> $4 OR broker_identity_evidence_ref <> $5
-             OR broker_role_contract_sha256 <> $6)
-         RETURNING reservation_id,operation_id,binding_digest_sha256`,
-        [trusted.database_role, trusted.database_name, trusted.state, trusted.broker_execution_identity,
-          trusted.broker_identity_evidence_ref, trusted.role_contract_digest_sha256],
-      );
-      for (const row of quarantined.rows) {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
-            reservation_id: row.reservation_id, reason: 'authenticated broker principal disabled or changed',
-            database_role: trusted.database_role, execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-      }
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ($1,$2,$3,$4::timestamptz,$5::jsonb)`,
-        [trusted.state === 'ready' ? 'broker-principal-registered' : 'broker-principal-disabled',
-          `broker-principal:${trusted.database_role}`, sha256Digest(trusted), transactionAt,
-          JSON.stringify({ ...trusted, registered_at: transactionAt })],
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async registerBudget(receiptId: string, hardLimitUsd: number): Promise<void> {
-    controlId.parse(receiptId);
-    z.number().finite().nonnegative().max(10_000).parse(hardLimitUsd);
-    const client = await this.pool.connect();
-    try {
-      await client.query(
-        `INSERT INTO swarm_authority_budgets (receipt_id,hard_limit_usd) VALUES ($1,$2)
-         ON CONFLICT (receipt_id) DO NOTHING`,
-        [receiptId, hardLimitUsd],
-      );
-    } finally { client.release?.(); }
-  }
-
-  async registerBudgetWindow(input: {
-    window_id: string;
-    policy_id: string;
-    kind: 'policy' | 'daily';
-    starts_at: string;
-    ends_at: string;
-    currency: 'USD';
-    hard_limit_usd: number;
-  }): Promise<BudgetWindowRegistrationResult> {
-    const window = budgetWindowSchema.parse(input);
-    const client = await this.pool.connect();
-    const deny = async (registeredAt: string, blocker: string): Promise<BudgetWindowRegistrationResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('budget-window-denied','control-plane',$1,$2::timestamptz,$3::jsonb)`,
-        ['0'.repeat(64), registeredAt, JSON.stringify({
-          window_id: window.window_id, policy_id: window.policy_id, kind: window.kind, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return { registered: false, already_registered: false, blockers: [blocker] };
-    };
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const registeredAt = await wallClock(client);
-      const sameId = await client.query(
-        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd
-         FROM swarm_authority_budget_windows WHERE window_id=$1 FOR UPDATE`,
-        [window.window_id],
-      );
-      if (sameId.rows.length > 1) return await deny(registeredAt, 'Budget window identity is ambiguous.');
-      if (sameId.rows.length === 1) {
-        const existing = sameId.rows[0];
-        if (existing.policy_id !== window.policy_id || existing.kind !== window.kind
-          || sqlInstant(existing.starts_at) !== new Date(window.starts_at).toISOString()
-          || sqlInstant(existing.ends_at) !== new Date(window.ends_at).toISOString()
-          || existing.currency !== window.currency
-          || Number(existing.hard_limit_usd) !== window.hard_limit_usd) {
-          return await deny(registeredAt, 'Budget window identity is immutable once registered.');
-        }
-        await client.query('COMMIT');
-        return { registered: true, already_registered: true, blockers: [] };
-      }
-      const overlap = await client.query(
-        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd
-         FROM swarm_authority_budget_windows
-         WHERE policy_id=$1 AND kind=$2
-           AND NOT (ends_at <= $3::timestamptz OR starts_at >= $4::timestamptz)
-         FOR UPDATE`,
-        [window.policy_id, window.kind, window.starts_at, window.ends_at],
-      );
-      if (overlap.rows.length > 0) {
-        return await deny(registeredAt, 'Budget policy window overlaps an immutable registered window.');
-      }
-      await client.query(
-        `INSERT INTO swarm_authority_budget_windows
-         (window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd)
-         VALUES ($1,$2,$3,$4::timestamptz,$5::timestamptz,$6,$7)`,
-        [window.window_id, window.policy_id, window.kind, window.starts_at, window.ends_at,
-          window.currency, window.hard_limit_usd],
-      );
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('budget-window-registered','control-plane',$1,$2::timestamptz,$3::jsonb)`,
-        ['0'.repeat(64), registeredAt, JSON.stringify(window)],
-      );
-      await client.query('COMMIT');
-      return { registered: true, already_registered: false, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async putPreparedOperation(operationId: string, bindingDigestSha256: string, registeredAt: string): Promise<void> {
-    controlId.parse(operationId);
-    z.string().regex(/^[a-f0-9]{64}$/).parse(bindingDigestSha256);
-    controlTime.parse(registeredAt);
-    const client = await this.pool.connect();
-    try {
-      await client.query(
-        `INSERT INTO swarm_authority_prepared_operations
-         (operation_id,binding_digest_sha256,registered_at,state) VALUES ($1,$2,$3::timestamptz,'ready')
-         ON CONFLICT (operation_id) DO NOTHING`,
-        [operationId, bindingDigestSha256, registeredAt],
-      );
-    } finally { client.release?.(); }
-  }
-
-  async cancelPreparedOperation(operationId: string): Promise<void> {
-    controlId.parse(operationId);
-    const client = await this.pool.connect();
-    let bindingDigest = '0'.repeat(64);
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const transactionAt = await wallClock(client);
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256 FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
-        [operationId],
-      );
-      if (!prepared.rows[0]) throw new Error('Prepared operation does not exist.');
-      bindingDigest = String(prepared.rows[0].binding_digest_sha256);
-      await client.query(
-        `UPDATE swarm_authority_prepared_operations SET state='cancelled' WHERE operation_id=$1`,
-        [operationId],
-      );
-      const affected = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,binding,budget_receipt_id,host_id,reserved_cost_usd,state,lease_id,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE operation_id=$1 AND state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-         FOR UPDATE`,
-        [operationId],
-      );
-      for (const row of affected.rows) {
-        const transitioned = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-           RETURNING reservation_id`,
-          [row.reservation_id],
-        );
-        if (transitioned.rows.length !== 1) throw new Error('Prepared-operation cancellation lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [operationId, row.binding_digest_sha256, transactionAt, JSON.stringify({
-            reservation_id: row.reservation_id, lease_id: row.lease_id ?? null,
-            reason: 'prepared operation cancelled before runner connection', released_cost_usd: released,
-          })],
-        );
-      }
-      const authorized = await client.query(
-        `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE operation_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-         RETURNING reservation_id,binding_digest_sha256`,
-        [operationId],
-      );
-      for (const row of authorized.rows) {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [operationId, row.binding_digest_sha256, transactionAt, JSON.stringify({
-            reservation_id: row.reservation_id, reason: 'prepared operation cancelled after start authorization',
-            execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-      }
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [operationId, bindingDigest, transactionAt, JSON.stringify({ reason: 'control-plane cancellation' })],
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, operationId, bindingDigest, {
-        action: 'cancel-prepared-operation', error: error instanceof Error ? error.message : 'unknown preparation cancellation failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async revoke(ref: string, at: string, reason: string): Promise<void> {
-    z.string().min(5).max(500).parse(ref);
-    controlTime.parse(at);
-    z.string().min(1).max(1_000).parse(reason);
-    const client = await this.pool.connect();
-    let affectedOperation = 'control-plane';
-    let affectedDigest = '0'.repeat(64);
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const transactionAt = await wallClock(client);
-      await client.query(
-        `INSERT INTO swarm_authority_revocations (ref,revoked_at,reason) VALUES ($1,$2::timestamptz,$3)
-         ON CONFLICT (ref) DO NOTHING`, [ref, transactionAt, reason],
-      );
-      const affected = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,binding,budget_receipt_id,host_id,reserved_cost_usd,state,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-           AND revocation_refs @> jsonb_build_array($1::text)
-         FOR UPDATE`,
-        [ref],
-      );
-      for (const row of affected.rows) {
-        affectedOperation = String(row.operation_id);
-        affectedDigest = String(row.binding_digest_sha256);
-        const transitioned = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started','leased-not-started')
-           RETURNING reservation_id`,
-          [row.reservation_id],
-        );
-        if (transitioned.rows.length !== 1) throw new Error('Revocation cancellation lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({ reservation_id: row.reservation_id, reason: 'authority revoked', revocation_ref: ref, released_cost_usd: released })],
-        );
-      }
-      const authorized = await client.query(
-        `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed')
-           AND (revocation_refs @> jsonb_build_array($1::text)
-             OR runner_revocation_refs @> jsonb_build_array($1::text)
-             OR $1='runner:'||runner_id
-             OR $1='runner-instance:'||runner_instance_id
-             OR $1='identity:'||runner_identity_evidence_ref
-             OR $1='channel:'||runner_channel_binding_sha256)
-         RETURNING reservation_id,operation_id,binding_digest_sha256`,
-        [ref],
-      );
-      for (const row of authorized.rows) {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, transactionAt, JSON.stringify({
-            reservation_id: row.reservation_id, reason: 'authority revoked after start authorization',
-            revocation_ref: ref, execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-      }
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('revoked','control-plane',$1,$2::timestamptz,$3::jsonb)`,
-        ['0'.repeat(64), transactionAt, JSON.stringify({ ref, requested_at: at, reason })],
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, affectedOperation, affectedDigest, {
-        action: 'revoke', ref, error: error instanceof Error ? error.message : 'unknown revocation failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [operationId, bindingDigest, at, JSON.stringify({ blockers })],
-      );
-    } finally { client.release?.(); }
-  }
-
-  private async readBudgetWindows(
-    client: AuthoritySqlClient,
-    reservationId: string,
-    expectedPolicyId: string,
-    expectedCost: number,
-  ): Promise<BudgetWindowEvidence[] | null> {
-    const result = await client.query(
-      `SELECT w.window_id,w.policy_id,w.kind,w.starts_at,w.ends_at,w.currency,
-              (h.reserved_cost_usd IS NOT DISTINCT FROM $2::numeric) AS hold_cost_matches,
-              (w.reserved_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(h2.reserved_cost_usd),0)
-               FROM swarm_authority_budget_holds h2
-               JOIN swarm_authority_reservations r2 ON r2.reservation_id=h2.reservation_id
-               WHERE h2.window_id=w.window_id
-                 AND r2.state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS ledger_reconciles,
-              (w.committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(h3.reserved_cost_usd),0)
-               FROM swarm_authority_budget_holds h3
-               JOIN swarm_authority_reservations r3 ON r3.reservation_id=h3.reservation_id
-               WHERE h3.window_id=w.window_id
-                 AND r3.state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS committed_reconciles
-       FROM swarm_authority_budget_holds h JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-       WHERE h.reservation_id=$1::uuid ORDER BY w.kind`,
-      [reservationId, expectedCost],
-    );
-    const kinds = new Set(result.rows.map((row) => row.kind));
-    if (result.rows.length !== 2
-      || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')
-      || result.rows.some((row) => row.policy_id !== expectedPolicyId
-        || row.currency !== 'USD' || row.hold_cost_matches !== true
-        || row.ledger_reconciles !== true || row.committed_reconciles !== true)) return null;
-    try {
-      return result.rows.map((row) => ({
-        window_id: String(row.window_id),
-        kind: row.kind as 'policy' | 'daily',
-        starts_at: sqlInstant(row.starts_at),
-        ends_at: sqlInstant(row.ends_at),
-        currency: 'USD',
-      }));
-    } catch { return null; }
-  }
-
-  private async releaseResources(
-    client: AuthoritySqlClient,
-    row: Record<string, unknown>,
-  ): Promise<number> {
-    const binding = operationBindingSchema.safeParse(row.binding);
-    if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
-      || row.cost_matches_binding !== true) {
-      throw new Error('Reservation binding is invalid or digest-drifted during resource release.');
-    }
-    const cost = binding.data.requested_cost_usd;
-    const durableCost = row.reserved_cost_usd;
-    const budget = await client.query(
-      `UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd-$2::numeric
-       WHERE receipt_id=$1 AND reserved_usd >= $2::numeric RETURNING reserved_usd`,
-      [row.budget_receipt_id, durableCost],
-    );
-    if (budget.rows.length !== 1) throw new Error('Budget release would underflow or references a missing receipt.');
-    const holds = await client.query(
-      `SELECT h.window_id,w.policy_id,w.kind,w.currency,
-              (h.reserved_cost_usd IS NOT DISTINCT FROM $2::numeric) AS hold_cost_matches,
-              (w.reserved_usd IS NOT DISTINCT FROM ((SELECT COALESCE(SUM(h2.reserved_cost_usd),0)
-               FROM swarm_authority_budget_holds h2
-               JOIN swarm_authority_reservations r2 ON r2.reservation_id=h2.reservation_id
-               WHERE h2.window_id=w.window_id
-                 AND r2.state IN ('reserved-not-started','consumed-not-started','leased-not-started')) + $2::numeric)) AS ledger_reconciles
-       FROM swarm_authority_budget_holds h
-       JOIN swarm_authority_budget_windows w ON w.window_id=h.window_id
-       WHERE h.reservation_id=$1::uuid ORDER BY w.kind FOR UPDATE`,
-      [row.reservation_id, durableCost],
-    );
-    const kinds = new Set(holds.rows.map((hold) => hold.kind));
-    if (holds.rows.length !== 2 || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')
-      || holds.rows.some((hold) => hold.hold_cost_matches !== true
-        || hold.policy_id !== binding.data.budget_policy_id || hold.currency !== 'USD'
-        || hold.ledger_reconciles !== true)) {
-      throw new Error('Aggregate budget holds are missing, ambiguous, or inconsistent.');
-    }
-    for (const hold of holds.rows) {
-      const aggregate = await client.query(
-        `UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd-$2::numeric
-         WHERE window_id=$1 AND reserved_usd >= $2::numeric RETURNING reserved_usd`,
-        [hold.window_id, durableCost],
-      );
-      if (aggregate.rows.length !== 1) throw new Error('Aggregate budget release would underflow or references a missing window.');
-    }
-    const host = await client.query(
-      `UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots-1
-       WHERE host_id=$1 AND reserved_slots >= 1 RETURNING reserved_slots`,
-      [row.host_id],
-    );
-    if (host.rows.length !== 1) throw new Error('Host capacity release would underflow or references a missing host.');
-    return cost;
-  }
-
-  async consume(input: ConsumptionInput): Promise<ConsumptionResult> {
-    const parsed = consumptionInputSchema.safeParse(input);
-    if (!parsed.success) return consumptionDenied('Consumption request is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string) => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('consume-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, blockers: [blocker] })],
-      );
-      await client.query('COMMIT');
-      return consumptionDenied(blocker);
-    };
-    try {
-      await client.query('BEGIN');
-      // Explicit pg_temp placement prevents PostgreSQL's implicit temp-first
-      // lookup from shadowing unqualified authority relations in this transaction.
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-      const found = await client.query(
-        `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
-                approval_receipt_id,budget_receipt_id,host_id,reserved_cost_usd,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding,
-                reservation_expires_at,max_host_evidence_age_ms,state,consumption_id,consumed_at,
-                consume_token_sha256,cancel_token_sha256,lease_claim_token_sha256
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND consume_token_sha256=$2 FOR UPDATE`,
-        [request.reservation_id, createHash('sha256').update(request.consume_token, 'utf8').digest('hex')],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Reservation does not exist.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Consumption request does not match the reserved operation and effect.');
-      }
-      const leaseClaimDigest = createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex');
-      if (leaseClaimDigest === row.consume_token_sha256 || leaseClaimDigest === row.cancel_token_sha256) {
-        return await deny('Consume, cancel, and lease-claim credentials must be distinct.');
-      }
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
-        || row.cost_matches_binding !== true) {
-        return await deny('Stored reservation binding or signed cost is invalid.');
-      }
-      if (binding.data.execution_identity !== request.execution_identity || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
-        return await deny('Consumption identity does not match the reserved binding.');
-      }
-      if (row.state === 'cancelled' || row.state === 'expired') return await deny(`Reservation is ${row.state}.`);
-      if (row.state !== 'reserved-not-started' && row.state !== 'consumed-not-started') return await deny('Reservation state is invalid.');
-      const heldWindows = await this.readBudgetWindows(
-        client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd,
-      );
-      if (!heldWindows) return await deny('Aggregate budget holds are missing, ambiguous, or inconsistent.');
-
-      if (Date.parse(String(row.reservation_expires_at)) <= nowMs) {
-        const expired = await client.query(
-          "UPDATE swarm_authority_reservations SET state='expired' WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started') RETURNING reservation_id",
-          [request.reservation_id],
-        );
-        if (expired.rows.length !== 1) return await deny('Reservation expiry transition lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('expired',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, reason: 'expired before consumption', released_cost_usd: released })],
-        );
-        await client.query('COMMIT');
-        return consumptionDenied('Reservation expired before consumption.');
-      }
-
-      const refs = revocationRefsSchema.safeParse(row.revocation_refs);
-      if (!refs.success) return await deny('Stored revocation binding is invalid.');
-      const revoked = await client.query(
-        'SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1',
-        [refs.data],
-      );
-      if (revoked.rows.length) {
-        const cancelled = await client.query(
-          "UPDATE swarm_authority_reservations SET state='cancelled' WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started') RETURNING reservation_id",
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Revocation cancellation lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, reason: 'authority revoked', released_cost_usd: released })],
-        );
-        await client.query('COMMIT');
-        return consumptionDenied('Reservation authority was revoked before consumption.');
-      }
-
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state === 'cancelled' && prepared.rows[0]?.binding_digest_sha256 === request.binding_digest_sha256) {
-        const cancelled = await client.query(
-          "UPDATE swarm_authority_reservations SET state='cancelled' WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started') RETURNING reservation_id",
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Prepared-operation cancellation lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, reason: 'prepared operation cancelled', released_cost_usd: released })],
-        );
-        await client.query('COMMIT');
-        return consumptionDenied('Prepared operation was cancelled before worker start.');
-      }
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Prepared operation is unavailable or drifted.');
-      }
-
-      if (row.state === 'consumed-not-started') {
-        if (typeof row.consumption_id !== 'string' || !row.consumption_id || !row.consumed_at) {
-          return await deny('Stored consumption receipt is incomplete.');
-        }
-        if (!row.lease_claim_token_sha256) {
-          return await deny('Stored consumption is not bound to a lease-claim credential.');
-        }
-        if (row.lease_claim_token_sha256 !== leaseClaimDigest) {
-          return await deny('Consumption retry changed the lease-claim credential.');
-        }
-        const receipt: ConsumptionReceipt = {
-          schema_version: 'starlight.operation_consumption.v1',
-          consumption_id: row.consumption_id,
-          reservation_id: request.reservation_id,
-          operation_id: request.operation_id,
-          effect_id: request.effect_id,
-          binding_digest_sha256: request.binding_digest_sha256,
-          execution_identity: request.execution_identity,
-          identity_evidence_ref: request.identity_evidence_ref,
-          budget_policy_id: binding.data.budget_policy_id,
-          budget_windows: heldWindows,
-          lease_claim_token_sha256: leaseClaimDigest,
-          consumed_at: sqlInstant(row.consumed_at),
-          consumption_expires_at: sqlInstant(row.reservation_expires_at),
-          state: 'consumed-not-started',
-        };
-        await client.query('COMMIT');
-        return { consumed: true, receipt, blockers: [] };
-      }
-
-      const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
-        [row.host_id],
-      );
-      const host = hostEvidence(hostRow.rows[0]);
-      const capacity = Number(hostRow.rows[0]?.capacity_slots);
-      const reserved = Number(hostRow.rows[0]?.reserved_slots);
-      const authorized = Number(hostRow.rows[0]?.authorized_slots);
-      const maxAge = Number(row.max_host_evidence_age_ms);
-      if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
-        return await deny('Trusted host is unavailable at consumption time.');
-      }
-      if (host.capacity_slots !== capacity) return await deny('Trusted host capacity evidence and ledger differ.');
-      if (nowMs - Date.parse(host.observed_at) > maxAge || Date.parse(host.observed_at) > nowMs + 60_000) {
-        return await deny('Trusted host evidence is stale or from the future at consumption time.');
-      }
-      if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired at consumption time.');
-      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
-        || reserved < 1 || authorized < 0 || capacity < reserved + authorized) {
-        return await deny('Trusted host capacity ledger cannot honor the reservation.');
-      }
-      const hostCaps = new Set(host.allowed_capabilities);
-      if (binding.data.capabilities.some((item) => !hostCaps.has(item))) return await deny('Trusted host no longer allows every reserved capability.');
-
-      const receipt: ConsumptionReceipt = {
-        schema_version: 'starlight.operation_consumption.v1',
-        consumption_id: randomUUID(),
-        reservation_id: request.reservation_id,
-        operation_id: request.operation_id,
-        effect_id: request.effect_id,
-        binding_digest_sha256: request.binding_digest_sha256,
-        execution_identity: request.execution_identity,
-        identity_evidence_ref: request.identity_evidence_ref,
-        budget_policy_id: binding.data.budget_policy_id,
-        budget_windows: heldWindows,
-          lease_claim_token_sha256: leaseClaimDigest,
-        consumed_at: at,
-        consumption_expires_at: sqlInstant(row.reservation_expires_at),
-        state: 'consumed-not-started',
-      };
-      const consumed = await client.query(
-        `UPDATE swarm_authority_reservations
-         SET state='consumed-not-started',consumption_id=$2::uuid,consumed_at=$3::timestamptz,
-             lease_claim_token_sha256=$4
-         WHERE reservation_id=$1::uuid AND state='reserved-not-started' RETURNING reservation_id`,
-        [request.reservation_id, receipt.consumption_id, at, receipt.lease_claim_token_sha256],
-      );
-      if (consumed.rows.length !== 1) return await deny('Reservation could not be consumed exactly once.');
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('consumed',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { consumed: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'consume', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown consumption failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async leaseStart(input: StartLeaseInput): Promise<StartLeaseResult> {
-    const parsed = startLeaseInputSchema.safeParse(input);
-    if (!parsed.success) return startLeaseDenied('Start-lease request is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string) => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('start-lease-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, consumption_id: request.consumption_id,
-          start_request_id: request.start_request_id, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return startLeaseDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): StartLeaseReceipt => ({
-      schema_version: 'starlight.worker_start_lease.v1',
-      lease_id: String(row.lease_id),
-      start_request_id: String(row.start_request_id),
-      consumption_id: String(row.consumption_id),
-      reservation_id: request.reservation_id,
-      operation_id: request.operation_id,
-      effect_id: request.effect_id,
-      binding_digest_sha256: request.binding_digest_sha256,
-      execution_identity: request.execution_identity,
-      identity_evidence_ref: request.identity_evidence_ref,
-      lease_claim_token_sha256: String(row.lease_claim_token_sha256),
-      redemption_token_sha256: String(row.redemption_token_sha256),
-      control_token_sha256: String(row.control_token_sha256),
-      broker_execution_identity: String(row.broker_execution_identity),
-      broker_identity_evidence_ref: String(row.broker_identity_evidence_ref),
-      lease_issued_at: sqlInstant(row.lease_issued_at),
-      lease_expires_at: sqlInstant(row.lease_expires_at),
-      lease_duration_ms: Number(row.lease_duration_ms),
-      dispatch_state: 'not-dispatched',
-      runner_activation_authorized: false,
-      state: 'leased-not-started',
-    });
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-      const found = await client.query(
-        `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
-                budget_receipt_id,host_id,reserved_cost_usd,reservation_expires_at,max_host_evidence_age_ms,
-                state,consumption_id,consumed_at,lease_id,start_request_id,lease_issued_at,lease_expires_at,lease_duration_ms,
-                consume_token_sha256,cancel_token_sha256,lease_claim_token_sha256,redemption_token_sha256,control_token_sha256,
-                broker_execution_identity,broker_identity_evidence_ref,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND lease_claim_token_sha256=$2 FOR UPDATE`,
-        [request.reservation_id, createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex')],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Reservation does not exist.');
-      const redemptionDigest = createHash('sha256').update(request.redemption_token, 'utf8').digest('hex');
-      const controlDigest = createHash('sha256').update(request.control_token, 'utf8').digest('hex');
-      const leaseClaimDigest = createHash('sha256').update(request.lease_claim_token, 'utf8').digest('hex');
-      if (new Set([
-        String(row.consume_token_sha256), String(row.cancel_token_sha256),
-        leaseClaimDigest, redemptionDigest, controlDigest,
-      ]).size !== 5) {
-        return await deny('Consume, cancel, lease-claim, redemption, and control credentials must be pairwise distinct.');
-      }
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256 || row.consumption_id !== request.consumption_id) {
-        return await deny('Start-lease request does not match the consumed operation.');
-      }
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
-        || row.cost_matches_binding !== true) {
-        return await deny('Stored reservation binding or signed cost is invalid.');
-      }
-      if (binding.data.execution_identity !== request.execution_identity
-        || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
-        return await deny('Start-lease identity does not match the consumed binding.');
-      }
-      if (row.state === 'cancelled' || row.state === 'expired') return await deny(`Reservation is ${row.state}.`);
-      if (row.state !== 'consumed-not-started' && row.state !== 'leased-not-started') {
-        return await deny('A consumed-not-started reservation is required before a start lease.');
-      }
-      const heldWindows = await this.readBudgetWindows(
-        client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd,
-      );
-      if (!heldWindows) return await deny('Aggregate budget holds are missing, ambiguous, or inconsistent.');
-
-      const reservationExpired = Date.parse(String(row.reservation_expires_at)) <= nowMs;
-      const leaseExpired = row.state === 'leased-not-started' && Date.parse(String(row.lease_expires_at)) <= nowMs;
-      if (reservationExpired || leaseExpired) {
-        const expired = await client.query(
-          `UPDATE swarm_authority_reservations SET state='expired'
-           WHERE reservation_id=$1::uuid AND state IN ('consumed-not-started','leased-not-started') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (expired.rows.length !== 1) return await deny('Start-lease expiry transition lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('expired',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id,
-            lease_id: row.lease_id ?? null,
-            reason: leaseExpired ? 'start lease expired before runner connection' : 'reservation expired before start lease',
-            released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startLeaseDenied(leaseExpired ? 'Start lease expired before runner connection.' : 'Reservation expired before start lease.');
-      }
-
-      const refs = revocationRefsSchema.safeParse(row.revocation_refs);
-      if (!refs.success) return await deny('Stored revocation binding is invalid.');
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
-      if (revoked.rows.length) {
-        const cancelled = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state IN ('consumed-not-started','leased-not-started') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Start-lease revocation race was lost.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, reason: 'authority revoked before runner connection',
-            revocation_ref: revoked.rows[0].ref, released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startLeaseDenied('Reservation authority was revoked before runner connection.');
-      }
-
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        const cancelled = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state IN ('consumed-not-started','leased-not-started') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Prepared-operation cancellation race was lost.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, reason: 'prepared operation unavailable before runner connection',
-            released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startLeaseDenied('Prepared operation is unavailable before runner connection.');
-      }
-
-      const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
-        [row.host_id],
-      );
-      const host = hostEvidence(hostRow.rows[0]);
-      const capacity = Number(hostRow.rows[0]?.capacity_slots);
-      const reserved = Number(hostRow.rows[0]?.reserved_slots);
-      const authorized = Number(hostRow.rows[0]?.authorized_slots);
-      const maxAge = Number(row.max_host_evidence_age_ms);
-      if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
-        return await deny('Trusted host is unavailable at start-lease time.');
-      }
-      if (host.capacity_slots !== capacity) return await deny('Trusted host capacity evidence and ledger differ.');
-      if (nowMs - Date.parse(host.observed_at) > maxAge || Date.parse(host.observed_at) > nowMs + 60_000) {
-        return await deny('Trusted host evidence is stale or from the future at start-lease time.');
-      }
-      if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired at start-lease time.');
-      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
-        || reserved < 1 || authorized < 0 || capacity < reserved + authorized) {
-        return await deny('Trusted host capacity ledger cannot honor the start lease.');
-      }
-      const hostCaps = new Set(host.allowed_capabilities);
-      if (binding.data.capabilities.some((item) => !hostCaps.has(item))) {
-        return await deny('Trusted host no longer allows every leased capability.');
-      }
-
-      if (request.lease_duration_ms > binding.data.timeout_ms) {
-        return await deny('Start lease duration exceeds the bound operation timeout.');
-      }
-      const leaseExpiresAt = new Date(nowMs + request.lease_duration_ms).toISOString();
-      if (Date.parse(leaseExpiresAt) > Date.parse(String(row.reservation_expires_at))) {
-        return await deny('Start lease would outlive its reservation.');
-      }
-
-      if (row.state === 'leased-not-started') {
-        if (row.start_request_id !== request.start_request_id
-          || Number(row.lease_duration_ms) !== request.lease_duration_ms
-          || !row.lease_id || !row.lease_issued_at || !row.lease_expires_at
-          || row.redemption_token_sha256 !== redemptionDigest
-          || row.control_token_sha256 !== controlDigest
-          || row.broker_execution_identity !== request.broker_execution_identity
-          || row.broker_identity_evidence_ref !== request.broker_identity_evidence_ref) {
-          return await deny('A different start lease was already issued for this reservation.');
-        }
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { leased: true, receipt, blockers: [] };
-      }
-
-      const duplicateRequest = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE start_request_id=$1::uuid LIMIT 1',
-        [request.start_request_id],
-      );
-      if (duplicateRequest.rows.length) return await deny('Start request id is already bound to another reservation.');
-      const leaseId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations
-         SET state='leased-not-started',lease_id=$2::uuid,start_request_id=$3::uuid,
-             lease_issued_at=$4::timestamptz,lease_expires_at=$5::timestamptz,lease_duration_ms=$6,
-             redemption_token_sha256=$7,control_token_sha256=$8,
-             broker_execution_identity=$9,broker_identity_evidence_ref=$10
-         WHERE reservation_id=$1::uuid AND state='consumed-not-started'
-         RETURNING lease_id,start_request_id,consumption_id,lease_claim_token_sha256,
-                   redemption_token_sha256,control_token_sha256,broker_execution_identity,broker_identity_evidence_ref,
-                   lease_issued_at,lease_expires_at,lease_duration_ms`,
-        [request.reservation_id, leaseId, request.start_request_id, at, leaseExpiresAt, request.lease_duration_ms,
-          redemptionDigest, controlDigest, request.broker_execution_identity, request.broker_identity_evidence_ref],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Start lease could not be issued exactly once.');
-      const receipt = receiptFrom(transitioned.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('start-lease-issued',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { leased: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'lease-start', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown start-lease failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async redeemStartAuthorization(input: StartRedemptionInput): Promise<StartRedemptionResult> {
-    const parsed = startRedemptionInputSchema.safeParse(input);
-    if (!parsed.success) return startRedemptionDenied('Start-redemption request is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string) => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('start-redemption-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, lease_id: request.lease_id,
-          redemption_request_id: request.redemption_request_id, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return startRedemptionDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): StartRedemptionReceipt => ({
-      schema_version: 'starlight.worker_start_redemption.v1',
-      redemption_id: String(row.redemption_id),
-      redemption_request_id: String(row.redemption_request_id),
-      lease_id: String(row.lease_id),
-      consumption_id: String(row.consumption_id),
-      reservation_id: request.reservation_id,
-      operation_id: request.operation_id,
-      effect_id: request.effect_id,
-      binding_digest_sha256: request.binding_digest_sha256,
-      execution_identity: request.execution_identity,
-      identity_evidence_ref: request.identity_evidence_ref,
-      broker_execution_identity: String(row.broker_execution_identity),
-      broker_identity_evidence_ref: String(row.broker_identity_evidence_ref),
-      broker_database_role: String(row.broker_database_role),
-      broker_database_name: String(row.broker_database_name),
-      broker_role_contract_sha256: String(row.broker_role_contract_sha256),
-      redemption_token_sha256: String(row.redemption_token_sha256),
-      control_token_sha256: String(row.control_token_sha256),
-      start_authorized_at: sqlInstant(row.start_authorized_at),
-      committed_cost_usd: Number(row.committed_cost_usd),
-      authorization_state: 'start-authorized',
-      execution_observed: false,
-      state: 'start-authorized-not-observed',
-    });
-    try {
-      await client.query('BEGIN');
-      // Explicit pg_temp placement prevents PostgreSQL's implicit temp-first
-      // lookup from shadowing unqualified authority relations in this transaction.
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-      const sessionAttestation = await this.brokerSessionAttestor(client);
-      if (!sessionAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${sessionAttestation.blockers.join(' ')}`);
-      }
-      const brokerSession = sessionAttestation.session;
-      const principalResult = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerSession.database_role, brokerSession.database_name],
-      );
-      const principalRow = principalResult.rows[0];
-      const parsedPrincipal = brokerPrincipalEvidenceSchema.safeParse(principalRow?.evidence);
-      const redemptionDigest = createHash('sha256').update(request.redemption_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT reservation_id,operation_id,effect_id,binding_digest_sha256,binding,revocation_refs,
-                budget_receipt_id,host_id,reserved_cost_usd,reservation_expires_at,max_host_evidence_age_ms,
-                state,consumption_id,lease_id,start_request_id,lease_expires_at,
-                lease_claim_token_sha256,redemption_token_sha256,control_token_sha256,
-                broker_execution_identity,broker_identity_evidence_ref,
-                broker_database_role,broker_database_name,broker_role_contract_sha256,
-                redemption_id,redemption_request_id,start_authorized_at,committed_cost_usd,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND lease_id=$2::uuid AND redemption_token_sha256=$3 FOR UPDATE`,
-        [request.reservation_id, request.lease_id, redemptionDigest],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Start lease does not exist or the redemption credential is invalid.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Start-redemption request does not match the leased operation.');
-      }
-      const authorizedState = row.state === 'start-authorized-not-observed' || row.state === 'runner-claimed-not-started' || row.state === 'runner-start-observed';
-      const exactRequest = authorizedState && row.redemption_request_id === request.redemption_request_id;
-      const quarantineRetry = async (reason: string, blocker: string): Promise<StartRedemptionResult> => {
-        const stopped = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (stopped.rows.length !== 1) return await deny('Start-authorization quarantine lost its authority race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, lease_id: request.lease_id, reason,
-            execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return startRedemptionDenied(blocker);
-      };
-      if (authorizedState && !exactRequest) {
-        return await deny('A different redemption request already authorized this start lease.');
-      }
-      const principal = parsedPrincipal.success ? parsedPrincipal.data : null;
-      const principalCurrent = principalResult.rows.length === 1 && principal !== null
-        && principal.database_role === principalRow.database_role
-        && principal.database_name === principalRow.database_name
-        && principal.broker_execution_identity === principalRow.broker_execution_identity
-        && principal.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principal.authn_kind === principalRow.authn_kind
-        && principal.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principal.role_contract_digest_sha256 === brokerSession.contract_digest_sha256
-        && principal.state === principalRow.state && principal.state === 'ready'
-        && sqlInstant(principal.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principal.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && Date.parse(principal.observed_at) <= nowMs + 60_000
-        && nowMs - Date.parse(principal.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principal.access_review_expires_at) > nowMs;
-      if (!principalCurrent || !principal) {
-        if (exactRequest) return await quarantineRetry(
-          'authenticated broker principal unavailable or stale on authorization retry',
-          'Authenticated broker principal is unavailable or stale on the authorization retry.',
-        );
-        return await deny('Authenticated broker principal is unavailable, stale, disabled, or drifted.');
-      }
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
-        if (exactRequest) return await quarantineRetry(
-          'stored binding or signed cost invalid on start-authorization retry',
-          'Stored binding or signed cost is invalid on the authorization retry.',
-        );
-        return await deny('Stored reservation binding or signed cost is invalid.');
-      }
-      if (binding.data.execution_identity !== request.execution_identity
-        || binding.data.identity_evidence_ref !== request.identity_evidence_ref) {
-        return await deny('Start-redemption worker identity does not match the operation binding.');
-      }
-      if (row.broker_execution_identity !== principal.broker_execution_identity
-        || row.broker_identity_evidence_ref !== principal.broker_identity_evidence_ref) {
-        if (exactRequest) return await quarantineRetry(
-          'authenticated broker identity drifted from the lease on authorization retry',
-          'Authenticated broker identity drifted from the start lease on the authorization retry.',
-        );
-        return await deny('Authenticated broker identity does not match the start lease.');
-      }
-      if (exactRequest && (row.broker_database_role !== brokerSession.database_role
-        || row.broker_database_name !== brokerSession.database_name
-        || row.broker_role_contract_sha256 !== brokerSession.contract_digest_sha256)) {
-        return await quarantineRetry(
-          'stored broker database principal drifted on authorization retry',
-          'Stored broker database principal drifted on the authorization retry.',
-        );
-      }
-      if (row.host_id !== binding.data.host_id) {
-        if (exactRequest) return await quarantineRetry(
-          'stored host attribution drifted from signed binding on authorization retry',
-          'Stored host attribution drifted from the signed binding on the authorization retry.',
-        );
-        return await deny('Stored host attribution does not match the signed operation binding.');
-      }
-      if (exactRequest) {
-        if (!row.redemption_id || !row.start_authorized_at
-          || Number(row.committed_cost_usd) !== binding.data.requested_cost_usd) {
-          return await quarantineRetry(
-            'stored redemption receipt invalid on start-authorization retry',
-            'Stored redemption receipt is invalid on the authorization retry.',
-          );
-        }
-      }
-      if (!exactRequest && row.state !== 'leased-not-started') {
-        return await deny(`Start lease cannot be redeemed from state ${String(row.state)}.`);
-      }
-
-      const heldWindows = await this.readBudgetWindows(
-        client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd,
-      );
-      if (!heldWindows) {
-        if (exactRequest) return await quarantineRetry(
-          'aggregate budget attribution invalid on authorization retry',
-          'Start authorization is no longer current because aggregate budget attribution is invalid.',
-        );
-        return await deny('Aggregate budget holds are missing, ambiguous, or inconsistent.');
-      }
-      if (Date.parse(String(row.reservation_expires_at)) <= nowMs || Date.parse(String(row.lease_expires_at)) <= nowMs) {
-        if (exactRequest) return await quarantineRetry(
-          'lease or reservation expired after start authorization',
-          'Start authorization expired before the retry.',
-        );
-        const expired = await client.query(
-          `UPDATE swarm_authority_reservations SET state='expired'
-           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (expired.rows.length !== 1) return await deny('Start-redemption expiry transition lost its authority race.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('expired',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, lease_id: request.lease_id,
-            reason: 'lease or reservation expired before start authorization', released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startRedemptionDenied('Start lease expired before authorization.');
-      }
-      const refs = revocationRefsSchema.safeParse(row.revocation_refs);
-      if (!refs.success) {
-        if (exactRequest) return await quarantineRetry(
-          'stored revocation binding invalid on start-authorization retry',
-          'Stored revocation binding is invalid on the authorization retry.',
-        );
-        return await deny('Stored revocation binding is invalid.');
-      }
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
-      if (revoked.rows.length) {
-        if (exactRequest) return await quarantineRetry(
-          'authority revoked after start authorization',
-          'Start authorization was revoked before the retry.',
-        );
-        const cancelled = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Start-redemption revocation race was lost.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, lease_id: request.lease_id,
-            reason: 'authority revoked before start authorization', revocation_ref: revoked.rows[0].ref,
-            released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startRedemptionDenied('Reservation authority was revoked before start authorization.');
-      }
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        if (exactRequest) return await quarantineRetry(
-          'prepared operation unavailable after start authorization',
-          'Prepared operation is unavailable or drifted on the authorization retry.',
-        );
-        const cancelled = await client.query(
-          `UPDATE swarm_authority_reservations SET state='cancelled'
-           WHERE reservation_id=$1::uuid AND state='leased-not-started' RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (cancelled.rows.length !== 1) return await deny('Prepared-operation cancellation race was lost.');
-        const released = await this.releaseResources(client, row);
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, lease_id: request.lease_id,
-            reason: 'prepared operation unavailable before start authorization', released_cost_usd: released,
-          })],
-        );
-        await client.query('COMMIT');
-        return startRedemptionDenied('Prepared operation is unavailable or drifted at start authorization.');
-      }
-      const hostRow = await client.query(
-        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
-                (reserved_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
-                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS authorized_reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
-        [row.host_id],
-      );
-      const host = hostEvidence(hostRow.rows[0]);
-      const capacity = Number(hostRow.rows[0]?.capacity_slots);
-      const reserved = Number(hostRow.rows[0]?.reserved_slots);
-      const authorized = Number(hostRow.rows[0]?.authorized_slots);
-      const maxAge = Number(row.max_host_evidence_age_ms);
-      if (!host || host.host_id !== row.host_id || host.status !== 'ready' || !host.secret_readiness) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host unavailable on start-authorization retry',
-          'Trusted host is unavailable on the authorization retry.',
-        );
-        return await deny('Trusted host is unavailable at start-authorization time.');
-      }
-      if (host.capacity_slots !== capacity) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host capacity evidence drifted on start-authorization retry',
-          'Trusted host capacity evidence and ledger differ on the authorization retry.',
-        );
-        return await deny('Trusted host capacity evidence and ledger differ.');
-      }
-      if (nowMs - Date.parse(host.observed_at) > maxAge || Date.parse(host.observed_at) > nowMs + 60_000) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host evidence stale on start-authorization retry',
-          'Trusted host evidence is stale or from the future on the authorization retry.',
-        );
-        return await deny('Trusted host evidence is stale or from the future at start-authorization time.');
-      }
-      if (Date.parse(host.access_review_expires_at) <= nowMs) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host access review expired on start-authorization retry',
-          'Trusted host access review expired before the authorization retry.',
-        );
-        return await deny('Trusted host access review is expired at start-authorization time.');
-      }
-      if (!Number.isSafeInteger(capacity) || !Number.isSafeInteger(reserved) || !Number.isSafeInteger(authorized)
-        || reserved < 0 || authorized < 0 || reserved + authorized > capacity
-        || hostRow.rows[0]?.reserved_reconciles !== true || hostRow.rows[0]?.authorized_reconciles !== true
-        || (exactRequest ? authorized < 1 : reserved < 1)) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host authorization ledger invalid on retry',
-          'Trusted host capacity ledger cannot honor the authorization retry.',
-        );
-        return await deny('Trusted host capacity ledger cannot honor start authorization.');
-      }
-      const hostCaps = new Set(host.allowed_capabilities);
-      if (binding.data.capabilities.some((item) => !hostCaps.has(item))) {
-        if (exactRequest) return await quarantineRetry(
-          'trusted host capability grant changed on start-authorization retry',
-          'Trusted host no longer allows every capability on the authorization retry.',
-        );
-        return await deny('Trusted host no longer allows every authorized capability.');
-      }
-      const budget = await client.query(
-        `SELECT hard_limit_usd,reserved_usd,committed_usd,
-                (reserved_usd >= $2::numeric) AS funds_reservation,
-                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling,
-                (reserved_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('reserved-not-started','consumed-not-started','leased-not-started'))) AS reserved_reconciles,
-                (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS committed_reconciles
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
-        [row.budget_receipt_id, binding.data.requested_cost_usd],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reserved_reconciles !== true
-        || budget.rows[0].committed_reconciles !== true
-        || (!exactRequest && budget.rows[0].funds_reservation !== true)
-        || budget.rows[0].within_ceiling !== true) {
-        if (exactRequest) return await quarantineRetry(
-          'receipt budget ledger invalid on start-authorization retry',
-          'Receipt budget ledger is invalid on the authorization retry.',
-        );
-        return await deny('Receipt budget ledgers are missing, exhausted, or inconsistent.');
-      }
-      if (exactRequest) {
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { redeemed: true, receipt, blockers: [] };
-      }
-      const duplicateRequest = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE redemption_request_id=$1::uuid LIMIT 1',
-        [request.redemption_request_id],
-      );
-      if (duplicateRequest.rows.length) return await deny('Redemption request id is already bound to another reservation.');
-
-      const redemptionId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations
-         SET state='start-authorized-not-observed',redemption_id=$2::uuid,redemption_request_id=$3::uuid,
-             start_authorized_at=$4::timestamptz,committed_cost_usd=reserved_cost_usd,
-             broker_database_role=$5,broker_database_name=$6,broker_role_contract_sha256=$7
-         WHERE reservation_id=$1::uuid AND state='leased-not-started'
-         RETURNING *`,
-        [request.reservation_id, redemptionId, request.redemption_request_id, at,
-          brokerSession.database_role, brokerSession.database_name, brokerSession.contract_digest_sha256],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Start lease could not be authorized exactly once.');
-      const cost = binding.data.requested_cost_usd;
-      const receiptBudget = await client.query(
-        `UPDATE swarm_authority_budgets
-         SET reserved_usd=reserved_usd-$2::numeric,committed_usd=committed_usd+$2::numeric
-         WHERE receipt_id=$1 AND reserved_usd >= $2::numeric
-           AND reserved_usd+committed_usd <= hard_limit_usd RETURNING receipt_id`,
-        [row.budget_receipt_id, cost],
-      );
-      if (receiptBudget.rows.length !== 1) throw new Error('Receipt budget authorization move would underflow or exceed its ceiling.');
-      for (const window of heldWindows) {
-        const aggregate = await client.query(
-          `UPDATE swarm_authority_budget_windows
-           SET reserved_usd=reserved_usd-$2::numeric,committed_usd=committed_usd+$2::numeric
-           WHERE window_id=$1 AND reserved_usd >= $2::numeric
-             AND reserved_usd+committed_usd <= hard_limit_usd RETURNING window_id`,
-          [window.window_id, cost],
-        );
-        if (aggregate.rows.length !== 1) throw new Error('Aggregate budget authorization move would underflow or exceed its ceiling.');
-      }
-      const hostMoved = await client.query(
-        `UPDATE swarm_authority_hosts
-         SET reserved_slots=reserved_slots-1,authorized_slots=authorized_slots+1
-         WHERE host_id=$1 AND reserved_slots >= 1
-           AND reserved_slots+authorized_slots <= capacity_slots RETURNING host_id`,
-        [row.host_id],
-      );
-      if (hostMoved.rows.length !== 1) throw new Error('Host authorization move would underflow or exceed capacity.');
-      const receipt = receiptFrom(transitioned.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('start-authority-redeemed',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { redeemed: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'redeem-start-authorization', reservation_id: request.reservation_id, lease_id: request.lease_id,
-        error: error instanceof Error ? error.message : 'unknown start-redemption failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async claimRunnerStart(input: RunnerClaimInput): Promise<RunnerClaimResult> {
-    const parsed = runnerClaimInputSchema.safeParse(input);
-    if (!parsed.success) return runnerClaimDenied('Runner claim is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string): Promise<RunnerClaimResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-claim-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, redemption_id: request.redemption_id,
-          claim_request_id: request.claim_request_id, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return runnerClaimDenied(blocker);
-    };
-    const rollbackAndDeny = async (blocker: string): Promise<RunnerClaimResult> => {
-      await client.query('ROLLBACK');
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      return deny(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): RunnerClaimReceipt => ({
-      schema_version: 'starlight.runner_claim_acceptance.v1',
-      claim_id: String(row.runner_claim_id),
-      claim_request_id: String(row.runner_claim_request_id),
-      reservation_id: request.reservation_id,
-      redemption_id: request.redemption_id,
-      operation_id: request.operation_id,
-      effect_id: request.effect_id,
-      binding_digest_sha256: request.binding_digest_sha256,
-      runner_id: String(row.runner_id),
-      runner_identity_evidence_ref: String(row.runner_identity_evidence_ref),
-      runner_instance_id: String(row.runner_instance_id),
-      runtime_id: String(row.runner_runtime_id),
-      host_id: String(row.runner_host_id),
-      channel_binding_sha256: String(row.runner_channel_binding_sha256),
-      accepted_at: sqlInstant(row.runner_claim_accepted_at),
-      claim_expires_at: sqlInstant(row.runner_claim_expires_at),
-      heartbeat_token_sha256: String(row.heartbeat_token_sha256),
-      start_observation_token_sha256: String(row.start_observation_token_sha256),
-      outcome_token_sha256: String(row.outcome_token_sha256),
-      usage_reconciliation_token_sha256: String(row.usage_reconciliation_token_sha256),
-      provider_usage_correlation_id: String(row.provider_usage_correlation_id),
-      launch_attempt_id: String(row.runner_launch_attempt_id),
-      fencing_generation: Number(row.runner_fencing_generation),
-      transport_state: 'attested-not-deployed',
-      dispatch_state: 'not-dispatched',
-      execution_observed: false,
-      state: 'runner-claimed-not-started',
-    });
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-
-      const brokerAttestation = await this.brokerSessionAttestor(client);
-      if (!brokerAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
-      }
-      const runnerAttestation = await this.runnerSessionAttestor(client);
-      if (!runnerAttestation.valid) {
-        return await deny(`Runner transport session is not authorized: ${runnerAttestation.blockers.join(' ')}`);
-      }
-      const parsedRunner = runnerSessionSchema.safeParse(runnerAttestation.session);
-      if (!parsedRunner.success) return await deny('Runner transport attestation is malformed.');
-      const runner = parsedRunner.data;
-      const runnerObservedMs = Date.parse(runner.observed_at);
-      if (runnerObservedMs > nowMs + 60_000 || nowMs - runnerObservedMs > this.maxRunnerEvidenceAgeMs) {
-        return await deny('Runner transport attestation is stale or from the future.');
-      }
-      if (Date.parse(runner.access_review_expires_at) <= nowMs) {
-        return await deny('Runner transport access review is expired.');
-      }
-
-      const controlDigest = createHash('sha256').update(request.control_token, 'utf8').digest('hex');
-      const heartbeatDigest = createHash('sha256').update(request.heartbeat_token, 'utf8').digest('hex');
-      const startObservationDigest = createHash('sha256').update(request.start_observation_token, 'utf8').digest('hex');
-      const outcomeDigest = createHash('sha256').update(request.outcome_token, 'utf8').digest('hex');
-      const usageDigest = createHash('sha256').update(request.usage_reconciliation_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT *,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND redemption_id=$2::uuid AND control_token_sha256=$3 FOR UPDATE`,
-        [request.reservation_id, request.redemption_id, controlDigest],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Start authorization does not exist or the control credential is invalid.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Runner claim does not match the authorized operation.');
-      }
-      const exactRequest = row.state === 'runner-claimed-not-started'
-        && row.runner_claim_request_id === request.claim_request_id;
-      const quarantine = async (reason: string, blocker: string): Promise<RunnerClaimResult> => {
-        const stopped = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid
-             AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (stopped.rows.length !== 1) return await deny('Runner-claim quarantine lost its authority race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, reason, execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return runnerClaimDenied(blocker);
-      };
-      if (row.state === 'runner-claimed-not-started' && !exactRequest) {
-        return await deny('A different runner claim already owns this start authorization.');
-      }
-      if (row.state !== 'start-authorized-not-observed' && !exactRequest) {
-        return await deny(`Runner claim cannot be accepted from state ${String(row.state)}.`);
-      }
-
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
-        return await quarantine(
-          exactRequest ? 'stored binding invalid on runner-claim retry' : 'stored binding invalid before runner claim',
-          exactRequest ? 'Stored binding is invalid on the runner-claim retry.' : 'Stored reservation binding or signed cost is invalid.',
-        );
-      }
-      if (Date.parse(String(row.reservation_expires_at)) <= nowMs
-        || Date.parse(String(row.lease_expires_at)) <= nowMs
-        || Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms <= nowMs) {
-        return await quarantine(
-          exactRequest ? 'stored runner authority expired on claim retry' : 'stored runner authority expired before runner claim',
-          exactRequest ? 'Runner authority expired before the claim retry.' : 'Runner authority expired before the claim.',
-        );
-      }
-      if (runner.runner_id !== binding.data.execution_identity
-        || runner.runner_identity_evidence_ref !== binding.data.identity_evidence_ref
-        || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id) {
-        return exactRequest
-          ? await quarantine('runner identity or placement drifted on claim retry', 'Runner identity or placement drifted on the claim retry.')
-          : await deny('Attested runner identity or placement does not match the signed operation binding.');
-      }
-      if (row.broker_database_role !== brokerAttestation.session.database_role
-        || row.broker_database_name !== brokerAttestation.session.database_name
-        || row.broker_role_contract_sha256 !== brokerAttestation.session.contract_digest_sha256
-        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
-        return exactRequest
-          ? await quarantine('authenticated broker principal drifted on claim retry', 'Authenticated broker principal drifted on the claim retry.')
-          : await deny('Authenticated broker principal does not match the start authorization.');
-      }
-      const principal = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
-      );
-      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principal.rows[0]?.evidence);
-      const principalRow = principal.rows[0];
-      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
-        && principalEvidence.data.database_role === principalRow.database_role
-        && principalEvidence.data.database_name === principalRow.database_name
-        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principalEvidence.data.authn_kind === principalRow.authn_kind
-        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principalEvidence.data.state === principalRow.state
-        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && principalEvidence.data.state === 'ready'
-        && principalEvidence.data.database_role === brokerAttestation.session.database_role
-        && principalEvidence.data.database_name === brokerAttestation.session.database_name
-        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
-        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        && principalEvidence.data.role_contract_digest_sha256 === brokerAttestation.session.contract_digest_sha256
-        && Date.parse(principalEvidence.data.observed_at) <= nowMs + 60_000
-        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
-      if (!principalCurrent) {
-        return await quarantine(
-          exactRequest ? 'broker principal unavailable on runner-claim retry' : 'broker principal unavailable before runner claim',
-          exactRequest ? 'Broker principal is unavailable on the runner-claim retry.' : 'Broker principal is unavailable, stale, disabled, or drifted.',
-        );
-      }
-
-      const storedRefs = revocationRefsSchema.safeParse(row.revocation_refs);
-      if (!storedRefs.success) return exactRequest
-        ? await quarantine('stored operation revocation binding invalid on claim retry', 'Stored operation revocation binding is invalid on the claim retry.')
-        : await quarantine('stored operation revocation binding invalid before runner claim', 'Stored operation revocation binding is invalid.');
-      const runnerRefs = [
-        `runner:${runner.runner_id}`, `runner-instance:${runner.runner_instance_id}`,
-        `identity:${runner.runner_identity_evidence_ref}`, `channel:${runner.channel_binding_sha256}`,
-      ];
-      const refs = revocationRefsSchema.safeParse([...storedRefs.data, ...runnerRefs]);
-      if (!refs.success) return exactRequest
-        ? await quarantine('runner revocation binding invalid on claim retry', 'Runner revocation binding is invalid on the claim retry.')
-        : await deny('Runner revocation binding is invalid.');
-      if (exactRequest) {
-        const storedRunnerRefs = revocationRefsSchema.safeParse(row.runner_revocation_refs);
-        if (!storedRunnerRefs.success || JSON.stringify(storedRunnerRefs.data) !== JSON.stringify(refs.data)) {
-          return await quarantine('runner revocation binding drifted on claim retry', 'Runner revocation binding drifted on the claim retry.');
-        }
-        const tokenHistory = await client.query(
-          `SELECT reservation_id,sequence,issued_by_request_id,kind
-           FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1`,
-          [heartbeatDigest],
-        );
-        if (tokenHistory.rows.length !== 1
-          || tokenHistory.rows[0].reservation_id !== request.reservation_id
-          || Number(tokenHistory.rows[0].sequence) !== 0
-          || tokenHistory.rows[0].issued_by_request_id !== request.claim_request_id
-          || tokenHistory.rows[0].kind !== 'claim') {
-          return await quarantine('initial heartbeat credential history drifted on claim retry', 'Initial heartbeat credential history drifted on the claim retry.');
-        }
-        const usageTokenHistory = await client.query(
-          `SELECT reservation_id,sequence,issued_by_request_id,kind
-           FROM swarm_authority_usage_tokens WHERE token_sha256=$1`,
-          [usageDigest],
-        );
-        if (usageTokenHistory.rows.length !== 1
-          || usageTokenHistory.rows[0].reservation_id !== request.reservation_id
-          || Number(usageTokenHistory.rows[0].sequence) !== 0
-          || usageTokenHistory.rows[0].issued_by_request_id !== request.claim_request_id
-          || usageTokenHistory.rows[0].kind !== 'claim') {
-          return await quarantine('initial usage credential history drifted on claim retry', 'Initial usage credential history drifted on the claim retry.');
-        }
-      }
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
-      if (revoked.rows.length) return await quarantine(
-        exactRequest ? 'runner or operation authority revoked on claim retry' : 'runner or operation authority revoked before runner claim',
-        exactRequest ? 'Runner or operation authority is revoked on the claim retry.' : 'Runner or operation authority is revoked.',
-      );
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await quarantine(
-          exactRequest ? 'prepared operation unavailable on runner-claim retry' : 'prepared operation unavailable before runner claim',
-          exactRequest ? 'Prepared operation is unavailable on the runner-claim retry.' : 'Prepared operation is unavailable or drifted.',
-        );
-      }
-
-      const hostResult = await client.query(
-        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
-                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
-      );
-      const host = hostEvidence(hostResult.rows[0]);
-      if (!host || host.status !== 'ready' || !host.secret_readiness || host.host_id !== runner.host_id
-        || host.capacity_slots !== Number(hostResult.rows[0]?.capacity_slots)
-        || hostResult.rows[0]?.reconciles !== true
-        || Date.parse(host.observed_at) > nowMs + 60_000
-        || nowMs - Date.parse(host.observed_at) > Number(row.max_host_evidence_age_ms)
-        || Date.parse(host.access_review_expires_at) <= nowMs
-        || binding.data.capabilities.some((capability) => !host.allowed_capabilities.includes(capability))) {
-        return await quarantine(
-          exactRequest ? 'host authority unavailable on runner-claim retry' : 'host authority unavailable before runner claim',
-          exactRequest ? 'Host authority is unavailable on the runner-claim retry.' : 'Host authority is unavailable, stale, or inconsistent.',
-        );
-      }
-      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
-        return await quarantine(
-          exactRequest ? 'aggregate budget invalid on runner-claim retry' : 'aggregate budget invalid before runner claim',
-          exactRequest ? 'Aggregate budget is invalid on the runner-claim retry.' : 'Aggregate budget authority is missing or inconsistent.',
-        );
-      }
-      const budget = await client.query(
-        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
-                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true || budget.rows[0].within_ceiling !== true) {
-        return await quarantine(
-          exactRequest ? 'receipt budget invalid on runner-claim retry' : 'receipt budget invalid before runner claim',
-          exactRequest ? 'Receipt budget is invalid on the runner-claim retry.' : 'Receipt budget authority is missing or inconsistent.',
-        );
-      }
-
-      const claimExpiryMs = Math.min(
-        Date.parse(runner.access_review_expires_at),
-        runnerObservedMs + this.maxRunnerEvidenceAgeMs,
-        Date.parse(String(row.reservation_expires_at)),
-        Date.parse(String(row.lease_expires_at)),
-        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
-      );
-      if (!Number.isFinite(claimExpiryMs) || claimExpiryMs <= nowMs) {
-        return await quarantine(
-          exactRequest ? 'runner claim expired before retry' : 'runner claim had no valid authority interval',
-          exactRequest ? 'Runner claim expired before the retry.' : 'Runner claim would have no valid authority interval.',
-        );
-      }
-      if (exactRequest) {
-        const storedEvidenceObservedMs = Date.parse(String(row.runner_evidence_observed_at));
-        const storedAccessReviewExpiresMs = Date.parse(String(row.runner_access_review_expires_at));
-        const storedClaimExpiryMs = Date.parse(String(row.runner_claim_expires_at));
-        const storedAuthorityCapMs = Math.min(
-          storedAccessReviewExpiresMs,
-          storedEvidenceObservedMs + this.maxRunnerEvidenceAgeMs,
-          Date.parse(String(row.reservation_expires_at)),
-          Date.parse(String(row.lease_expires_at)),
-          Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
-        );
-        if (row.heartbeat_token_sha256 !== heartbeatDigest
-          || row.start_observation_token_sha256 !== startObservationDigest
-          || row.outcome_token_sha256 !== outcomeDigest
-          || row.usage_reconciliation_token_sha256 !== usageDigest
-          || row.provider_usage_correlation_id !== request.provider_usage_correlation_id
-          || row.runner_id !== runner.runner_id
-          || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
-          || row.runner_instance_id !== runner.runner_instance_id
-          || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
-          || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
-          || row.runner_launch_attempt_id !== runner.launch_attempt_id
-          || Number(row.runner_fencing_generation) !== runner.fencing_generation
-          || !Number.isFinite(storedAuthorityCapMs)
-          || storedClaimExpiryMs !== storedAuthorityCapMs
-          || storedClaimExpiryMs > claimExpiryMs
-          || storedClaimExpiryMs <= nowMs) {
-          return await quarantine('runner claim replay evidence drifted', 'Runner claim replay evidence drifted.');
-        }
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { claimed: true, receipt, blockers: [] };
-      }
-      const duplicate = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE runner_claim_request_id=$1::uuid LIMIT 1',
-        [request.claim_request_id],
-      );
-      if (duplicate.rows.length) return await deny('Runner claim request id is already bound to another reservation.');
-      const duplicateCorrelation = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE provider_usage_correlation_id=$1 LIMIT 1',
-        [request.provider_usage_correlation_id],
-      );
-      if (duplicateCorrelation.rows.length) {
-        return await deny('Provider usage correlation is already bound to another reservation.');
-      }
-      const newCredentialDigests = [heartbeatDigest, startObservationDigest, outcomeDigest, usageDigest];
-      if (new Set(newCredentialDigests).size !== newCredentialDigests.length) {
-        return await deny('Runner claim credentials alias each other.');
-      }
-      const findIssuedCredential = async (digest: string) => client.query(
-        `SELECT reservation_id FROM swarm_authority_reservations
-         WHERE consume_token_sha256=$1 OR cancel_token_sha256=$1 OR lease_claim_token_sha256=$1
-           OR redemption_token_sha256=$1 OR control_token_sha256=$1 OR heartbeat_token_sha256=$1
-           OR start_observation_token_sha256=$1 OR outcome_token_sha256=$1
-           OR usage_reconciliation_token_sha256=$1
-           OR runner_heartbeat_presented_token_sha256=$1 OR runner_start_presented_token_sha256=$1
-           OR runner_outcome_presented_token_sha256=$1
-         UNION ALL
-         SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1
-         UNION ALL
-         SELECT reservation_id FROM swarm_authority_usage_tokens WHERE token_sha256=$1
-         LIMIT 1`,
-        [digest],
-      );
-      for (const [label, digest] of [
-        ['Heartbeat', heartbeatDigest],
-        ['Start-observation', startObservationDigest],
-        ['Outcome', outcomeDigest],
-        ['Usage-reconciliation', usageDigest],
-      ] as const) {
-        if ((await findIssuedCredential(digest)).rows.length) {
-          return await deny(`${label} credential aliases an issued lifecycle credential.`);
-        }
-      }
-      const claimId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations SET state='runner-claimed-not-started',
-           runner_claim_id=$2::uuid,runner_claim_request_id=$3::uuid,runner_claim_accepted_at=$4::timestamptz,
-           runner_claim_expires_at=$5::timestamptz,runner_evidence_observed_at=$6::timestamptz,
-           runner_access_review_expires_at=$7::timestamptz,runner_id=$8,runner_identity_evidence_ref=$9,
-           runner_instance_id=$10,runner_runtime_id=$11,runner_host_id=$12,runner_channel_binding_sha256=$13,
-           heartbeat_token_sha256=$14,start_observation_token_sha256=$15,outcome_token_sha256=$16,
-           runner_launch_attempt_id=$17,runner_fencing_generation=$18,runner_revocation_refs=$19::jsonb
-         WHERE reservation_id=$1::uuid AND state='start-authorized-not-observed' RETURNING *`,
-        [request.reservation_id, claimId, request.claim_request_id, at, new Date(claimExpiryMs).toISOString(),
-          runner.observed_at, runner.access_review_expires_at, runner.runner_id, runner.runner_identity_evidence_ref,
-          runner.runner_instance_id, runner.runtime_id, runner.host_id, runner.channel_binding_sha256,
-          heartbeatDigest, startObservationDigest, outcomeDigest, runner.launch_attempt_id,
-          runner.fencing_generation, JSON.stringify(refs.data)],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Runner claim could not be accepted exactly once.');
-      await client.query(
-        `INSERT INTO swarm_authority_heartbeat_tokens
-         (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
-         VALUES ($1,$2::uuid,0,$3::uuid,$4::timestamptz,'claim')`,
-        [heartbeatDigest, request.reservation_id, request.claim_request_id, at],
-      );
-      const initialized = await client.query(
-        `SELECT public.starlight_initialize_runner_usage_stream($1::jsonb) AS result`,
-        [JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: claimId,
-          claim_request_id: request.claim_request_id, operation_id: request.operation_id,
-          binding_digest_sha256: request.binding_digest_sha256,
-          usage_reconciliation_token: request.usage_reconciliation_token,
-          provider_usage_correlation_id: request.provider_usage_correlation_id,
-        })],
-      );
-      const initialization = initialized.rows[0]?.result as { ok?: boolean; blocker?: string } | undefined;
-      if (initialization?.ok !== true) {
-        return await rollbackAndDeny(initialization?.blocker ?? 'Runner usage stream could not be initialized.');
-      }
-      const claimed = await client.query(
-        `SELECT * FROM swarm_authority_reservations WHERE reservation_id=$1::uuid FOR UPDATE`,
-        [request.reservation_id],
-      );
-      if (claimed.rows.length !== 1) throw new Error('Initialized runner claim disappeared.');
-      const receipt = receiptFrom(claimed.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-claim-accepted',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { claimed: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'claim-runner-start', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown runner-claim failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async acceptRunnerHeartbeat(input: RunnerHeartbeatInput): Promise<RunnerHeartbeatResult> {
-    const parsed = runnerHeartbeatInputSchema.safeParse(input);
-    if (!parsed.success) return runnerHeartbeatDenied('Runner heartbeat is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string): Promise<RunnerHeartbeatResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-heartbeat-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          heartbeat_request_id: request.heartbeat_request_id,
-          heartbeat_sequence: request.heartbeat_sequence, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return runnerHeartbeatDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): RunnerHeartbeatReceipt => ({
-      schema_version: 'starlight.runner_heartbeat_acceptance.v1',
-      heartbeat_id: String(row.runner_heartbeat_id),
-      heartbeat_request_id: String(row.runner_heartbeat_request_id),
-      heartbeat_sequence: Number(row.runner_heartbeat_sequence),
-      claim_id: request.claim_id,
-      reservation_id: request.reservation_id,
-      operation_id: request.operation_id,
-      effect_id: request.effect_id,
-      binding_digest_sha256: request.binding_digest_sha256,
-      runner_id: String(row.runner_id),
-      runner_instance_id: String(row.runner_instance_id),
-      runtime_id: String(row.runner_runtime_id),
-      host_id: String(row.runner_host_id),
-      channel_binding_sha256: String(row.runner_channel_binding_sha256),
-      accepted_at: sqlInstant(row.runner_heartbeat_accepted_at),
-      claim_expires_at: sqlInstant(row.runner_claim_expires_at),
-      heartbeat_token_sha256: String(row.heartbeat_token_sha256),
-      transport_state: 'attested-not-deployed',
-      dispatch_state: 'not-dispatched',
-      execution_observed: row.state === 'runner-start-observed',
-      workload_effect_observed: false,
-      state: row.state === 'runner-start-observed' ? 'runner-start-observed' : 'runner-claimed-not-started',
-    });
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-
-      const brokerAttestation = await this.brokerSessionAttestor(client);
-      if (!brokerAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
-      }
-      const runnerAttestation = await this.runnerSessionAttestor(client);
-      if (!runnerAttestation.valid) {
-        return await deny(`Runner transport session is not authorized: ${runnerAttestation.blockers.join(' ')}`);
-      }
-      const parsedRunner = runnerSessionSchema.safeParse(runnerAttestation.session);
-      if (!parsedRunner.success) return await deny('Runner transport attestation is malformed.');
-      const runner = parsedRunner.data;
-      const runnerObservedMs = Date.parse(runner.observed_at);
-      if (runnerObservedMs > nowMs + 60_000 || nowMs - runnerObservedMs > this.maxRunnerEvidenceAgeMs) {
-        return await deny('Runner transport attestation is stale or from the future.');
-      }
-      if (Date.parse(runner.access_review_expires_at) <= nowMs) {
-        return await deny('Runner transport access review is expired.');
-      }
-
-      const heartbeatDigest = createHash('sha256').update(request.heartbeat_token, 'utf8').digest('hex');
-      const nextHeartbeatDigest = createHash('sha256').update(request.next_heartbeat_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT *,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid FOR UPDATE`,
-        [request.reservation_id, request.claim_id],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Runner claim does not exist.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Runner heartbeat does not match the claimed operation.');
-      }
-      const exactRequest = (row.state === 'runner-claimed-not-started' || row.state === 'runner-start-observed')
-        && row.runner_heartbeat_request_id === request.heartbeat_request_id
-        && Number(row.runner_heartbeat_sequence) === request.heartbeat_sequence;
-      const quarantine = async (reason: string, blocker: string): Promise<RunnerHeartbeatResult> => {
-        const stopped = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state IN ('runner-claimed-not-started','runner-start-observed') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (stopped.rows.length !== 1) return await deny('Runner-heartbeat quarantine lost its authority race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, claim_id: request.claim_id, reason,
-            execution_state: row.state === 'runner-start-observed' ? 'started-or-unknown' : 'unknown', released_cost_usd: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return runnerHeartbeatDenied(blocker);
-      };
-      if (row.state !== 'runner-claimed-not-started' && row.state !== 'runner-start-observed') {
-        return await deny(`Runner heartbeat cannot be accepted from state ${String(row.state)}.`);
-      }
-
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
-        return await quarantine('stored binding invalid before runner heartbeat', 'Stored reservation binding or signed cost is invalid.');
-      }
-      const fixedAuthorityCapMs = Math.min(
-        Date.parse(String(row.reservation_expires_at)),
-        Date.parse(String(row.lease_expires_at)),
-        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
-      );
-      const currentEvidenceObservedMs = Date.parse(String(row.runner_evidence_observed_at));
-      const currentAccessReviewExpiresMs = Date.parse(String(row.runner_access_review_expires_at));
-      const currentClaimExpiryMs = Date.parse(String(row.runner_claim_expires_at));
-      const currentAuthorityCapMs = Math.min(
-        currentAccessReviewExpiresMs,
-        currentEvidenceObservedMs + this.maxRunnerEvidenceAgeMs,
-        fixedAuthorityCapMs,
-      );
-      if (!Number.isFinite(currentAuthorityCapMs) || currentClaimExpiryMs !== currentAuthorityCapMs) {
-        return await quarantine('stored runner heartbeat authority drifted', 'Stored runner heartbeat authority drifted.');
-      }
-      if (currentClaimExpiryMs <= nowMs) {
-        return await quarantine('runner heartbeat authority expired', 'Runner heartbeat authority expired before renewal.');
-      }
-      const storedCredentialDigests = [
-        row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
-        row.start_observation_token_sha256, row.outcome_token_sha256,
-        row.usage_reconciliation_token_sha256,
-      ];
-      if (storedCredentialDigests.some((digest) => typeof digest !== 'string')
-        || new Set(storedCredentialDigests).size !== storedCredentialDigests.length
-        || (row.runner_heartbeat_presented_token_sha256 !== null
-          && (typeof row.runner_heartbeat_presented_token_sha256 !== 'string'
-            || storedCredentialDigests.includes(row.runner_heartbeat_presented_token_sha256)))) {
-        return await quarantine('stored lifecycle credential separation drifted', 'Stored lifecycle credential separation drifted.');
-      }
-      const storedSequence = row.runner_heartbeat_sequence === null ? 0 : Number(row.runner_heartbeat_sequence);
-      const currentTokenHistory = await client.query(
-        `SELECT reservation_id,sequence,issued_by_request_id,kind
-         FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1`,
-        [row.heartbeat_token_sha256],
-      );
-      if (!Number.isSafeInteger(storedSequence) || currentTokenHistory.rows.length !== 1
-        || currentTokenHistory.rows[0].reservation_id !== request.reservation_id
-        || Number(currentTokenHistory.rows[0].sequence) !== storedSequence) {
-        return await quarantine('current heartbeat credential history drifted', 'Current heartbeat credential history drifted.');
-      }
-      if (runner.runner_id !== binding.data.execution_identity
-        || runner.runner_identity_evidence_ref !== binding.data.identity_evidence_ref
-        || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id
-        || row.runner_id !== runner.runner_id
-        || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
-        || row.runner_instance_id !== runner.runner_instance_id
-        || row.runner_runtime_id !== runner.runtime_id || row.runner_host_id !== runner.host_id
-        || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
-        || row.runner_launch_attempt_id !== runner.launch_attempt_id
-        || Number(row.runner_fencing_generation) !== runner.fencing_generation) {
-        return await quarantine('runner identity or channel drifted before heartbeat', 'Runner identity, placement, or channel drifted before heartbeat.');
-      }
-      if (row.broker_database_role !== brokerAttestation.session.database_role
-        || row.broker_database_name !== brokerAttestation.session.database_name
-        || row.broker_role_contract_sha256 !== brokerAttestation.session.contract_digest_sha256
-        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
-        return await quarantine('authenticated broker principal drifted before heartbeat', 'Authenticated broker principal drifted before heartbeat.');
-      }
-      const principal = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
-      );
-      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principal.rows[0]?.evidence);
-      const principalRow = principal.rows[0];
-      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
-        && principalEvidence.data.database_role === principalRow.database_role
-        && principalEvidence.data.database_name === principalRow.database_name
-        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principalEvidence.data.authn_kind === principalRow.authn_kind
-        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principalEvidence.data.state === principalRow.state
-        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && principalEvidence.data.state === 'ready'
-        && principalEvidence.data.database_role === brokerAttestation.session.database_role
-        && principalEvidence.data.database_name === brokerAttestation.session.database_name
-        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
-        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        && Date.parse(principalEvidence.data.observed_at) <= nowMs + 60_000
-        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
-      if (!principalCurrent) {
-        return await quarantine('broker principal unavailable before heartbeat', 'Broker principal is unavailable, stale, disabled, or drifted.');
-      }
-
-      const storedOperationRefs = revocationRefsSchema.safeParse(row.revocation_refs);
-      const storedRunnerRefs = revocationRefsSchema.safeParse(row.runner_revocation_refs);
-      if (!storedOperationRefs.success || !storedRunnerRefs.success) {
-        return await quarantine('stored revocation binding invalid before heartbeat', 'Stored revocation binding is invalid.');
-      }
-      const refs = revocationRefsSchema.safeParse([
-        ...storedOperationRefs.data,
-        `runner:${runner.runner_id}`, `runner-instance:${runner.runner_instance_id}`,
-        `identity:${runner.runner_identity_evidence_ref}`, `channel:${runner.channel_binding_sha256}`,
-      ]);
-      if (!refs.success || JSON.stringify(refs.data) !== JSON.stringify(storedRunnerRefs.data)) {
-        return await quarantine('runner revocation binding drifted before heartbeat', 'Runner revocation binding drifted before heartbeat.');
-      }
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
-      if (revoked.rows.length) {
-        return await quarantine('runner or operation authority revoked before heartbeat', 'Runner or operation authority is revoked.');
-      }
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await quarantine('prepared operation unavailable before heartbeat', 'Prepared operation is unavailable or drifted.');
-      }
-      const hostResult = await client.query(
-        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
-                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
-      );
-      const host = hostEvidence(hostResult.rows[0]);
-      if (!host || host.status !== 'ready' || !host.secret_readiness || host.host_id !== runner.host_id
-        || host.capacity_slots !== Number(hostResult.rows[0]?.capacity_slots)
-        || hostResult.rows[0]?.reconciles !== true
-        || Date.parse(host.observed_at) > nowMs + 60_000
-        || nowMs - Date.parse(host.observed_at) > Number(row.max_host_evidence_age_ms)
-        || Date.parse(host.access_review_expires_at) <= nowMs
-        || binding.data.capabilities.some((capability) => !host.allowed_capabilities.includes(capability))) {
-        return await quarantine('host authority unavailable before heartbeat', 'Host authority is unavailable, stale, or inconsistent.');
-      }
-      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
-        return await quarantine('aggregate budget invalid before heartbeat', 'Aggregate budget authority is missing or inconsistent.');
-      }
-      const budget = await client.query(
-        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
-                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true || budget.rows[0].within_ceiling !== true) {
-        return await quarantine('receipt budget invalid before heartbeat', 'Receipt budget authority is missing or inconsistent.');
-      }
-
-      const freshClaimExpiryMs = Math.min(
-        Date.parse(runner.access_review_expires_at),
-        runnerObservedMs + this.maxRunnerEvidenceAgeMs,
-        fixedAuthorityCapMs,
-      );
-      if (!Number.isFinite(freshClaimExpiryMs) || freshClaimExpiryMs <= nowMs) {
-        return await quarantine('runner heartbeat had no valid authority interval', 'Runner heartbeat would have no valid authority interval.');
-      }
-      if (exactRequest) {
-        const presentedTokenHistory = await client.query(
-          `SELECT reservation_id,sequence FROM swarm_authority_heartbeat_tokens
-           WHERE token_sha256=$1`,
-          [heartbeatDigest],
-        );
-        if (row.runner_heartbeat_presented_token_sha256 !== heartbeatDigest
-          || row.heartbeat_token_sha256 !== nextHeartbeatDigest
-          || presentedTokenHistory.rows.length !== 1
-          || presentedTokenHistory.rows[0].reservation_id !== request.reservation_id
-          || Number(presentedTokenHistory.rows[0].sequence) !== request.heartbeat_sequence - 1
-          || currentClaimExpiryMs > freshClaimExpiryMs) {
-          return await quarantine('runner heartbeat replay evidence drifted', 'Runner heartbeat replay evidence drifted.');
-        }
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { accepted: true, receipt, blockers: [] };
-      }
-      if (row.runner_heartbeat_request_id === request.heartbeat_request_id) {
-        return await quarantine('runner heartbeat request replay drifted', 'Runner heartbeat request replay drifted.');
-      }
-      const priorSequence = storedSequence;
-      if (!Number.isSafeInteger(priorSequence) || request.heartbeat_sequence !== priorSequence + 1) {
-        return await deny('Runner heartbeat sequence is stale, skipped, or already consumed.');
-      }
-      if (row.heartbeat_token_sha256 !== heartbeatDigest) {
-        return await deny('Runner heartbeat credential is invalid or already rotated.');
-      }
-      const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, row.start_observation_token_sha256,
-        row.outcome_token_sha256, row.usage_reconciliation_token_sha256, heartbeatDigest];
-      if (lifecycleDigests.includes(nextHeartbeatDigest)) {
-        return await deny('Next heartbeat credential aliases an existing lifecycle credential.');
-      }
-      if (freshClaimExpiryMs <= currentClaimExpiryMs) {
-        return await deny('Fresh heartbeat evidence does not extend the live authority interval.');
-      }
-      const claimAcceptedMs = Date.parse(String(row.runner_claim_accepted_at));
-      const maxHeartbeatSequence = Math.max(
-        1,
-        Math.ceil((fixedAuthorityCapMs - claimAcceptedMs) / this.minRunnerHeartbeatIntervalMs),
-      );
-      if (!Number.isFinite(claimAcceptedMs) || request.heartbeat_sequence > maxHeartbeatSequence) {
-        return await deny('Runner heartbeat exceeds the fixed authority resource bound.');
-      }
-      const duplicateRequest = await client.query(
-        'SELECT reservation_id FROM swarm_authority_reservations WHERE runner_heartbeat_request_id=$1::uuid LIMIT 1',
-        [request.heartbeat_request_id],
-      );
-      if (duplicateRequest.rows.length) return await deny('Runner heartbeat request id is already bound to another reservation.');
-      const duplicateToken = await client.query(
-         `SELECT reservation_id FROM swarm_authority_heartbeat_tokens WHERE token_sha256=$1
-         UNION ALL
-         SELECT reservation_id FROM swarm_authority_usage_tokens WHERE token_sha256=$1
-         UNION ALL
-         SELECT reservation_id FROM swarm_authority_reservations
-         WHERE consume_token_sha256=$1 OR cancel_token_sha256=$1 OR lease_claim_token_sha256=$1
-           OR redemption_token_sha256=$1 OR control_token_sha256=$1 OR heartbeat_token_sha256=$1
-           OR start_observation_token_sha256=$1 OR outcome_token_sha256=$1
-           OR usage_reconciliation_token_sha256=$1
-           OR runner_heartbeat_presented_token_sha256=$1 OR runner_start_presented_token_sha256=$1
-           OR runner_outcome_presented_token_sha256=$1
-         LIMIT 1`,
-        [nextHeartbeatDigest],
-      );
-      if (duplicateToken.rows.length) return await deny('Next heartbeat credential was already issued.');
-      if (priorSequence > 0) {
-        const priorAcceptedMs = Date.parse(String(row.runner_heartbeat_accepted_at));
-        if (!Number.isFinite(priorAcceptedMs)) {
-          return await quarantine('stored runner heartbeat acceptance time drifted', 'Stored runner heartbeat acceptance time drifted.');
-        }
-        if (nowMs - priorAcceptedMs < this.minRunnerHeartbeatIntervalMs) {
-          // A predictable throttle denial must not itself create an unbounded audit stream.
-          await client.query('COMMIT');
-          return runnerHeartbeatDenied('Runner heartbeat arrived before the server-owned minimum interval.');
-        }
-      }
-
-      const heartbeatId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations SET
-           runner_heartbeat_id=$2::uuid,runner_heartbeat_request_id=$3::uuid,
-           runner_heartbeat_sequence=$4,runner_heartbeat_accepted_at=$5::timestamptz,
-           runner_heartbeat_presented_token_sha256=$6,heartbeat_token_sha256=$7,
-           runner_claim_expires_at=$8::timestamptz,runner_evidence_observed_at=$9::timestamptz,
-           runner_access_review_expires_at=$10::timestamptz,runner_revocation_refs=$11::jsonb
-         WHERE reservation_id=$1::uuid AND state IN ('runner-claimed-not-started','runner-start-observed')
-           AND heartbeat_token_sha256=$6 RETURNING *`,
-        [request.reservation_id, heartbeatId, request.heartbeat_request_id, request.heartbeat_sequence, at,
-          heartbeatDigest, nextHeartbeatDigest, new Date(freshClaimExpiryMs).toISOString(),
-          runner.observed_at, runner.access_review_expires_at, JSON.stringify(refs.data)],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Runner heartbeat could not be accepted exactly once.');
-      await client.query(
-        `INSERT INTO swarm_authority_heartbeat_tokens
-         (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
-         VALUES ($1,$2::uuid,$3,$4::uuid,$5::timestamptz,'heartbeat')`,
-        [nextHeartbeatDigest, request.reservation_id, request.heartbeat_sequence,
-          request.heartbeat_request_id, at],
-      );
-      const receipt = receiptFrom(transitioned.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-heartbeat-accepted',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { accepted: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'accept-runner-heartbeat', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown runner-heartbeat failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async observeRunnerStart(input: RunnerStartObservationInput): Promise<RunnerStartObservationResult> {
-    const parsed = runnerStartObservationInputSchema.safeParse(input);
-    if (!parsed.success) return runnerStartObservationDenied('Runner start observation is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string): Promise<RunnerStartObservationResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-start-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          observation_request_id: request.observation_request_id, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return runnerStartObservationDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): RunnerStartObservationReceipt => ({
-      schema_version: 'starlight.runner_start_observation.v1',
-      observation_id: String(row.runner_start_observation_id),
-      observation_request_id: String(row.runner_start_observation_request_id),
-      claim_id: request.claim_id,
-      reservation_id: request.reservation_id,
-      operation_id: request.operation_id,
-      effect_id: request.effect_id,
-      binding_digest_sha256: request.binding_digest_sha256,
-      runner_id: String(row.runner_id),
-      runner_instance_id: String(row.runner_instance_id),
-      runtime_id: String(row.runner_runtime_id),
-      host_id: String(row.runner_host_id),
-      channel_binding_sha256: String(row.runner_channel_binding_sha256),
-      process_instance_sha256: String(row.runner_process_instance_sha256),
-      evidence_ref: String(row.runner_start_evidence_ref),
-      evidence_sha256: String(row.runner_start_evidence_sha256),
-      process_started_at: sqlInstant(row.runner_process_started_at),
-      evidence_observed_at: sqlInstant(row.runner_start_evidence_observed_at),
-      accepted_at: sqlInstant(row.runner_start_observation_accepted_at),
-      transport_state: 'attested-not-deployed',
-      dispatch_state: 'not-dispatched',
-      execution_observed: true,
-      workload_effect_observed: false,
-      state: 'runner-start-observed',
-    });
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-
-      const brokerAttestation = await this.brokerSessionAttestor(client);
-      if (!brokerAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
-      }
-      const runnerAttestation = await this.runnerSessionAttestor(client);
-      if (!runnerAttestation.valid) {
-        return await deny(`Runner transport session is not authorized: ${runnerAttestation.blockers.join(' ')}`);
-      }
-      const parsedRunner = runnerSessionSchema.safeParse(runnerAttestation.session);
-      if (!parsedRunner.success) return await deny('Runner transport attestation is malformed.');
-      const runner = parsedRunner.data;
-      const startAttestation = await this.runnerStartEvidenceAttestor(client);
-      if (!startAttestation.valid) {
-        return await deny(`Runner start evidence is not authorized: ${startAttestation.blockers.join(' ')}`);
-      }
-      const parsedEvidence = runnerStartEvidenceSchema.safeParse(startAttestation.evidence);
-      if (!parsedEvidence.success) return await deny('Runner start evidence is malformed.');
-      const evidence = parsedEvidence.data;
-      const runnerObservedMs = Date.parse(runner.observed_at);
-      const evidenceObservedMs = Date.parse(evidence.observed_at);
-      if (runnerObservedMs > nowMs + 60_000 || nowMs - runnerObservedMs > this.maxRunnerEvidenceAgeMs
-        || evidenceObservedMs > nowMs) {
-        return await deny('Runner transport or start evidence is stale or from the future.');
-      }
-      if (Date.parse(runner.access_review_expires_at) <= nowMs
-        || Date.parse(evidence.access_review_expires_at) <= nowMs) {
-        return await deny('Runner transport or start-evidence access review is expired.');
-      }
-      if (evidence.reservation_id !== request.reservation_id || evidence.claim_id !== request.claim_id
-        || evidence.operation_id !== request.operation_id || evidence.effect_id !== request.effect_id
-        || evidence.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Server-owned start evidence does not bind the requested operation and claim.');
-      }
-      if (evidence.runner_id !== runner.runner_id
-        || evidence.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
-        || evidence.runner_instance_id !== runner.runner_instance_id || evidence.runtime_id !== runner.runtime_id
-        || evidence.host_id !== runner.host_id || evidence.channel_binding_sha256 !== runner.channel_binding_sha256
-        || evidence.launch_attempt_id !== runner.launch_attempt_id
-        || evidence.fencing_generation !== runner.fencing_generation) {
-        return await deny('Server-owned start evidence does not match the authenticated runner session.');
-      }
-
-      const startTokenDigest = createHash('sha256').update(request.start_observation_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT *,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid FOR UPDATE`,
-        [request.reservation_id, request.claim_id],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Runner claim does not exist.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Runner start observation does not match the claimed operation.');
-      }
-      if (row.state === 'runner-never-started-observed') {
-        const generationMatches = row.start_observation_token_sha256 === startTokenDigest
-          && row.runner_id === runner.runner_id
-          && row.runner_identity_evidence_ref === runner.runner_identity_evidence_ref
-          && row.runner_instance_id === runner.runner_instance_id
-          && row.runner_runtime_id === runner.runtime_id
-          && row.runner_host_id === runner.host_id
-          && row.runner_channel_binding_sha256 === runner.channel_binding_sha256
-          && row.runner_launch_attempt_id === runner.launch_attempt_id
-          && Number(row.runner_fencing_generation) === runner.fencing_generation
-          && Date.parse(evidence.process_started_at) >= Date.parse(String(row.runner_claim_accepted_at));
-        if (!generationMatches) {
-          return await deny('Contradictory start evidence does not match the settled execution generation.');
-        }
-        const duplicate = await client.query(
-          `SELECT reservation_id FROM swarm_authority_reservations
-           WHERE runner_start_observation_request_id=$1::uuid OR runner_process_instance_sha256=$2
-             OR runner_start_evidence_ref=$3 OR runner_start_evidence_sha256=$4 LIMIT 1`,
-          [request.observation_request_id, evidence.process_instance_sha256, evidence.evidence_ref, evidence.evidence_sha256],
-        );
-        if (duplicate.rows.length) return await deny('Contradictory start request or evidence is already bound.');
-        const conflicted = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested',
-             runner_start_observation_id=$2::uuid,runner_start_observation_request_id=$3::uuid,
-             runner_start_observation_accepted_at=$4::timestamptz,
-             runner_start_evidence_observed_at=$5::timestamptz,runner_process_started_at=$6::timestamptz,
-             runner_process_instance_sha256=$7,runner_start_evidence_ref=$8,
-             runner_start_evidence_sha256=$9,runner_start_presented_token_sha256=$10
-           WHERE reservation_id=$1::uuid AND state='runner-never-started-observed'
-             AND start_observation_token_sha256=$10 RETURNING reservation_id`,
-          [request.reservation_id, randomUUID(), request.observation_request_id, at,
-            evidence.observed_at, evidence.process_started_at, evidence.process_instance_sha256,
-            evidence.evidence_ref, evidence.evidence_sha256, startTokenDigest],
-        );
-        if (conflicted.rows.length !== 1) return await deny('Contradictory start evidence lost its quarantine race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, claim_id: request.claim_id,
-            reason: 'authenticated start evidence contradicted settled never-started evidence',
-            execution_state: 'conflicted', released_cost_usd: 0, released_host_slots: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return runnerStartObservationDenied('Authenticated start evidence contradicted never-started evidence; authority is quarantined.');
-      }
-      const exactRequest = row.state === 'runner-start-observed'
-        && row.runner_start_observation_request_id === request.observation_request_id;
-      const quarantine = async (reason: string, blocker: string): Promise<RunnerStartObservationResult> => {
-        const stopped = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state IN ('runner-claimed-not-started','runner-start-observed')
-           RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (stopped.rows.length !== 1) return await deny('Runner-start quarantine lost its authority race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, claim_id: request.claim_id, reason,
-            execution_state: exactRequest ? 'started-or-unknown' : 'unknown', released_cost_usd: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return runnerStartObservationDenied(blocker);
-      };
-      if (row.state === 'runner-start-observed' && !exactRequest) {
-        return await deny('A different start observation already owns this runner claim.');
-      }
-      if (row.state !== 'runner-claimed-not-started' && !exactRequest) {
-        return await deny(`Runner start cannot be observed from state ${String(row.state)}.`);
-      }
-      if (!exactRequest && nowMs - evidenceObservedMs > this.maxRunnerEvidenceAgeMs) {
-        return await deny('Runner start evidence is stale.');
-      }
-
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256 || row.cost_matches_binding !== true) {
-        return await quarantine('stored binding invalid before runner start observation', 'Stored reservation binding or signed cost is invalid.');
-      }
-      const fixedAuthorityCapMs = Math.min(
-        Date.parse(String(row.reservation_expires_at)),
-        Date.parse(String(row.lease_expires_at)),
-        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
-      );
-      const currentEvidenceObservedMs = Date.parse(String(row.runner_evidence_observed_at));
-      const currentAccessReviewExpiresMs = Date.parse(String(row.runner_access_review_expires_at));
-      const currentClaimExpiryMs = Date.parse(String(row.runner_claim_expires_at));
-      const currentAuthorityCapMs = Math.min(
-        currentAccessReviewExpiresMs,
-        currentEvidenceObservedMs + this.maxRunnerEvidenceAgeMs,
-        fixedAuthorityCapMs,
-      );
-      if (!Number.isFinite(currentAuthorityCapMs) || currentClaimExpiryMs !== currentAuthorityCapMs
-        || currentClaimExpiryMs <= nowMs) {
-        return await quarantine('runner authority expired or drifted before start observation', 'Runner authority expired or drifted before start observation.');
-      }
-      const claimAcceptedMs = Date.parse(String(row.runner_claim_accepted_at));
-      const latestLivenessAtMs = row.runner_heartbeat_accepted_at === null
-        ? claimAcceptedMs : Date.parse(String(row.runner_heartbeat_accepted_at));
-      const storedProcessStartedMs = Date.parse(String(row.runner_process_started_at));
-      const storedStartEvidenceObservedMs = Date.parse(String(row.runner_start_evidence_observed_at));
-      const storedStartAcceptedMs = Date.parse(String(row.runner_start_observation_accepted_at));
-      const storedChronologyInvalid = exactRequest && (
-        !Number.isFinite(storedProcessStartedMs) || !Number.isFinite(storedStartEvidenceObservedMs)
-        || !Number.isFinite(storedStartAcceptedMs) || storedProcessStartedMs < claimAcceptedMs
-        || storedProcessStartedMs > storedStartEvidenceObservedMs
-        || storedStartEvidenceObservedMs > storedStartAcceptedMs
-        || storedStartAcceptedMs >= currentClaimExpiryMs
-      );
-      if (Date.parse(evidence.process_started_at) < claimAcceptedMs
-        || (!exactRequest && evidenceObservedMs < latestLivenessAtMs)
-        || evidenceObservedMs > nowMs || storedChronologyInvalid) {
-        return await quarantine('runner start chronology drifted', 'Runner start evidence chronology is invalid.');
-      }
-      const storedCredentialDigests = [
-        row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
-        row.start_observation_token_sha256, row.outcome_token_sha256,
-        row.usage_reconciliation_token_sha256,
-      ];
-      if (storedCredentialDigests.some((digest) => typeof digest !== 'string')
-        || new Set(storedCredentialDigests).size !== storedCredentialDigests.length
-        || row.start_observation_token_sha256 !== startTokenDigest) {
-        return exactRequest
-          ? await quarantine('start-observation credential drifted on retry', 'Start-observation credential drifted on retry.')
-          : await deny('Start-observation credential is invalid or aliases another lifecycle credential.');
-      }
-      if (runner.runner_id !== binding.data.execution_identity
-        || runner.runner_identity_evidence_ref !== binding.data.identity_evidence_ref
-        || runner.runtime_id !== binding.data.runtime_id || runner.host_id !== row.host_id
-        || row.runner_id !== runner.runner_id || row.runner_identity_evidence_ref !== runner.runner_identity_evidence_ref
-        || row.runner_instance_id !== runner.runner_instance_id || row.runner_runtime_id !== runner.runtime_id
-        || row.runner_host_id !== runner.host_id || row.runner_channel_binding_sha256 !== runner.channel_binding_sha256
-        || row.runner_launch_attempt_id !== runner.launch_attempt_id
-        || Number(row.runner_fencing_generation) !== runner.fencing_generation) {
-        return await quarantine('runner identity or channel drifted before start observation', 'Runner identity, placement, or channel drifted before start observation.');
-      }
-      if (row.broker_database_role !== brokerAttestation.session.database_role
-        || row.broker_database_name !== brokerAttestation.session.database_name
-        || row.broker_role_contract_sha256 !== brokerAttestation.session.contract_digest_sha256
-        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
-        return await quarantine('authenticated broker principal drifted before start observation', 'Authenticated broker principal drifted before start observation.');
-      }
-      const principal = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
-      );
-      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principal.rows[0]?.evidence);
-      const principalRow = principal.rows[0];
-      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
-        && principalEvidence.data.database_role === principalRow.database_role
-        && principalEvidence.data.database_name === principalRow.database_name
-        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principalEvidence.data.authn_kind === principalRow.authn_kind
-        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principalEvidence.data.state === principalRow.state
-        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && principalEvidence.data.state === 'ready'
-        && principalEvidence.data.database_role === brokerAttestation.session.database_role
-        && principalEvidence.data.database_name === brokerAttestation.session.database_name
-        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
-        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        && Date.parse(principalEvidence.data.observed_at) <= nowMs + 60_000
-        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
-      if (!principalCurrent) {
-        return await quarantine('broker principal unavailable before start observation', 'Broker principal is unavailable, stale, disabled, or drifted.');
-      }
-
-      const storedOperationRefs = revocationRefsSchema.safeParse(row.revocation_refs);
-      const storedRunnerRefs = revocationRefsSchema.safeParse(row.runner_revocation_refs);
-      if (!storedOperationRefs.success || !storedRunnerRefs.success) {
-        return await quarantine('stored revocation binding invalid before start observation', 'Stored revocation binding is invalid.');
-      }
-      const refs = revocationRefsSchema.safeParse([
-        ...storedOperationRefs.data,
-        `runner:${runner.runner_id}`, `runner-instance:${runner.runner_instance_id}`,
-        `identity:${runner.runner_identity_evidence_ref}`, `channel:${runner.channel_binding_sha256}`,
-      ]);
-      if (!refs.success || JSON.stringify(refs.data) !== JSON.stringify(storedRunnerRefs.data)) {
-        return await quarantine('runner revocation binding drifted before start observation', 'Runner revocation binding drifted before start observation.');
-      }
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs.data]);
-      if (revoked.rows.length) {
-        return await quarantine('runner or operation authority revoked before start observation', 'Runner or operation authority is revoked.');
-      }
-      const prepared = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1',
-        [request.operation_id],
-      );
-      if (prepared.rows[0]?.state !== 'ready' || prepared.rows[0]?.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await quarantine('prepared operation unavailable before start observation', 'Prepared operation is unavailable or drifted.');
-      }
-      const hostResult = await client.query(
-        `SELECT evidence,capacity_slots,reserved_slots,authorized_slots,
-                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`, [row.host_id],
-      );
-      const host = hostEvidence(hostResult.rows[0]);
-      if (!host || host.status !== 'ready' || !host.secret_readiness || host.host_id !== runner.host_id
-        || host.capacity_slots !== Number(hostResult.rows[0]?.capacity_slots)
-        || hostResult.rows[0]?.reconciles !== true
-        || Date.parse(host.observed_at) > nowMs + 60_000
-        || nowMs - Date.parse(host.observed_at) > Number(row.max_host_evidence_age_ms)
-        || Date.parse(host.access_review_expires_at) <= nowMs
-        || binding.data.capabilities.some((capability) => !host.allowed_capabilities.includes(capability))) {
-        return await quarantine('host authority unavailable before start observation', 'Host authority is unavailable, stale, or inconsistent.');
-      }
-      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
-        return await quarantine('aggregate budget invalid before start observation', 'Aggregate budget authority is missing or inconsistent.');
-      }
-      const budget = await client.query(
-        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles,
-                (reserved_usd+committed_usd <= hard_limit_usd) AS within_ceiling
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`, [row.budget_receipt_id],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true || budget.rows[0].within_ceiling !== true) {
-        return await quarantine('receipt budget invalid before start observation', 'Receipt budget authority is missing or inconsistent.');
-      }
-
-      if (exactRequest) {
-        if (row.runner_start_presented_token_sha256 !== startTokenDigest
-          || row.runner_process_instance_sha256 !== evidence.process_instance_sha256
-          || row.runner_start_evidence_ref !== evidence.evidence_ref
-          || row.runner_start_evidence_sha256 !== evidence.evidence_sha256
-          || sqlInstant(row.runner_process_started_at) !== sqlInstant(evidence.process_started_at)
-          || sqlInstant(row.runner_start_evidence_observed_at) !== sqlInstant(evidence.observed_at)) {
-          return await quarantine('runner start replay evidence drifted', 'Runner start replay evidence drifted.');
-        }
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { observed: true, receipt, blockers: [] };
-      }
-      const duplicates = await client.query(
-        `SELECT reservation_id FROM swarm_authority_reservations
-         WHERE runner_start_observation_request_id=$1::uuid OR runner_process_instance_sha256=$2
-           OR runner_start_evidence_ref=$3 OR runner_start_evidence_sha256=$4 LIMIT 1`,
-        [request.observation_request_id, evidence.process_instance_sha256, evidence.evidence_ref, evidence.evidence_sha256],
-      );
-      if (duplicates.rows.length) return await deny('Runner start request or evidence is already bound to another reservation.');
-
-      const observationId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations SET state='runner-start-observed',
-           runner_start_observation_id=$2::uuid,runner_start_observation_request_id=$3::uuid,
-           runner_start_observation_accepted_at=$4::timestamptz,
-           runner_start_evidence_observed_at=$5::timestamptz,runner_process_started_at=$6::timestamptz,
-           runner_process_instance_sha256=$7,runner_start_evidence_ref=$8,
-           runner_start_evidence_sha256=$9,runner_start_presented_token_sha256=$10
-         WHERE reservation_id=$1::uuid AND state='runner-claimed-not-started'
-           AND start_observation_token_sha256=$10 RETURNING *`,
-        [request.reservation_id, observationId, request.observation_request_id, at,
-          evidence.observed_at, evidence.process_started_at, evidence.process_instance_sha256,
-          evidence.evidence_ref, evidence.evidence_sha256, startTokenDigest],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Runner start observation could not be accepted exactly once.');
-      const receipt = receiptFrom(transitioned.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-start-observed',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      await client.query('COMMIT');
-      return { observed: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'observe-runner-start', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown runner-start observation failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async settleRunnerOutcome(input: RunnerOutcomeInput): Promise<RunnerOutcomeResult> {
-    const parsed = runnerOutcomeInputSchema.safeParse(input);
-    if (!parsed.success) return runnerOutcomeDenied('Runner outcome request is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let at = new Date().toISOString();
-    const deny = async (blocker: string): Promise<RunnerOutcomeResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-outcome-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          outcome_request_id: request.outcome_request_id, blockers: [blocker],
-        })],
-      );
-      await client.query('COMMIT');
-      return runnerOutcomeDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): RunnerOutcomeReceipt => ({
-      schema_version: 'starlight.runner_outcome.v1',
-      outcome_id: String(row.runner_outcome_id),
-      outcome_request_id: String(row.runner_outcome_request_id),
-      outcome_event_id: String(row.runner_outcome_event_id),
-      outcome_kind: row.runner_outcome_kind as 'never-started' | 'process-terminal',
-      claim_id: String(row.runner_claim_id),
-      reservation_id: String(row.reservation_id),
-      operation_id: String(row.operation_id),
-      effect_id: String(row.effect_id),
-      binding_digest_sha256: String(row.binding_digest_sha256),
-      runner_id: String(row.runner_id),
-      runner_instance_id: String(row.runner_instance_id),
-      runtime_id: String(row.runner_runtime_id),
-      host_id: String(row.runner_host_id),
-      channel_binding_sha256: String(row.runner_channel_binding_sha256),
-      launch_attempt_id: String(row.runner_launch_attempt_id),
-      fencing_generation: Number(row.runner_fencing_generation),
-      process_instance_sha256: row.runner_process_instance_sha256 === null ? null : String(row.runner_process_instance_sha256),
-      exit_disposition: row.runner_exit_disposition === null ? null
-        : row.runner_exit_disposition as RunnerOutcomeReceipt['exit_disposition'],
-      evidence_ref: String(row.runner_outcome_evidence_ref),
-      evidence_sha256: String(row.runner_outcome_evidence_sha256),
-      outcome_at: sqlInstant(row.runner_outcome_at),
-      evidence_observed_at: sqlInstant(row.runner_outcome_evidence_observed_at),
-      accepted_at: sqlInstant(row.runner_outcome_accepted_at),
-      remote_stop_confirmed: row.runner_remote_stop_confirmed === true,
-      restart_fenced: true,
-      launch_queue_closed: true,
-      descendants_quiesced: true,
-      transport_state: 'attested-not-deployed',
-      dispatch_state: 'not-dispatched',
-      execution_observed: row.runner_outcome_kind === 'process-terminal',
-      workload_effect_observed: false,
-      actual_usage_reconciled: false,
-      host_capacity_released: row.state === 'runner-terminal-observed',
-      budget_commitment_released: false,
-      released_host_slots: row.state === 'runner-terminal-observed' ? 1 : 0,
-      released_cost_usd: 0,
-      retained_committed_cost_usd: Number(row.committed_cost_usd),
-      state: row.state as 'runner-never-started-observed' | 'runner-terminal-observed',
-    });
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-
-      const brokerAttestation = await this.brokerSessionAttestor(client);
-      if (!brokerAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
-      }
-      const outcomeAttestation = await this.runnerOutcomeEvidenceAttestor(client);
-      if (!outcomeAttestation.valid) {
-        return await deny(`Runner outcome evidence is unavailable: ${outcomeAttestation.blockers.join(' ')}`);
-      }
-      const parsedEvidence = runnerOutcomeEvidenceSchema.safeParse(outcomeAttestation.evidence);
-      if (!parsedEvidence.success) return await deny('Runner outcome evidence is malformed.');
-      const evidence = parsedEvidence.data;
-      const outcomeDigest = createHash('sha256').update(request.outcome_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT *,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid AND outcome_token_sha256=$3 FOR UPDATE`,
-        [request.reservation_id, request.claim_id, outcomeDigest],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Runner claim does not exist or the outcome credential is invalid.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Runner outcome request does not match the claimed operation.');
-      }
-      if (row.broker_database_role !== brokerAttestation.session.database_role
-        || row.broker_database_name !== brokerAttestation.session.database_name
-        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        || brokerAttestation.session.contract_digest_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
-        return await deny('Authenticated broker database session does not match the claimed operation.');
-      }
-      const principal = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
-      );
-      const principalRow = principal.rows[0];
-      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principalRow?.evidence);
-      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
-        && principalEvidence.data.database_role === principalRow.database_role
-        && principalEvidence.data.database_name === principalRow.database_name
-        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principalEvidence.data.authn_kind === principalRow.authn_kind
-        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principalEvidence.data.state === principalRow.state
-        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && principalEvidence.data.state === 'ready'
-        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
-        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        && Date.parse(principalEvidence.data.observed_at) <= nowMs
-        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
-      if (!principalCurrent) return await deny('Broker principal is unavailable, stale, disabled, or drifted.');
-
-      const expectedState = evidence.outcome_kind === 'never-started'
-        ? 'runner-never-started-observed' : 'runner-terminal-observed';
-      const exactRetry = row.state === expectedState
-        && row.runner_outcome_request_id === request.outcome_request_id;
-      if (row.state === 'runner-never-started-observed' || row.state === 'runner-terminal-observed') {
-        if (!exactRetry) return await deny('A different immutable runner outcome already settled this claim.');
-      }
-
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
-        || row.cost_matches_binding !== true || row.committed_cost_usd !== row.reserved_cost_usd) {
-        return await deny('Stored operation or committed cost is invalid or drifted.');
-      }
-      const bindingsMatch = evidence.reservation_id === request.reservation_id
-        && evidence.claim_id === request.claim_id
-        && evidence.operation_id === request.operation_id
-        && evidence.effect_id === request.effect_id
-        && evidence.binding_digest_sha256 === request.binding_digest_sha256
-        && evidence.runner_id === row.runner_id
-        && evidence.runner_identity_evidence_ref === row.runner_identity_evidence_ref
-        && evidence.runner_instance_id === row.runner_instance_id
-        && evidence.runtime_id === row.runner_runtime_id
-        && evidence.host_id === row.runner_host_id
-        && evidence.channel_binding_sha256 === row.runner_channel_binding_sha256
-        && evidence.launch_attempt_id === row.runner_launch_attempt_id
-        && evidence.fencing_generation === Number(row.runner_fencing_generation);
-      if (!bindingsMatch) return await deny('Runner outcome evidence is bound to another execution generation.');
-
-      const outcomeMs = Date.parse(evidence.outcome_at);
-      const observedMs = Date.parse(evidence.observed_at);
-      if (outcomeMs < Date.parse(String(row.runner_claim_accepted_at))
-        || observedMs > nowMs || nowMs - observedMs > this.maxRunnerEvidenceAgeMs
-        || Date.parse(evidence.access_review_expires_at) <= nowMs) {
-        return await deny('Runner outcome evidence chronology is invalid, stale, or expired.');
-      }
-      const hasStart = row.runner_start_observation_id !== null
-        || row.runner_process_instance_sha256 !== null
-        || row.runner_start_evidence_ref !== null
-        || row.runner_start_evidence_sha256 !== null;
-      if (exactRetry) {
-        const retryDrifted = row.runner_outcome_event_id !== evidence.outcome_event_id
-          || row.runner_outcome_kind !== evidence.outcome_kind
-          || row.runner_outcome_evidence_ref !== evidence.evidence_ref
-          || row.runner_outcome_evidence_sha256 !== evidence.evidence_sha256
-          || row.runner_outcome_presented_token_sha256 !== outcomeDigest
-          || row.runner_exit_disposition !== evidence.exit_disposition
-          || sqlInstant(row.runner_outcome_at) !== sqlInstant(evidence.outcome_at)
-          || sqlInstant(row.runner_outcome_evidence_observed_at) !== sqlInstant(evidence.observed_at)
-          || row.runner_remote_stop_confirmed !== evidence.remote_stop_confirmed
-          || (evidence.outcome_kind === 'never-started' && hasStart)
-          || (evidence.outcome_kind === 'process-terminal' && (
-            !hasStart
-            || evidence.process_instance_sha256 !== row.runner_process_instance_sha256
-            || evidence.start_observation_id !== row.runner_start_observation_id
-            || evidence.start_evidence_ref !== row.runner_start_evidence_ref
-            || evidence.start_evidence_sha256 !== row.runner_start_evidence_sha256
-            || sqlInstant(evidence.process_started_at) !== sqlInstant(row.runner_process_started_at)
-          ));
-        if (retryDrifted) return await deny('Runner outcome retry evidence drifted.');
-        const receipt = receiptFrom(row);
-        await client.query('COMMIT');
-        return { settled: true, receipt, blockers: [] };
-      }
-      if (!['runner-claimed-not-started', 'runner-start-observed', 'stop-requested'].includes(String(row.state))) {
-        return await deny(`Runner outcome cannot be settled from state ${String(row.state)}.`);
-      }
-      if (evidence.outcome_kind === 'never-started') {
-        if (row.state === 'runner-start-observed' || hasStart) {
-          return await deny('Never-started evidence cannot settle an execution with start evidence.');
-        }
-      } else {
-        if ((row.state !== 'runner-start-observed' && row.state !== 'stop-requested') || !hasStart
-          || evidence.process_instance_sha256 !== row.runner_process_instance_sha256
-          || evidence.start_observation_id !== row.runner_start_observation_id
-          || evidence.start_evidence_ref !== row.runner_start_evidence_ref
-          || evidence.start_evidence_sha256 !== row.runner_start_evidence_sha256
-          || sqlInstant(evidence.process_started_at) !== sqlInstant(row.runner_process_started_at)
-          || outcomeMs < Date.parse(String(row.runner_process_started_at))) {
-          return await deny('Process-terminal evidence does not match the stored start observation.');
-        }
-      }
-
-      const duplicate = await client.query(
-        `SELECT reservation_id FROM swarm_authority_reservations
-         WHERE runner_outcome_request_id=$1::uuid OR runner_outcome_event_id=$2::uuid
-           OR runner_outcome_evidence_ref=$3 OR runner_outcome_evidence_sha256=$4 LIMIT 1`,
-        [request.outcome_request_id, evidence.outcome_event_id, evidence.evidence_ref, evidence.evidence_sha256],
-      );
-      if (duplicate.rows.length) return await deny('Runner outcome request or evidence is already bound to another reservation.');
-
-      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
-        return await deny('Committed aggregate budget authority is missing or inconsistent.');
-      }
-      const budget = await client.query(
-        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
-        [row.budget_receipt_id],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true) {
-        return await deny('Committed receipt budget authority is missing or inconsistent.');
-      }
-      const host = await client.query(
-        `SELECT authorized_slots,
-                (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE`,
-        [row.host_id],
-      );
-      if (host.rows.length !== 1 || host.rows[0].reconciles !== true || Number(host.rows[0].authorized_slots) < 1) {
-        return await deny('Authorized host ledger is missing or inconsistent.');
-      }
-
-      const outcomeId = randomUUID();
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations SET state=$2,
-           runner_outcome_id=$3::uuid,runner_outcome_request_id=$4::uuid,
-           runner_outcome_event_id=$5::uuid,runner_outcome_kind=$6,
-           runner_outcome_accepted_at=$7::timestamptz,runner_outcome_at=$8::timestamptz,
-           runner_outcome_evidence_observed_at=$9::timestamptz,runner_outcome_evidence_ref=$10,
-           runner_outcome_evidence_sha256=$11,runner_outcome_presented_token_sha256=$12,
-           runner_exit_disposition=$13,runner_remote_stop_confirmed=$14
-         WHERE reservation_id=$1::uuid
-           AND state IN ('runner-claimed-not-started','runner-start-observed','stop-requested') RETURNING *`,
-        [request.reservation_id, expectedState, outcomeId, request.outcome_request_id,
-          evidence.outcome_event_id, evidence.outcome_kind, at, evidence.outcome_at,
-          evidence.observed_at, evidence.evidence_ref, evidence.evidence_sha256, outcomeDigest,
-          evidence.exit_disposition, evidence.remote_stop_confirmed],
-      );
-      if (transitioned.rows.length !== 1) return await deny('Runner outcome settlement lost its authority race.');
-      if (evidence.outcome_kind === 'process-terminal') {
-        const released = await client.query(
-          `UPDATE swarm_authority_hosts SET authorized_slots=authorized_slots-1
-           WHERE host_id=$1 AND authorized_slots >= 1 RETURNING authorized_slots`,
-          [row.host_id],
-        );
-        if (released.rows.length !== 1) throw new Error('Authorized host-capacity release would underflow or references a missing host.');
-      }
-      const hostAfter = await client.query(
-        `SELECT (authorized_slots IS NOT DISTINCT FROM (SELECT COUNT(*)::integer FROM swarm_authority_reservations
-                  WHERE host_id=$1 AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed'))) AS reconciles
-         FROM swarm_authority_hosts WHERE host_id=$1`,
-        [row.host_id],
-      );
-      if (hostAfter.rows.length !== 1 || hostAfter.rows[0].reconciles !== true) {
-        throw new Error('Authorized host ledger failed to reconcile after outcome settlement.');
-      }
-      const receipt = receiptFrom(transitioned.rows[0]);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-outcome-observed',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify(receipt)],
-      );
-      if (evidence.outcome_kind === 'process-terminal') {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('host-capacity-released',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, claim_id: request.claim_id,
-            outcome_id: outcomeId, released_host_slots: 1, released_cost_usd: 0,
-            actual_usage_reconciled: false,
-          })],
-        );
-      }
-      await client.query('COMMIT');
-      return { settled: true, receipt, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'settle-runner-outcome', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown runner-outcome settlement failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async recordRunnerUsageEvidence(input: RunnerUsageEvidenceInput): Promise<RunnerUsageEvidenceResult> {
-    const parsed = runnerUsageEvidenceInputSchema.safeParse(input);
-    if (!parsed.success) return runnerUsageEvidenceDenied('Runner usage-evidence request is invalid.');
-    const request = parsed.data;
-    if (!this.usageEvidencePool) {
-      const blocker = 'Dedicated usage-evidence database authority is not configured.';
-      await this.recordRunnerUsageEvidenceRefusal(request, blocker, false);
-      return runnerUsageEvidenceDenied(blocker);
-    }
-    const client = await this.pool.connect();
-    let brokerTransactionOpen = false;
-    let brokerClientReleased = false;
-    let usageClient: AuthoritySqlClient | undefined;
-    let usageTransactionOpen = false;
-    let at = new Date().toISOString();
-    const deny = async (blocker: string): Promise<RunnerUsageEvidenceResult> => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('runner-usage-evidence-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          outcome_id: request.outcome_id, usage_request_id: request.usage_request_id,
-          usage_sequence: request.usage_sequence, blockers: [blocker], released_cost_usd: '0.000000',
-        })],
-      );
-      await client.query('COMMIT');
-      return runnerUsageEvidenceDenied(blocker);
-    };
-    const receiptFrom = (row: Record<string, unknown>): RunnerUsageEvidenceReceipt => {
-      const providerSchemaVersion = String(row.evidence_schema_version);
-      if (providerSchemaVersion !== 'starlight.runner_usage_provider_evidence.v1'
-        && providerSchemaVersion !== 'starlight.runner_usage_provider_evidence.v2') {
-        throw new Error('Database returned an unsupported provider usage-evidence schema version.');
-      }
-      return ({
-      schema_version: providerSchemaVersion === 'starlight.runner_usage_provider_evidence.v1'
-        ? 'starlight.runner_usage_evidence.v1'
-        : 'starlight.runner_usage_evidence.v2',
-      usage_evidence_id: String(row.usage_evidence_id),
-      usage_request_id: String(row.usage_request_id),
-      usage_sequence: Number(row.usage_sequence),
-      provider_event_id: String(row.provider_event_id),
-      reservation_id: String(row.reservation_id),
-      claim_id: String(row.claim_id),
-      outcome_id: String(row.outcome_id),
-      operation_id: String(row.operation_id),
-      effect_id: String(row.effect_id),
-      binding_digest_sha256: String(row.binding_digest_sha256),
-      provider_id: String(row.provider_id),
-      provider_account_ref: String(row.provider_account_ref),
-      provider_usage_correlation_id: String(row.provider_usage_correlation_id),
-      meter_id: String(row.meter_id),
-      evidence_ref: String(row.evidence_ref),
-      evidence_sha256: String(row.evidence_sha256),
-      usage_started_at: sqlInstant(row.usage_started_at),
-      usage_ended_at: sqlInstant(row.usage_ended_at),
-      statement_finalized_at: row.statement_finalized_at === null ? null : sqlInstant(row.statement_finalized_at),
-      evidence_observed_at: sqlInstant(row.evidence_observed_at),
-      accepted_at: sqlInstant(row.accepted_at),
-      statement_status: row.statement_status as 'provisional' | 'final',
-      currency: 'USD',
-      cumulative_cost_usd: canonicalProviderUsd(row.cumulative_cost_usd, providerSchemaVersion),
-      authorized_cost_usd: canonicalUsd(row.authorized_cost_usd),
-      budget_breach_observed: row.budget_breach_observed === true,
-      actual_usage_reconciled: false,
-      budget_commitment_released: false,
-      released_cost_usd: '0.000000',
-      transport_state: 'attested-not-deployed',
-      dispatch_state: 'not-dispatched',
-      workload_effect_observed: false,
-    });
-    };
-    try {
-      await client.query('BEGIN');
-      brokerTransactionOpen = true;
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) return await deny('Authority serialization control row is missing or ambiguous.');
-      at = await wallClock(client);
-      const nowMs = Date.parse(at);
-
-      const brokerAttestation = await this.brokerSessionAttestor(client);
-      if (!brokerAttestation.valid) {
-        return await deny(`Broker database session is not authorized: ${brokerAttestation.blockers.join(' ')}`);
-      }
-      const usageAttestation = await this.runnerUsageEvidenceAttestor(client);
-      if (!usageAttestation.valid) {
-        return await deny(`Runner usage evidence is unavailable: ${usageAttestation.blockers.join(' ')}`);
-      }
-      const parsedEvidence = runnerUsageEvidenceSchema.safeParse(usageAttestation.evidence);
-      if (!parsedEvidence.success) return await deny('Runner usage evidence is malformed.');
-      const evidence = parsedEvidence.data;
-      const evidenceObservedMs = Date.parse(evidence.observed_at);
-      if (evidenceObservedMs > nowMs || nowMs - evidenceObservedMs > this.maxRunnerEvidenceAgeMs
-        || Date.parse(evidence.access_review_expires_at) <= nowMs) {
-        return await deny('Runner usage evidence is stale, future-dated, or access-expired.');
-      }
-
-      const usageDigest = createHash('sha256').update(request.usage_reconciliation_token, 'utf8').digest('hex');
-      const nextUsageDigest = createHash('sha256').update(request.next_usage_reconciliation_token, 'utf8').digest('hex');
-      const found = await client.query(
-        `SELECT *,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid AND runner_outcome_id=$3::uuid FOR UPDATE`,
-        [request.reservation_id, request.claim_id, request.outcome_id],
-      );
-      const row = found.rows[0];
-      if (!row) return await deny('Settled runner outcome does not exist.');
-      if (row.operation_id !== request.operation_id || row.effect_id !== request.effect_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Runner usage request does not match the settled operation.');
-      }
-      if (!['runner-never-started-observed', 'runner-terminal-observed'].includes(String(row.state))) {
-        return await deny(`Runner usage evidence cannot be recorded from state ${String(row.state)}.`);
-      }
-      if (row.broker_database_role !== brokerAttestation.session.database_role
-        || row.broker_database_name !== brokerAttestation.session.database_name
-        || row.broker_role_contract_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        || brokerAttestation.session.contract_digest_sha256 !== BROKER_DATABASE_ROLE_CONTRACT_SHA256) {
-        return await deny('Authenticated broker database session does not match the settled operation.');
-      }
-      const principal = await client.query(
-        `SELECT database_role,database_name,broker_execution_identity,broker_identity_evidence_ref,
-                authn_kind,role_contract_digest_sha256,observed_at,access_review_expires_at,state,evidence
-         FROM swarm_authority_broker_principals
-         WHERE database_role=$1 AND database_name=$2`,
-        [brokerAttestation.session.database_role, brokerAttestation.session.database_name],
-      );
-      const principalRow = principal.rows[0];
-      const principalEvidence = brokerPrincipalEvidenceSchema.safeParse(principalRow?.evidence);
-      const principalCurrent = principal.rows.length === 1 && principalEvidence.success
-        && principalEvidence.data.database_role === principalRow.database_role
-        && principalEvidence.data.database_name === principalRow.database_name
-        && principalEvidence.data.broker_execution_identity === principalRow.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === principalRow.broker_identity_evidence_ref
-        && principalEvidence.data.authn_kind === principalRow.authn_kind
-        && principalEvidence.data.role_contract_digest_sha256 === principalRow.role_contract_digest_sha256
-        && principalEvidence.data.state === principalRow.state
-        && sqlInstant(principalEvidence.data.observed_at) === sqlInstant(principalRow.observed_at)
-        && sqlInstant(principalEvidence.data.access_review_expires_at) === sqlInstant(principalRow.access_review_expires_at)
-        && principalEvidence.data.state === 'ready'
-        && principalEvidence.data.broker_execution_identity === row.broker_execution_identity
-        && principalEvidence.data.broker_identity_evidence_ref === row.broker_identity_evidence_ref
-        && principalEvidence.data.role_contract_digest_sha256 === BROKER_DATABASE_ROLE_CONTRACT_SHA256
-        && Date.parse(principalEvidence.data.observed_at) <= nowMs
-        && nowMs - Date.parse(principalEvidence.data.observed_at) <= this.maxBrokerEvidenceAgeMs
-        && Date.parse(principalEvidence.data.access_review_expires_at) > nowMs;
-      if (!principalCurrent) return await deny('Broker principal is unavailable, stale, disabled, or drifted.');
-
-      const binding = operationBindingSchema.safeParse(row.binding);
-      if (!binding.success || sha256Digest(binding.data) !== row.binding_digest_sha256
-        || row.cost_matches_binding !== true || row.committed_cost_usd !== row.reserved_cost_usd) {
-        return await deny('Stored operation or committed cost is invalid or drifted.');
-      }
-      if (typeof row.usage_reconciliation_token_sha256 !== 'string'
-        || typeof row.provider_usage_correlation_id !== 'string') {
-        return await deny('Runner claim predates usage-evidence authority.');
-      }
-      const bindingsMatch = evidence.reservation_id === request.reservation_id
-        && evidence.claim_id === request.claim_id
-        && evidence.outcome_id === request.outcome_id
-        && evidence.operation_id === request.operation_id
-        && evidence.effect_id === request.effect_id
-        && evidence.binding_digest_sha256 === request.binding_digest_sha256
-        && evidence.runner_id === row.runner_id
-        && evidence.runner_identity_evidence_ref === row.runner_identity_evidence_ref
-        && evidence.runner_instance_id === row.runner_instance_id
-        && evidence.runtime_id === row.runner_runtime_id
-        && evidence.host_id === row.runner_host_id
-        && evidence.channel_binding_sha256 === row.runner_channel_binding_sha256
-        && evidence.launch_attempt_id === row.runner_launch_attempt_id
-        && evidence.fencing_generation === Number(row.runner_fencing_generation)
-        && evidence.process_instance_sha256 === row.runner_process_instance_sha256
-        && evidence.provider_usage_correlation_id === row.provider_usage_correlation_id;
-      if (!bindingsMatch) return await deny('Runner usage evidence is bound to another execution generation.');
-      const usageStartedMs = Date.parse(evidence.usage_started_at);
-      const usageEndedMs = Date.parse(evidence.usage_ended_at);
-      if (usageStartedMs < Date.parse(sqlInstant(row.runner_claim_accepted_at))
-        || usageEndedMs > Date.parse(sqlInstant(row.runner_outcome_at))) {
-        return await deny('Runner usage interval falls outside the authenticated execution interval.');
-      }
-
-      const lifecycleDigests = [row.consume_token_sha256, row.cancel_token_sha256, row.lease_claim_token_sha256,
-        row.redemption_token_sha256, row.control_token_sha256, row.heartbeat_token_sha256,
-        row.start_observation_token_sha256, row.outcome_token_sha256, usageDigest,
-        row.runner_heartbeat_presented_token_sha256, row.runner_start_presented_token_sha256,
-        row.runner_outcome_presented_token_sha256].filter((digest): digest is string => typeof digest === 'string');
-      if (lifecycleDigests.includes(nextUsageDigest)) {
-        return await deny('Next usage-reconciliation credential aliases an existing lifecycle credential.');
-      }
-      if (!await this.readBudgetWindows(client, request.reservation_id, binding.data.budget_policy_id, binding.data.requested_cost_usd)) {
-        return await deny('Committed aggregate budget authority is missing or inconsistent.');
-      }
-      const budget = await client.query(
-        `SELECT (committed_usd IS NOT DISTINCT FROM (SELECT COALESCE(SUM(reserved_cost_usd),0)
-                  FROM swarm_authority_reservations WHERE budget_receipt_id=$1
-                    AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed'))) AS reconciles
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
-        [row.budget_receipt_id],
-      );
-      if (budget.rows.length !== 1 || budget.rows[0].reconciles !== true) {
-        return await deny('Committed receipt budget authority is missing or inconsistent.');
-      }
-      await client.query('COMMIT');
-      brokerTransactionOpen = false;
-      client.release?.();
-      brokerClientReleased = true;
-
-      usageClient = await this.usageEvidencePool.connect();
-      await usageClient.query('BEGIN');
-      usageTransactionOpen = true;
-      await usageClient.query('SET LOCAL search_path = pg_catalog, public');
-      const verifierAttestation = await this.usageEvidenceSessionAttestor(usageClient);
-      if (!verifierAttestation.valid) {
-        await usageClient.query('ROLLBACK');
-        usageTransactionOpen = false;
-        usageClient.release?.();
-        usageClient = undefined;
-        const blocker = `Usage-evidence database session is not authorized: ${verifierAttestation.blockers.join(' ')}`;
-        await this.recordRunnerUsageEvidenceRefusal(request, blocker);
-        return runnerUsageEvidenceDenied(blocker);
-      }
-      const usageEvidenceId = randomUUID();
-      const appended = await usageClient.query(
-        `SELECT public.starlight_append_runner_usage_evidence($1::jsonb) AS result`,
-        [JSON.stringify({
-          usage_evidence_id: usageEvidenceId, usage_request_id: request.usage_request_id,
-          evidence_schema_version: evidence.schema_version,
-          usage_sequence: request.usage_sequence, provider_event_id: evidence.provider_event_id,
-          reservation_id: request.reservation_id, claim_id: request.claim_id, outcome_id: request.outcome_id,
-          operation_id: request.operation_id, effect_id: request.effect_id,
-          binding_digest_sha256: request.binding_digest_sha256,
-          role_contract_digest_sha256: BROKER_DATABASE_ROLE_CONTRACT_SHA256,
-          verifier_database_role: verifierAttestation.session.database_role,
-          verifier_database_name: verifierAttestation.session.database_name,
-          verifier_role_contract_sha256: verifierAttestation.session.contract_digest_sha256,
-          runner_id: evidence.runner_id, runner_identity_evidence_ref: evidence.runner_identity_evidence_ref,
-          runner_instance_id: evidence.runner_instance_id, runtime_id: evidence.runtime_id,
-          host_id: evidence.host_id, channel_binding_sha256: evidence.channel_binding_sha256,
-          launch_attempt_id: evidence.launch_attempt_id, fencing_generation: evidence.fencing_generation,
-          process_instance_sha256: evidence.process_instance_sha256,
-          provider_id: evidence.provider_id, provider_account_ref: evidence.provider_account_ref,
-          provider_usage_correlation_id: evidence.provider_usage_correlation_id, meter_id: evidence.meter_id,
-          evidence_ref: evidence.evidence_ref, evidence_sha256: evidence.evidence_sha256,
-          usage_started_at: evidence.usage_started_at, usage_ended_at: evidence.usage_ended_at,
-          statement_status: evidence.statement_status, statement_finalized_at: evidence.statement_finalized_at,
-          evidence_observed_at: evidence.observed_at, cumulative_cost_usd: evidence.cumulative_cost_usd,
-          access_review_expires_at: evidence.access_review_expires_at,
-          usage_reconciliation_token: request.usage_reconciliation_token,
-          next_usage_reconciliation_token: request.next_usage_reconciliation_token,
-          issuer: evidence.issuer, key_id: evidence.key_id, authn_kind: evidence.authn_kind,
-        })],
-      );
-      const appendResult = appended.rows[0]?.result as {
-        ok?: boolean; blocker?: string; audited?: boolean; row?: Record<string, unknown>;
-      } | undefined;
-      if (appendResult?.ok !== true || !appendResult.row) {
-        // Preserve the routine's sanitized denial in the managed verifier path. PostgreSQL
-        // cannot force a caller-controlled transaction to commit, so arbitrary direct SQL is
-        // outside this audit guarantee. No authority mutation occurs before a false result.
-        await usageClient.query(appendResult?.audited === true ? 'COMMIT' : 'ROLLBACK');
-        usageTransactionOpen = false;
-        usageClient.release?.();
-        usageClient = undefined;
-        const blocker = appendResult?.blocker ?? 'Runner usage evidence could not be appended.';
-        if (appendResult?.audited !== true) {
-          await this.recordRunnerUsageEvidenceRefusal(request, blocker);
-        }
-        return runnerUsageEvidenceDenied(blocker);
-      }
-      const receipt = receiptFrom(appendResult.row);
-      await usageClient.query('COMMIT');
-      usageTransactionOpen = false;
-      return { recorded: true, receipt, blockers: [] };
-    } catch (error) {
-      if (usageClient) {
-        if (usageTransactionOpen) await usageClient.query('ROLLBACK');
-        usageClient.release?.();
-        usageClient = undefined;
-      }
-      if (brokerTransactionOpen) await client.query('ROLLBACK');
-      if (brokerClientReleased) {
-        await this.recordRunnerUsageEvidenceRefusal(
-          request,
-          error instanceof Error ? error.message : 'unknown runner usage-evidence verifier failure',
-        );
-      } else {
-        await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-          action: 'record-runner-usage-evidence', reservation_id: request.reservation_id,
-          error: error instanceof Error ? error.message : 'unknown runner usage-evidence failure',
-        });
-      }
-      throw error;
-    } finally {
-      usageClient?.release?.();
-      if (!brokerClientReleased) client.release?.();
-    }
-  }
-
-  async reconcileRunnerHeartbeatExpiry(input: RunnerHeartbeatExpiryInput): Promise<RunnerHeartbeatExpiryResult> {
-    const parsed = runnerHeartbeatExpiryInputSchema.safeParse(input);
-    if (!parsed.success) {
-      return { reconciled: false, reservation_id: String(input?.reservation_id ?? 'invalid-reservation'), state: null, expired: false, blockers: ['Runner heartbeat expiry request is invalid.'] };
-    }
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('SET LOCAL search_path = pg_catalog, public, pg_temp');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const at = await wallClock(client);
-      const nowMs = Date.parse(at);
-      const found = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,state,runner_claim_expires_at,
-                runner_evidence_observed_at,runner_access_review_expires_at,reservation_expires_at,
-                lease_expires_at,start_authorized_at,binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND runner_claim_id=$2::uuid FOR UPDATE`,
-        [request.reservation_id, request.claim_id],
-      );
-      const row = found.rows[0];
-      if (!row || row.operation_id !== request.operation_id
-        || row.binding_digest_sha256 !== request.binding_digest_sha256) {
-        await client.query('COMMIT');
-        return { reconciled: false, reservation_id: request.reservation_id, state: null, expired: false, blockers: ['Runner claim does not exist or does not match the expiry request.'] };
-      }
-      if (row.state === 'stop-requested') {
-        await client.query('COMMIT');
-        return { reconciled: true, reservation_id: request.reservation_id, state: 'stop-requested', expired: true, blockers: [] };
-      }
-      if (row.state !== 'runner-claimed-not-started' && row.state !== 'runner-start-observed') {
-        await client.query('COMMIT');
-        return { reconciled: false, reservation_id: request.reservation_id, state: null, expired: false, blockers: [`Runner heartbeat expiry cannot be reconciled from state ${String(row.state)}.`] };
-      }
-      const binding = operationBindingSchema.safeParse(row.binding);
-      const expiryMs = Date.parse(String(row.runner_claim_expires_at));
-      const authorityCapMs = binding.success ? Math.min(
-        Date.parse(String(row.runner_access_review_expires_at)),
-        Date.parse(String(row.runner_evidence_observed_at)) + this.maxRunnerEvidenceAgeMs,
-        Date.parse(String(row.reservation_expires_at)),
-        Date.parse(String(row.lease_expires_at)),
-        Date.parse(String(row.start_authorized_at)) + binding.data.timeout_ms,
-      ) : Number.NaN;
-      const invalidOrExpired = !binding.success
-        || sha256Digest(binding.data) !== row.binding_digest_sha256
-        || !Number.isFinite(authorityCapMs)
-        || expiryMs !== authorityCapMs
-        || expiryMs <= nowMs;
-      if (!invalidOrExpired) {
-        await client.query('COMMIT');
-        return { reconciled: true, reservation_id: request.reservation_id, state: row.state, expired: false, blockers: [] };
-      }
-      const stopped = await client.query(
-        `UPDATE swarm_authority_reservations SET state='stop-requested'
-         WHERE reservation_id=$1::uuid AND state IN ('runner-claimed-not-started','runner-start-observed') RETURNING reservation_id`,
-        [request.reservation_id],
-      );
-      if (stopped.rows.length !== 1) throw new Error('Runner heartbeat expiry reconciliation lost its authority race.');
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.operation_id, request.binding_digest_sha256, at, JSON.stringify({
-          reservation_id: request.reservation_id, claim_id: request.claim_id,
-          reason: 'runner heartbeat authority expired or drifted',
-          execution_state: row.state === 'runner-start-observed' ? 'started-or-unknown' : 'unknown', released_cost_usd: 0,
-        })],
-      );
-      await client.query('COMMIT');
-      return { reconciled: true, reservation_id: request.reservation_id, state: 'stop-requested', expired: true, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, request.operation_id, request.binding_digest_sha256, {
-        action: 'reconcile-runner-heartbeat-expiry', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown runner-heartbeat expiry reconciliation failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async cancel(input: CancellationInput): Promise<CancellationResult> {
-    const parsed = cancellationInputSchema.safeParse(input);
-    if (!parsed.success) return cancellationDenied(String(input?.reservation_id ?? 'invalid-reservation'), 'Cancellation request is invalid.');
-    const request = parsed.data;
-    const client = await this.pool.connect();
-    let affectedOperation = 'invalid-operation';
-    let affectedDigest = '0'.repeat(64);
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
-      const at = await wallClock(client);
-      const found = await client.query(
-        `SELECT reservation_id,operation_id,binding_digest_sha256,binding,budget_receipt_id,host_id,reserved_cost_usd,state,
-                (reserved_cost_usd IS NOT DISTINCT FROM (binding->>'requested_cost_usd')::numeric) AS cost_matches_binding
-         FROM swarm_authority_reservations
-         WHERE reservation_id=$1::uuid AND cancel_token_sha256=$2 FOR UPDATE`,
-        [request.reservation_id, createHash('sha256').update(request.cancel_token, 'utf8').digest('hex')],
-      );
-      const row = found.rows[0];
-      if (!row) {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('denied','invalid-operation',$1,$2::timestamptz,$3::jsonb)`,
-          ['0'.repeat(64), at, JSON.stringify({ reservation_id: request.reservation_id, blockers: ['Reservation does not exist.'] })],
-        );
-        await client.query('COMMIT');
-        return cancellationDenied(request.reservation_id, 'Reservation does not exist.');
-      }
-      affectedOperation = String(row.operation_id);
-      affectedDigest = String(row.binding_digest_sha256);
-      if (row.state === 'cancelled') {
-        await client.query('COMMIT');
-        return { cancelled: true, reservation_id: request.reservation_id, state: 'cancelled', already_terminal: true, released_cost_usd: 0, blockers: [] };
-      }
-      if (row.state === 'expired') {
-        await client.query('COMMIT');
-        return cancellationDenied(request.reservation_id, 'Reservation is already expired.', 'expired', true);
-      }
-      if (row.state === 'stop-requested') {
-        await client.query('COMMIT');
-        return cancellationDenied(
-          request.reservation_id,
-          'Stop was already requested; authenticated terminal evidence is required before resource release.',
-          'stop-requested',
-          true,
-        );
-      }
-      if (row.state === 'start-authorized-not-observed' || row.state === 'runner-claimed-not-started' || row.state === 'runner-start-observed') {
-        const stopped = await client.query(
-          `UPDATE swarm_authority_reservations SET state='stop-requested'
-           WHERE reservation_id=$1::uuid AND state IN ('start-authorized-not-observed','runner-claimed-not-started','runner-start-observed') RETURNING reservation_id`,
-          [request.reservation_id],
-        );
-        if (stopped.rows.length !== 1) throw new Error('Stop request lost its authority race.');
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('stop-requested',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, at, JSON.stringify({
-            reservation_id: request.reservation_id, reason: request.reason,
-            execution_state: 'unknown', released_cost_usd: 0,
-          })],
-        );
-        await client.query('COMMIT');
-        return cancellationDenied(
-          request.reservation_id,
-          'Start authority was already redeemed; authenticated terminal evidence is required before resource release.',
-          'stop-requested',
-        );
-      }
-      if (row.state !== 'reserved-not-started' && row.state !== 'consumed-not-started' && row.state !== 'leased-not-started') {
-        await client.query(
-          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-           VALUES ('denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-          [row.operation_id, row.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, blockers: ['Reservation state is invalid.'] })],
-        );
-        await client.query('COMMIT');
-        return cancellationDenied(request.reservation_id, 'Reservation state is invalid.');
-      }
-      const transitioned = await client.query(
-        `UPDATE swarm_authority_reservations SET state='cancelled'
-         WHERE reservation_id=$1::uuid AND state IN ('reserved-not-started','consumed-not-started','leased-not-started') RETURNING reservation_id`,
-        [request.reservation_id],
-      );
-      if (transitioned.rows.length !== 1) throw new Error('Cancellation lost its authority race.');
-      const released = await this.releaseResources(client, row);
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('reservation-cancelled',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [row.operation_id, row.binding_digest_sha256, at, JSON.stringify({ reservation_id: request.reservation_id, reason: request.reason, released_cost_usd: released })],
-      );
-      await client.query('COMMIT');
-      return { cancelled: true, reservation_id: request.reservation_id, state: 'cancelled', already_terminal: false, released_cost_usd: released, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      await this.recordIntegrityRefusal(client, affectedOperation, affectedDigest, {
-        action: 'cancel', reservation_id: request.reservation_id,
-        error: error instanceof Error ? error.message : 'unknown cancellation failure',
-      });
-      throw error;
-    } finally { client.release?.(); }
-  }
-
-  async reserve(request: AtomicAdmissionRequest): Promise<AdmissionResult> {
-    if (!Number.isInteger(request.max_host_evidence_age_ms) || request.max_host_evidence_age_ms < 1_000 || request.max_host_evidence_age_ms > 60 * 60_000) {
-      throw new Error('Host evidence age ceiling must be between 1 second and 1 hour.');
-    }
-    const client = await this.pool.connect();
-    let auditAt = request.now;
-    const deny = async (blocker: string) => {
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('denied',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.binding.operation_id, request.binding_digest_sha256, auditAt, JSON.stringify({ blockers: [blocker] })],
-      );
-      await client.query('COMMIT');
-      return denial(blocker);
-    };
-    try {
-      await client.query('BEGIN');
-      if (!await lockAuthority(client)) {
-        return await deny('Authority serialization control row is missing or ambiguous.');
-      }
-      const transactionNow = await wallClock(client);
-      auditAt = transactionNow;
-      const transactionNowMs = Date.parse(transactionNow);
-      const refs = [
-        `receipt:${request.approval.receipt_id}`, `receipt:${request.budget.receipt_id}`,
-        `key:${request.approval.issuer}:${request.approval.key_id}`, `key:${request.budget.issuer}:${request.budget.key_id}`,
-        `issuer:${request.approval.issuer}`, `issuer:${request.budget.issuer}`,
-        `operation:${request.binding.operation_id}`, `effect:${request.binding.effect_id}`,
-      ];
-      const revoked = await client.query('SELECT ref FROM swarm_authority_revocations WHERE ref = ANY($1::text[]) LIMIT 1', [refs]);
-      if (revoked.rows.length) return await deny('An authority receipt, issuer or signing key is revoked.');
-      if (Date.parse(request.approval.expires_at) <= transactionNowMs || Date.parse(request.budget.expires_at) <= transactionNowMs) {
-        return await deny('An authority receipt expired before the reservation transaction.');
-      }
-      if (Date.parse(request.reservation_expires_at) <= transactionNowMs) return await deny('Reservation expiry elapsed before it could be issued.');
-
-      const preparedRow = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
-        [request.binding.operation_id],
-      );
-      if (!preparedRow.rows[0]) return await deny('Server-owned prepared operation is missing.');
-      if (preparedRow.rows[0].state !== 'ready') return await deny('Server-owned prepared operation is cancelled.');
-      if (preparedRow.rows[0].binding_digest_sha256 !== request.binding_digest_sha256) {
-        return await deny('Prepared operation digest does not match the signed operation binding.');
-      }
-
-      const hostRow = await client.query(
-        'SELECT evidence,capacity_slots,reserved_slots,authorized_slots FROM swarm_authority_hosts WHERE host_id=$1 FOR UPDATE',
-        [request.binding.host_id],
-      );
-      const host = hostEvidence(hostRow.rows[0]);
-      if (!host) return await deny('Trusted host evidence is missing.');
-      if (host.host_id !== request.binding.host_id) return await deny('Trusted host evidence identity does not match the requested host.');
-      const nowMs = transactionNowMs;
-      if (host.status !== 'ready') return await deny('Trusted host is not ready.');
-      if (nowMs - Date.parse(host.observed_at) > request.max_host_evidence_age_ms || Date.parse(host.observed_at) > nowMs + 60_000) return await deny('Trusted host evidence is stale or from the future.');
-      if (!host.secret_readiness) return await deny('Trusted host secrets are not ready.');
-      if (Date.parse(host.access_review_expires_at) <= nowMs) return await deny('Trusted host access review is expired.');
-      const capacitySlots = Number(hostRow.rows[0]?.capacity_slots);
-      const reservedSlots = Number(hostRow.rows[0]?.reserved_slots);
-      const authorizedSlots = Number(hostRow.rows[0]?.authorized_slots);
-      if (!Number.isSafeInteger(capacitySlots) || !Number.isSafeInteger(reservedSlots)
-        || !Number.isSafeInteger(authorizedSlots) || capacitySlots < 0 || reservedSlots < 0 || authorizedSlots < 0) {
-        return await deny('Trusted host capacity ledger is invalid.');
-      }
-      if (host.capacity_slots !== capacitySlots) return await deny('Trusted host capacity evidence and ledger differ.');
-      if (capacitySlots - reservedSlots - authorizedSlots < 1) return await deny('Trusted host has no available capacity.');
-      const hostCaps = new Set(host.allowed_capabilities);
-      if (request.binding.capabilities.some((item) => !hostCaps.has(item))) return await deny('Trusted host does not allow every requested capability.');
-
-      const budgetRow = await client.query(
-        `SELECT hard_limit_usd,reserved_usd,committed_usd,
-                (reserved_usd+committed_usd+$2::numeric <= hard_limit_usd) AS can_reserve
-         FROM swarm_authority_budgets WHERE receipt_id=$1 FOR UPDATE`,
-        [request.budget.receipt_id, request.binding.requested_cost_usd],
-      );
-      if (!budgetRow.rows[0]) return await deny('Durable budget registry entry is missing.');
-      const registeredLimit = Number(budgetRow.rows[0].hard_limit_usd);
-      const reserved = Number(budgetRow.rows[0].reserved_usd);
-      if (registeredLimit !== request.budget.hard_limit_usd) return await deny('Signed and durable budget ceilings differ.');
-      if (!Number.isFinite(reserved) || budgetRow.rows[0].can_reserve !== true) return await deny('Durable budget is exhausted.');
-
-      const aggregateRows = await client.query(
-        `SELECT window_id,policy_id,kind,starts_at,ends_at,currency,hard_limit_usd,reserved_usd,committed_usd,
-                (reserved_usd+committed_usd+$3::numeric <= hard_limit_usd) AS can_reserve
-         FROM swarm_authority_budget_windows
-         WHERE policy_id=$1 AND starts_at <= $2::timestamptz AND ends_at > $2::timestamptz
-         ORDER BY kind FOR UPDATE`,
-        [request.binding.budget_policy_id, transactionNow, request.binding.requested_cost_usd],
-      );
-      const kinds = new Set(aggregateRows.rows.map((row) => row.kind));
-      if (aggregateRows.rows.length !== 2 || kinds.size !== 2 || !kinds.has('policy') || !kinds.has('daily')) {
-        return await deny('Exactly one active policy and daily aggregate budget window are required.');
-      }
-      if (aggregateRows.rows.some((row) => row.currency !== 'USD')) return await deny('Aggregate budget currency must be USD.');
-      if (aggregateRows.rows.some((row) => Date.parse(request.reservation_expires_at) > Date.parse(String(row.ends_at)))) {
-        return await deny('Reservation expiry crosses an aggregate budget window boundary.');
-      }
-      if (aggregateRows.rows.some((row) => row.can_reserve !== true)) return await deny('Aggregate budget window is exhausted.');
-      const selectedWindows: BudgetWindowEvidence[] = aggregateRows.rows.map((row) => ({
-        window_id: String(row.window_id), kind: row.kind as 'policy' | 'daily',
-        starts_at: sqlInstant(row.starts_at), ends_at: sqlInstant(row.ends_at), currency: 'USD',
-      }));
-
-      const inserted = await client.query(
-        `INSERT INTO swarm_authority_reservations
-         (reservation_id,operation_id,effect_id,binding_digest_sha256,binding,binding_database_sha256,revocation_refs,
-          consume_token_sha256,cancel_token_sha256,approval_receipt_id,budget_receipt_id,host_id,reserved_cost_usd,reserved_at,
-          reservation_expires_at,max_host_evidence_age_ms,state)
-         VALUES ($1::uuid,$2,$3,$4,$5::jsonb,
-          encode(sha256(convert_to($5::jsonb::text,'UTF8')),'hex'),
-          $6::jsonb,$7,$8,$9,$10,$11,$12,$13::timestamptz,$14::timestamptz,$15,'reserved-not-started')
-         ON CONFLICT DO NOTHING RETURNING *`,
-        [request.reservation_id, request.binding.operation_id, request.binding.effect_id, request.binding_digest_sha256,
-          JSON.stringify(request.binding), JSON.stringify(refs), request.consume_token_sha256, request.cancel_token_sha256,
-          request.approval.receipt_id, request.budget.receipt_id, request.binding.host_id,
-          request.binding.requested_cost_usd, transactionNow, request.reservation_expires_at,
-          request.max_host_evidence_age_ms],
-      );
-      if (!inserted.rows[0]) return await deny('Operation or external effect was already reserved.');
-      for (const window of selectedWindows) {
-        await client.query(
-          `INSERT INTO swarm_authority_budget_holds (reservation_id,window_id,reserved_cost_usd)
-           VALUES ($1::uuid,$2,$3)`,
-          [request.reservation_id, window.window_id, request.binding.requested_cost_usd],
-        );
-        const aggregateUpdate = await client.query(
-          `UPDATE swarm_authority_budget_windows SET reserved_usd=reserved_usd+$2
-           WHERE window_id=$1 AND reserved_usd+committed_usd+$2 <= hard_limit_usd RETURNING reserved_usd`,
-          [window.window_id, request.binding.requested_cost_usd],
-        );
-        if (aggregateUpdate.rows.length !== 1) throw new Error('Aggregate budget reservation lost its authority race.');
-      }
-      await client.query('UPDATE swarm_authority_budgets SET reserved_usd=reserved_usd+$2 WHERE receipt_id=$1', [request.budget.receipt_id, request.binding.requested_cost_usd]);
-      await client.query('UPDATE swarm_authority_hosts SET reserved_slots=reserved_slots+1 WHERE host_id=$1', [host.host_id]);
-      const reservation: AdmissionReservation = {
-        schema_version: 'starlight.operation_admission.v1', reservation_id: request.reservation_id,
-        operation_id: request.binding.operation_id, effect_id: request.binding.effect_id,
-        binding_digest_sha256: request.binding_digest_sha256, approval_receipt_id: request.approval.receipt_id,
-        budget_receipt_id: request.budget.receipt_id, budget_policy_id: request.binding.budget_policy_id,
-        budget_windows: selectedWindows,
-        host_id: request.binding.host_id,
-        reserved_cost_usd: request.binding.requested_cost_usd, reserved_at: transactionNow,
-        reservation_expires_at: request.reservation_expires_at,
-        consume_token: request.consume_token,
-        cancel_token: request.cancel_token,
-        state: 'reserved-not-started',
-      };
-      const { consume_token: _consumeToken, cancel_token: _cancelToken, ...reservationAudit } = reservation;
-      await client.query(
-        `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-         VALUES ('reserved',$1,$2,$3::timestamptz,$4::jsonb)`,
-        [request.binding.operation_id, request.binding_digest_sha256, transactionNow, JSON.stringify(reservationAudit)],
-      );
-      await client.query('COMMIT');
-      return { admitted: true, reservation, blockers: [] };
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally { client.release?.(); }
-  }
-}
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×N»ß´èµ©hºÚn¶X§zÍZ[\ÜÈÜ™X]R\Ú˜[™ÛUURQHœ›ÛH	Û›ÙN˜Ü\ÉÎÂ‚š[\ÜÂˆØ[˜Ù[][Û’[œ]ØÚ[XKˆÛÛœİ[\[Û’[œ]ØÚ[XKˆÜ\˜][Ûš[™[™ÔØÚ[XKˆ[›™\ÛZ[R[œ]ØÚ[XKˆ[›™\’X\™X]^\R[œ]ØÚ[XKˆ[›™\’X\™X][œ]ØÚ[XKˆ[›™\“İ]ÛÛYR[œ]ØÚ[XKˆ[›™\•\ØYÙQ]šY[˜ÙR[œ]ØÚ[XKˆ[›™\”İ\ØœÙ\˜][Û’[œ]ØÚ[XKˆİ\X\ÙR[œ]ØÚ[XKˆİ\™Y[\[Û’[œ]ØÚ[XKŸHœ›ÛH	Ë‹ÛÜ\˜][Û‹X]]Üš]IÎÂš[\ÜÈÚLM‘YÙ\İHœ›ÛH	Ë‹Ü[[YKYYÙ\İ	ÎÂš[\ÜÈTĞQÑWĞUUÔ’UWÔ“ÕUS‘WÔÔSHœ›ÛH	Ë‹İ\ØYÙKX]]Üš]K\›İ][™\ÉÎÂš[\ÜÈ‘SSÕWÔÕÔĞUUÔ’UWÔ“ÕUS‘WÔÔSHœ›ÛH	Ë‹Ü™[[İK\İÜX]]Üš]K\›İ][™\ÉÎÂš[\ÜÈ‘SSÕWÔÕÔÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMˆHœ›ÛH	Ë‹Ü™[[İK\İÜX]]Üš]K\›İ][™\ÉÎÂš[\ÜÂˆ\ÜÙ\ÜÔ™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛ™›Ü›X[˜ÙKˆ™[[İTİÜ™\]Y\İØÚ[XKˆ™[[İTİÜš[˜Ú\[]šY[˜ÙTØÚ[XKˆ\H™[[İTİÜXÚÛ›İÛYÙ[Y[ˆ\H™[[İTİÜXÚÛ›İÛYÙ[Y[]\İ][Û‹ˆ\H™[[İTİÜXÚÛ›İÛYÙ[Y[\œÚ\İ[˜ÙT™\İ[ˆ\H™[[İTİÜš[˜Ú\[]šY[˜ÙKˆ\H™[[İTİÜ™\]Y\İŸHœ›ÛH	Ë‹Ü™[[İK\İÜXÛÛ™›Ü›X[˜ÙIÎÂš[\ÜÂˆ]\İœ›ÚÙ\‘]X˜\ÙTÙ\ÜÚ[Û‹ˆ]\İ™[[İTİÜ]X˜\ÙTÙ\ÜÚ[Û‹ˆ]\İ\ØYÙQ]šY[˜ÙQ]X˜\ÙTÙ\ÜÚ[Û‹ˆ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‹ˆ\Hœ›ÚÙ\‘]X˜\ÙTÙ\ÜÚ[Û]\İÜ‹ˆ\H™[[İTİÜ]X˜\ÙTÙ\ÜÚ[Û]\İÜ‹ˆ\H\ØYÙQ]šY[˜ÙQ]X˜\ÙTÙ\ÜÚ[Û]\İÜ‹ŸHœ›ÛH	Ë‹Ø]]Üš]K\›ÛKXÛÛ˜Xİ	ÎÂš[\Ü\HÂˆYZ\ÜÚ[Û”™\Ù\˜][Û‹ˆYZ\ÜÚ[Û”™\İ[ˆ]ÛZXĞYZ\ÜÚ[Û”™\]Y\İˆYÙ]Ú[™İÑ]šY[˜ÙKˆØ[˜Ù[][Û’[œ]ˆØ[˜Ù[][Û”™\İ[ˆÛÛœİ[\[Û’[œ]ˆÛÛœİ[\[Û”™XÙZ\ˆÛÛœİ[\[Û”™\İ[ˆÜ\˜][Û]]Üš]TİÜ™Kˆ[›™\ÛZ[R[œ]ˆ[›™\ÛZ[T™XÙZ\ˆ[›™\ÛZ[T™\İ[ˆ[›™\’X\™X][œ]ˆ[›™\’X\™X]^\R[œ]ˆ[›™\’X\™X]^\T™\İ[ˆ[›™\’X\™X]™XÙZ\ˆ[›™\’X\™X]™\İ[ˆ[›™\“İ]ÛÛYR[œ]ˆ[›™\“İ]ÛÛYT™XÙZ\ˆ[›™\“İ]ÛÛYT™\İ[ˆ[›™\•\ØYÙQ]šY[˜ÙR[œ]ˆ[›™\•\ØYÙQ]šY[˜ÙT™XÙZ\ˆ[›™\•\ØYÙQ]šY[˜ÙT™\İ[ˆ[›™\”İ\ØœÙ\˜][Û’[œ]ˆ[›™\”İ\ØœÙ\˜][Û”™XÙZ\ˆ[›™\”İ\ØœÙ\˜][Û”™\İ[ˆİ\X\ÙR[œ]ˆİ\X\ÙT™XÙZ\ˆİ\X\ÙT™\İ[ˆİ\™Y[\[Û’[œ]ˆİ\™Y[\[Û”™XÙZ\ˆİ\™Y[\[Û”™\İ[ˆ\İYÜİ]šY[˜ÙKŸHœ›ÛH	Ë‹ÛÜ\˜][Û‹X]]Üš]IÎÂš[\ÜÈˆHœ›ÛH	Ş›Ù	ÎÂ‚˜ÛÛœİÛÛ›ÛYH‹œİš[™Ê
+K›Z[ŠÊK›X^
+MŒ
+Kœ™YÙ^
+×–ĞKV˜K^ŒNWVĞKV˜K^ŒNK—Î‹WJ‰ÊNÂ˜ÛÛœİÛÛ›Û[YHH‹š\ÛË™]][YJÈÙ™œÙ]ˆYHJNÂ˜ÛÛœİYÙ]Ú[™İÔØÚ[XHH‹›Øš™Xİ
+ÂˆÚ[™İ×ÚYˆÛÛ›ÛYˆÛXŞWÚYˆÛÛ›ÛYˆÚ[™ˆ‹™[[JÉÜÛXŞIË	ÙZ[I×JKˆİ\×Ø]ˆÛÛ›Û[YKˆ[™×Ø]ˆÛÛ›Û[YKˆİ\œ™[˜ŞNˆ‹›]\˜[
+	ÕTÑ	ÊKˆ\™Û[Z]İ\Ùˆ‹›[X™\Š
+K™š[š]J
+K››Û›™YØ]]™J
+K›X^
+LÌÌ
+KŸJKœİšXİ
+
+Kœ™Yš[™J
+˜[YJHOˆ]Kœ\œÙJ˜[YKœİ\×Ø]
+H]Kœ\œÙJ˜[YK™[™×Ø]
+KÂˆY\ÜØYÙNˆ	ĞYÙ]Ú[™İÈ]\İ[™Y\ˆ]İ\Ë‰Ë]ˆÉÙ[™×Ø]	×KŸJNÂ™^Ü\HYÙ]Ú[™İÔ™YÚ\İ˜][Û”™\İ[BˆÈ™YÚ\İ\™YˆYNÈ[™XYWÜ™YÚ\İ\™Yˆ›ÛÛX[È›ØÚÙ\œÎˆ×HBˆÈ™YÚ\İ\™Yˆ˜[ÙNÈ[™XYWÜ™YÚ\İ\™Yˆ˜[ÙNÈ›ØÚÙ\œÎˆİš[™Ö×HNÂ˜ÛÛœİ™]›ØØ][Û”™YœÔØÚ[XHH‹˜\œ˜^J‹œİš[™Ê
+K›Z[ŠJK›X^
+L
+JK›Z[ŠJK›X^
+LŠNÂ˜ÛÛœİÜİ]šY[˜ÙTØÚ[XHH‹›Øš™Xİ
+ÂˆÜİÚYˆÛÛ›ÛYˆØœÙ\™YØ]ˆÛÛ›Û[YKˆİ]\Îˆ‹™[[JÉÜ™XYIË	ÙYÜ˜YY	Ë	ÛÙ™›[™I×JKˆØ\XÚ]WÜÛİÎˆ‹›[X™\Š
+Kš[
+
+K››Û›™YØ]]™J
+K›X^
+LÌ
+KˆÙXÜ™]Ü™XY[™\ÜÎˆ‹˜›ÛÛX[Š
+KˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKˆ[İÙYØØ\Xš[]Y\Îˆ‹˜\œ˜^J‹œİš[™Ê
+K›Z[ŠÊK›X^
+MŒ
+Kœ™YÙ^
+×–ØK^ŒNWVØK^ŒNK—Î‹WJ‰ÊJK›X^
+
+KŸJKœİšXİ
+
+Kœİ\\”™Yš[™J
+˜[YKÛÛ^
+HOˆÂˆYˆ
+™]ÈÙ]
+˜[YK˜[İÙYØØ\Xš[]Y\ÊKœÚ^™HOOH˜[YK˜[İÙYØØ\Xš[]Y\Ë›[™İ
+HÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉØ[İÙYØØ\Xš[]Y\É×KY\ÜØYÙNˆ	ÒÜİØ\Xš[]Y\È]\İ™H[š\]YK‰ÈJNÂˆBŸJNÂ‚˜ÛÛœİ]X˜\ÙT›ÛHH‹œİš[™Ê
+K›Z[ŠÊK›X^
+ŒÊKœ™YÙ^
+×–ØK^—VØK^ŒNW×J‰ÊNÂ˜ÛÛœİ]X˜\ÙS˜[YHH‹œİš[™Ê
+K›Z[ŠJK›X^
+ŒÊKœ™YÙ^
+×–ĞKV˜K^ŒNWË‹WJÉÊNÂ™^ÜÛÛœİœ›ÚÙ\”š[˜Ú\[]šY[˜ÙTØÚ[XHH‹›Øš™Xİ
+ÂˆØÚ[XWİ™\œÚ[Ûˆ‹›]\˜[
+	Üİ\›YÚ˜œ›ÚÙ\—Üš[˜Ú\[Ù]šY[˜ÙKŒIÊKˆ]X˜\ÙWÜ›ÛNˆ]X˜\ÙT›ÛKˆ]X˜\ÙWÛ˜[YNˆ]X˜\ÙS˜[YKˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]NˆÛÛ›ÛYˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ]]—ÚÚ[™ˆ‹›]\˜[
+	ÜÜİÜ™\Ë\Ù\ÜÚ[Û‹\›ÛIÊKˆ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆ‹›]\˜[
+”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŠKˆØœÙ\™YØ]ˆÛÛ›Û[YKˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKˆİ]Nˆ‹™[[JÉÜ™XYIË	Ù\ØX›Y	×JKŸJKœİšXİ
+
+Kœ™Yš[™J
+˜[YJHOˆ]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+H]Kœ\œÙJ˜[YK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+KÂˆY\ÜØYÙNˆ	Ğœ›ÚÙ\ˆXØÙ\ÜÈ™]šY]È]\İ^\™HY\ˆ]šY[˜ÙHØœÙ\˜][Û‹‰Ë]ˆÉØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]	×KŸJNÂ™^Ü\H\İYœ›ÚÙ\”š[˜Ú\[]šY[˜ÙHH‹š[™™\\[Ùˆœ›ÚÙ\”š[˜Ú\[]šY[˜ÙTØÚ[XOÂ‚™^Ü[\™˜XÙH]\İY[›™\”Ù\ÜÚ[ÛˆÂˆ[›™\—ÚYˆİš[™ÎÂˆ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Yˆİš[™ÎÂˆ[›™\—Ú[œİ[˜ÙWÚYˆİš[™ÎÂˆ[[YWÚYˆİš[™ÎÂˆÜİÚYˆİš[™ÎÂˆÚ[›™[Øš[™[™×ÜÚLMˆİš[™ÎÂˆ][˜ÚØ][\ÚYˆİš[™ÎÂˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ[X™\ÂˆØœÙ\™YØ]ˆİš[™ÎÂˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆİš[™ÎÂŸB‚˜ÛÛœİ[›™\”Ù\ÜÚ[Û”ØÚ[XHH‹›Øš™Xİ
+Âˆ[›™\—ÚYˆÛÛ›ÛYˆ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ[›™\—Ú[œİ[˜ÙWÚYˆÛÛ›ÛYˆ[[YWÚYˆÛÛ›ÛYˆÜİÚYˆÛÛ›ÛYˆÚ[›™[Øš[™[™×ÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ][˜ÚØ][\ÚYˆÛÛ›ÛYˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ‹›[X™\Š
+Kš[
+
+K›Z[ŠJK›X^
+WÌÌÌ
+KˆØœÙ\™YØ]ˆÛÛ›Û[YKˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKŸJKœİšXİ
+
+Kœ™Yš[™J
+˜[YJHOˆ]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+H]Kœ\œÙJ˜[YK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+KÂˆY\ÜØYÙNˆ	Ô[›™\ˆXØÙ\ÜÈ™]šY]È]\İ^\™HY\ˆ]šY[˜ÙHØœÙ\˜][Û‹‰Ë]ˆÉØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]	×KŸJNÂ‚™^Ü\H[›™\”Ù\ÜÚ[Û]\İ][ÛˆBˆÈ˜[YˆYNÈÙ\ÜÚ[Ûˆ]\İY[›™\”Ù\ÜÚ[ÛÈ›ØÚÙ\œÎˆ×HBˆÈ˜[Yˆ˜[ÙNÈÙ\ÜÚ[Ûˆ[È›ØÚÙ\œÎˆİš[™Ö×HNÂ‚™^Ü\H[›™\”Ù\ÜÚ[Û]\İÜˆH
+ÛY[ˆ]]Üš]TÜ[ÛY[
+HOˆ›ÛZ\ÙO[›™\”Ù\ÜÚ[Û]\İ][ÛÂ‚˜ÛÛœİ[U[˜ÛÛ™šYİ\™Y[›™\”Ù\ÜÚ[Ûˆ[›™\”Ù\ÜÚ[Û]\İÜˆH\Ş[˜È
+
+HOˆ
+Âˆ˜[Yˆ˜[ÙKˆÙ\ÜÚ[Ûˆ[ˆ›ØÚÙ\œÎˆÉÔ[›™\ˆ˜[œÜÜ]\İÜˆ\È›İÛÛ™šYİ\™Y‰×KŸJNÂ‚™^ÜÛÛœİ[›™\”İ\]šY[˜ÙTØÚ[XHH‹›Øš™Xİ
+ÂˆØÚ[XWİ™\œÚ[Ûˆ‹›]\˜[
+	Üİ\›YÚœ[›™\—Üİ\Ù]šY[˜ÙKŒIÊKˆ™\Ù\˜][Û—ÚYˆ‹]ZY
+
+KˆÛZ[WÚYˆ‹]ZY
+
+KˆÜ\˜][Û—ÚYˆÛÛ›ÛYˆY™™XİÚYˆÛÛ›ÛYˆš[™[™×ÙYÙ\İÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ[›™\—ÚYˆÛÛ›ÛYˆ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ[›™\—Ú[œİ[˜ÙWÚYˆÛÛ›ÛYˆ[[YWÚYˆÛÛ›ÛYˆÜİÚYˆÛÛ›ÛYˆÚ[›™[Øš[™[™×ÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ][˜ÚØ][\ÚYˆÛÛ›ÛYˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ‹›[X™\Š
+Kš[
+
+K›Z[ŠJK›X^
+WÌÌÌ
+Kˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ]šY[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ›ØÙ\Ü×Üİ\YØ]ˆÛÛ›Û[YKˆØœÙ\™YØ]ˆÛÛ›Û[YKˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKˆİ]Nˆ‹›]\˜[
+	Üİ\[ØœÙ\™Y	ÊKŸJKœİšXİ
+
+Kœİ\\”™Yš[™J
+˜[YKÛÛ^
+HOˆÂˆYˆ
+]Kœ\œÙJ˜[YKœ›ØÙ\Ü×Üİ\YØ]
+Hˆ]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+JHÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉÜ›ØÙ\Ü×Üİ\YØ]	×KY\ÜØYÙNˆ	Ô›ØÙ\ÜÈİ\Ø[››İ›ÛİÈ]ÈØœÙ\˜][Û‹‰ÈJNÂˆBˆYˆ
+]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+HH]Kœ\œÙJ˜[YK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+JHÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]	×KY\ÜØYÙNˆ	Ôİ\Y]šY[˜ÙHXØÙ\ÜÈ™]šY]È]\İ™[XZ[ˆ]™HY\ˆØœÙ\˜][Û‹‰ÈJNÂˆBŸJNÂ‚™^Ü\H[›™\”İ\]šY[˜ÙHH‹š[™™\\[Ùˆ[›™\”İ\]šY[˜ÙTØÚ[XOÂ™^Ü\H[›™\”İ\]šY[˜ÙP]\İ][ÛˆBˆÈ˜[YˆYNÈ]šY[˜ÙNˆ[›™\”İ\]šY[˜ÙNÈ›ØÚÙ\œÎˆ×HBˆÈ˜[Yˆ˜[ÙNÈ]šY[˜ÙNˆ[È›ØÚÙ\œÎˆİš[™Ö×HNÂ™^Ü\H[›™\”İ\]šY[˜ÙP]\İÜˆH
+ÛY[ˆ]]Üš]TÜ[ÛY[
+HOˆ›ÛZ\ÙO[›™\”İ\]šY[˜ÙP]\İ][ÛÂ‚˜ÛÛœİ[U[˜ÛÛ™šYİ\™Y[›™\”İ\]šY[˜ÙNˆ[›™\”İ\]šY[˜ÙP]\İÜˆH\Ş[˜È
+
+HOˆ
+Âˆ˜[Yˆ˜[ÙKˆ]šY[˜ÙNˆ[ˆ›ØÚÙ\œÎˆÉÔ[›™\ˆİ\Y]šY[˜ÙH]\İÜˆ\È›İÛÛ™šYİ\™Y‰×KŸJNÂ‚˜ÛÛœİ[›™\“İ]ÛÛYPÛÛ[[ÛˆHÂˆØÚ[XWİ™\œÚ[Ûˆ‹›]\˜[
+	Üİ\›YÚœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙKŒIÊKˆİ]ÛÛYWÙ]™[ÚYˆ‹]ZY
+
+Kˆ™\Ù\˜][Û—ÚYˆ‹]ZY
+
+KˆÛZ[WÚYˆ‹]ZY
+
+KˆÜ\˜][Û—ÚYˆÛÛ›ÛYˆY™™XİÚYˆÛÛ›ÛYˆš[™[™×ÙYÙ\İÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ[›™\—ÚYˆÛÛ›ÛYˆ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ[›™\—Ú[œİ[˜ÙWÚYˆÛÛ›ÛYˆ[[YWÚYˆÛÛ›ÛYˆÜİÚYˆÛÛ›ÛYˆÚ[›™[Øš[™[™×ÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ][˜ÚØ][\ÚYˆÛÛ›ÛYˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ‹›[X™\Š
+Kš[
+
+K›Z[ŠJK›X^
+WÌÌÌ
+Kˆ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ]šY[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆİ]ÛÛYWØ]ˆÛÛ›Û[YKˆØœÙ\™YØ]ˆÛÛ›Û[YKˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKˆ™\İ\Ù™[˜ÙYˆ‹›]\˜[
+YJKˆ][˜ÚÜ]Y]YWØÛÜÙYˆ‹›]\˜[
+YJKˆ\ØÙ[™[×Ü]ZY\ØÙYˆ‹›]\˜[
+YJKˆ™[[İWÜİÜØÛÛ™š\›YYˆ‹˜›ÛÛX[Š
+KŸNÂ‚™^ÜÛÛœİ[›™\“İ]ÛÛYQ]šY[˜ÙTØÚ[XHH‹™\ØÜš[Z[˜]Y[š[ÛŠ	Ûİ]ÛÛYWÚÚ[™	ËÂˆ‹›Øš™Xİ
+Âˆ‹‹œ[›™\“İ]ÛÛYPÛÛ[[Û‹ˆİ]ÛÛYWÚÚ[™ˆ‹›]\˜[
+	Û™]™\‹\İ\Y	ÊKˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ‹›[
+
+Kˆİ\ÛØœÙ\˜][Û—ÚYˆ‹›[
+
+Kˆİ\Ù]šY[˜ÙWÜ™Yˆ‹›[
+
+Kˆİ\Ù]šY[˜ÙWÜÚLMˆ‹›[
+
+Kˆ›ØÙ\Ü×Üİ\YØ]ˆ‹›[
+
+Kˆ^]Ù\ÜÜÚ][Ûˆ‹›[
+
+KˆJKœİšXİ
+
+Kˆ‹›Øš™Xİ
+Âˆ‹‹œ[›™\“İ]ÛÛYPÛÛ[[Û‹ˆİ]ÛÛYWÚÚ[™ˆ‹›]\˜[
+	Ü›ØÙ\ÜË]\›Z[˜[	ÊKˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆİ\ÛØœÙ\˜][Û—ÚYˆ‹]ZY
+
+Kˆİ\Ù]šY[˜ÙWÜ™YˆÛÛ›ÛYˆİ\Ù]šY[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ›ØÙ\Ü×Üİ\YØ]ˆÛÛ›Û[YKˆ^]Ù\ÜÜÚ][Ûˆ‹™[[JÉÙ^]Y^™\›ÉË	Ù^]Y[›Û™\›ÉË	ÜÚYÛ˜[	Ë	Üİ\\š\ÛÜ‹ZÚ[Y	Ë	İ[šÛ›İÛ‰×JKˆJKœİšXİ
+
+K—JKœİ\\”™Yš[™J
+˜[YKÛÛ^
+HOˆÂˆYˆ
+]Kœ\œÙJ˜[YK›İ]ÛÛYWØ]
+Hˆ]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+JHÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉÛİ]ÛÛYWØ]	×KY\ÜØYÙNˆ	Ô[›™\ˆİ]ÛÛYHØ[››İ›ÛİÈ]ÈØœÙ\˜][Û‹‰ÈJNÂˆBˆYˆ
+]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+HH]Kœ\œÙJ˜[YK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+JHÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]	×KY\ÜØYÙNˆ	Óİ]ÛÛYKY]šY[˜ÙHXØÙ\ÜÈ™]šY]È]\İ™[XZ[ˆ]™HY\ˆØœÙ\˜][Û‹‰ÈJNÂˆBŸJNÂ‚™^Ü\H[›™\“İ]ÛÛYQ]šY[˜ÙHH‹š[™™\\[Ùˆ[›™\“İ]ÛÛYQ]šY[˜ÙTØÚ[XOÂ™^Ü\H[›™\“İ]ÛÛYQ]šY[˜ÙP]\İ][ÛˆBˆÈ˜[YˆYNÈ]šY[˜ÙNˆ[›™\“İ]ÛÛYQ]šY[˜ÙNÈ›ØÚÙ\œÎˆ×HBˆÈ˜[Yˆ˜[ÙNÈ]šY[˜ÙNˆ[È›ØÚÙ\œÎˆİš[™Ö×HNÂ™^Ü\H[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜˆH
+ÛY[ˆ]]Üš]TÜ[ÛY[
+HOˆ›ÛZ\ÙO[›™\“İ]ÛÛYQ]šY[˜ÙP]\İ][ÛÂ‚˜ÛÛœİ[U[˜ÛÛ™šYİ\™Y[›™\“İ]ÛÛYQ]šY[˜ÙNˆ[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜˆH\Ş[˜È
+
+HOˆ
+Âˆ˜[Yˆ˜[ÙKˆ]šY[˜ÙNˆ[ˆ›ØÚÙ\œÎˆÉÔ[›™\ˆİ]ÛÛYKY]šY[˜ÙH]\İÜˆ\È›İÛÛ™šYİ\™Y‰×KŸJNÂ‚˜ÛÛœİ^Xİ\ÙH‹œİš[™Ê
+Kœ™YÙ^
+×ŠÌKNWVÌNW^ÌßJW–ÌNW^ÍŸIÊNÂ˜ÛÛœİ^Xİ›İšY\•\ÙŒˆH‹œİš[™Ê
+Kœ™YÙ^
+×ŠÌKNWVÌNW^ÌßJW–ÌNW^ÌLŸIÊNÂ˜ÛÛœİ[›™\•\ØYÙQ]šY[˜ÙP˜\ÙTØÚ[XHH‹›Øš™Xİ
+Âˆ›İšY\—Ù]™[ÚYˆ‹]ZY
+
+Kˆ™\Ù\˜][Û—ÚYˆ‹]ZY
+
+KˆÛZ[WÚYˆ‹]ZY
+
+Kˆİ]ÛÛYWÚYˆ‹]ZY
+
+KˆÜ\˜][Û—ÚYˆÛÛ›ÛYˆY™™XİÚYˆÛÛ›ÛYˆš[™[™×ÙYÙ\İÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ[›™\—ÚYˆÛÛ›ÛYˆ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ[›™\—Ú[œİ[˜ÙWÚYˆÛÛ›ÛYˆ[[YWÚYˆÛÛ›ÛYˆÜİÚYˆÛÛ›ÛYˆÚ[›™[Øš[™[™×ÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ][˜ÚØ][\ÚYˆÛÛ›ÛYˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ‹›[X™\Š
+Kš[
+
+K›Z[ŠJK›X^
+WÌÌÌ
+Kˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊK›[X›J
+Kˆ›İšY\—ÚYˆÛÛ›ÛYˆ›İšY\—ØXØÛİ[Ü™YˆÛÛ›ÛYˆ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYˆÛÛ›ÛYˆY]\—ÚYˆÛÛ›ÛYˆ]šY[˜ÙWÜ™YˆÛÛ›ÛYˆ]šY[˜ÙWÜÚLMˆ‹œİš[™Ê
+Kœ™YÙ^
+×–ØKYŒNW^ÍIÊKˆ\ØYÙWÜİ\YØ]ˆÛÛ›Û[YKˆ\ØYÙWÙ[™YØ]ˆÛÛ›Û[YKˆİ][Y[Üİ]\Îˆ‹™[[JÉÜ›İš\Ú[Û˜[	Ë	Ùš[˜[	×JKˆİ][Y[Ùš[˜[^™YØ]ˆÛÛ›Û[YK›[X›J
+KˆØœÙ\™YØ]ˆÛÛ›Û[YKˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆÛÛ›Û[YKˆİ\œ™[˜ŞNˆ‹›]\˜[
+	ÕTÑ	ÊKˆ]]—ÚÚ[™ˆ‹›]\˜[
+	Ü›İšY\‹\ÚYÛ™Y\İ][Y[	ÊKˆ\ÜİY\ˆÛÛ›ÛYˆÙ^WÚYˆÛÛ›ÛYŸJKœİšXİ
+
+NÂ™^ÜÛÛœİ[›™\•\ØYÙQ]šY[˜ÙTØÚ[XHH‹™\ØÜš[Z[˜]Y[š[ÛŠ	ÜØÚ[XWİ™\œÚ[Û‰ËÂˆ[›™\•\ØYÙQ]šY[˜ÙP˜\ÙTØÚ[XK™^[™
+ÂˆØÚ[XWİ™\œÚ[Ûˆ‹›]\˜[
+	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÊKˆİ[][]]™WØÛÜİİ\Ùˆ^Xİ\ÙˆJKˆ[›™\•\ØYÙQ]šY[˜ÙP˜\ÙTØÚ[XK™^[™
+ÂˆØÚ[XWİ™\œÚ[Ûˆ‹›]\˜[
+	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ÊKˆİ[][]]™WØÛÜİİ\Ùˆ^Xİ›İšY\•\ÙŒ‹ˆJK—JKœİ\\”™Yš[™J
+˜[YKÛÛ^
+HOˆÂˆÛÛœİİ\YH]Kœ\œÙJ˜[YK\ØYÙWÜİ\YØ]
+NÂˆÛÛœİ[™YH]Kœ\œÙJ˜[YK\ØYÙWÙ[™YØ]
+NÂˆÛÛœİØœÙ\™YH]Kœ\œÙJ˜[YK›ØœÙ\™YØ]
+NÂˆYˆ
+İ\Yˆ[™Y
+HÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉİ\ØYÙWÜİ\YØ]	×KY\ÜØYÙNˆ	Õ\ØYÙHİ\Ø[››İ›ÛİÈ\ØYÙH[™‰ÈJNÂˆBˆYˆ
+[™YˆØœÙ\™Y
+HÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉİ\ØYÙWÙ[™YØ]	×KY\ÜØYÙNˆ	Õ\ØYÙH[™Ø[››İ›ÛİÈ]šY[˜ÙHØœÙ\˜][Û‹‰ÈJNÂˆBˆYˆ
+ØœÙ\™YH]Kœ\œÙJ˜[YK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+JHÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]	×KY\ÜØYÙNˆ	Õ\ØYÙKY]šY[˜ÙHXØÙ\ÜÈ™]šY]È]\İ™[XZ[ˆ]™K‰ÈJNÂˆBˆYˆ
+˜[YKœİ][Y[Üİ]\ÈOOH	Ùš[˜[	ÊHÂˆYˆ
+˜[YKœİ][Y[Ùš[˜[^™YØ]OOH[ˆ]Kœ\œÙJ˜[YKœİ][Y[Ùš[˜[^™YØ]
+H[™Yˆ]Kœ\œÙJ˜[YKœİ][Y[Ùš[˜[^™YØ]
+HˆØœÙ\™Y
+HÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉÜİ][Y[Ùš[˜[^™YØ]	×KY\ÜØYÙNˆ	Ñš[˜[İ][Y[[YH]\İ›ÛİÈ\ØYÙH[™™XÙYHØœÙ\˜][Û‹‰ÈJNÂˆBˆH[ÙHYˆ
+˜[YKœİ][Y[Ùš[˜[^™YØ]OOH[
+HÂˆÛÛ^˜Y\ÜİYJÈÛÙNˆ	Øİ\İÛIË]ˆÉÜİ][Y[Ùš[˜[^™YØ]	×KY\ÜØYÙNˆ	Ô›İš\Ú[Û˜[]šY[˜ÙHØ[››İÛZ[Hš[˜[^˜][Û‹‰ÈJNÂˆBŸJNÂ‚™^Ü\H[›™\•\ØYÙQ]šY[˜ÙHH‹š[™™\\[Ùˆ[›™\•\ØYÙQ]šY[˜ÙTØÚ[XOÂ™^Ü\H[›™\•\ØYÙQ]šY[˜ÙP]\İ][ÛˆBˆÈ˜[YˆYNÈ]šY[˜ÙNˆ[›™\•\ØYÙQ]šY[˜ÙNÈ›ØÚÙ\œÎˆ×HBˆÈ˜[Yˆ˜[ÙNÈ]šY[˜ÙNˆ[È›ØÚÙ\œÎˆİš[™Ö×HNÂ™^Ü\H[›™\•\ØYÙQ]šY[˜ÙP]\İÜˆH
+ÛY[ˆ]]Üš]TÜ[ÛY[
+HOˆ›ÛZ\ÙO[›™\•\ØYÙQ]šY[˜ÙP]\İ][ÛÂ‚˜ÛÛœİ[U[˜ÛÛ™šYİ\™Y[›™\•\ØYÙQ]šY[˜ÙNˆ[›™\•\ØYÙQ]šY[˜ÙP]\İÜˆH\Ş[˜È
+
+HOˆ
+Âˆ˜[Yˆ˜[ÙKˆ]šY[˜ÙNˆ[ˆ›ØÚÙ\œÎˆÉÔ[›™\ˆ\ØYÙKY]šY[˜ÙH]\İÜˆ\È›İÛÛ™šYİ\™Y‰×KŸJNÂ‚™^ÜÛÛœİÔTUSÓ—ĞUUÔ’UWÓRQÔUSÓ—ÔÔSHÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™]›ØØ][ÛœÈ
+ˆ™YˆV’SPT–HÑVK™]›ÚÙYØ]SQTÕSTˆ“Õ•S™X\ÛÛˆV“Õ•SŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØÛÛ›Û
+ˆÚ[™Û]Ûˆ“ÓÓPSˆ’SPT–HÑVHQUS•QHÒPÒÈ
+Ú[™Û]ÛŠK\]YØ]SQTÕSTˆ“Õ•SQUS“ÕÊ
+BŠNÂ’S”ÑT•S•ÈİØ\›WØ]]Üš]WØÛÛ›Û
+Ú[™Û]ÛŠHSQTÈ
+•QJHÓˆÓÓ‘“PÕ
+Ú[™Û]ÛŠHÈ“ÕS‘ÎÂÔ‘PUHÔˆ‘TPÑH•SÕSÓˆİ\›YÚØ]]Üš]WÛØÚÊ
+H‘UT“”È“ÓÓPS‚“S‘ÕPQÑHÜÜ[ÑPÕT’UHQ’S‘TˆÑUÙX\˜ÚÜ]\×ØØ][ÙËX›XÈTÈ	]]Üš]WÛØÚÉ‘PÓT‘HØÚÙY“ÓÓPSÂ‘QÒS‚ˆÑSPÕÚ[™Û]ÛˆS•ÈØÚÙY”“ÓHX›XËœİØ\›WØ]]Üš]WØÛÛ›ÛÒT‘HÚ[™Û]ÛU•QH“ÔˆTUNÂˆ‘UT“ˆÓĞSTĞÑJØÚÙYSÑJNÂ‘S‘‰]]Üš]WÛØÚÉÂ”‘U“ÒÑHSÓˆ•SÕSÓˆİ\›YÚØ]]Üš]WÛØÚÊ
+H”“ÓHP“PÎÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÚÜİÈ
+ˆÜİÚYV’SPT–HÑVK]šY[˜ÙH”ÓÓˆ“Õ•SØœÙ\™YØ]SQTÕSTˆ“Õ•SˆØ\XÚ]WÜÛİÈS•QÑTˆ“Õ•SÒPÒÈ
+Ø\XÚ]WÜÛİÈH
+Kˆ™\Ù\™YÜÛİÈS•QÑTˆ“Õ•SQUSÒPÒÈ
+™\Ù\™YÜÛİÈH
+Kˆ]]Üš^™YÜÛİÈS•QÑTˆ“Õ•SQUSÒPÒÈ
+]]Üš^™YÜÛİÈH
+KˆÒPÒÈ
+™\Ù\™YÜÛİÈ
+È]]Üš^™YÜÛİÈHØ\XÚ]WÜÛİÊBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØYÙ]È
+ˆ™XÙZ\ÚYV’SPT–HÑVK\™Û[Z]İ\Ù•SQT’PÈ“Õ•SÒPÒÈ
+\™Û[Z]İ\ÙH
+Kˆ™\Ù\™Yİ\Ù•SQT’PÈ“Õ•SQUSÒPÒÈ
+™\Ù\™Yİ\ÙH
+KˆÛÛ[Z]Yİ\Ù•SQT’PÈ“Õ•SQUSÒPÒÈ
+ÛÛ[Z]Yİ\ÙH
+KˆÒPÒÈ
+™\Ù\™Yİ\Ù
+ÈÛÛ[Z]Yİ\ÙH\™Û[Z]İ\Ù
+BŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈ
+ˆÚ[™İ×ÚYV’SPT–HÑVKÛXŞWÚYV“Õ•SˆÚ[™V“Õ•SÒPÒÈ
+Ú[™Sˆ
+	ÜÛXŞIË	ÙZ[IÊJKˆİ\×Ø]SQTÕSTˆ“Õ•S[™×Ø]SQTÕSTˆ“Õ•Sˆİ\œ™[˜ŞHÒTŠÊH“Õ•SÒPÒÈ
+İ\œ™[˜ŞOIÕTÑ	ÊKˆ\™Û[Z]İ\Ù•SQT’PÈ“Õ•SÒPÒÈ
+\™Û[Z]İ\ÙH
+Kˆ™\Ù\™Yİ\Ù•SQT’PÈ“Õ•SQUSÒPÒÈ
+™\Ù\™Yİ\ÙH
+KˆÛÛ[Z]Yİ\Ù•SQT’PÈ“Õ•SQUSÒPÒÈ
+ÛÛ[Z]Yİ\ÙH
+KˆÒPÒÈ
+™\Ù\™Yİ\Ù
+ÈÛÛ[Z]Yİ\ÙH\™Û[Z]İ\Ù
+KˆÒPÒÈ
+[™×Ø]ˆİ\×Ø]
+BŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\\™YÛÜ\˜][ÛœÈ
+ˆÜ\˜][Û—ÚYV’SPT–HÑVKš[™[™×ÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sˆ™YÚ\İ\™YØ]SQTÕSTˆ“Õ•Sİ]HV“Õ•SÒPÒÈ
+İ]HSˆ
+	Ü™XYIË	ØØ[˜Ù[Y	ÊJBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØœ›ÚÙ\—Üš[˜Ú\[È
+ˆ]X˜\ÙWÜ›ÛHV“Õ•S]X˜\ÙWÛ˜[YHV“Õ•Sˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HV“Õ•SS’TUQKœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆV“Õ•SS’TUQKˆ]]—ÚÚ[™V“Õ•SÒPÒÈ
+]]—ÚÚ[™IÜÜİÜ™\Ë\Ù\ÜÚ[Û‹\›ÛIÊKˆ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•SˆØœÙ\™YØ]SQTÕSTˆ“Õ•SXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]SQTÕSTˆ“Õ•Sˆİ]HV“Õ•SÒPÒÈ
+İ]HSˆ
+	Ü™XYIË	Ù\ØX›Y	ÊJK]šY[˜ÙH”ÓÓˆ“Õ•Sˆ’SPT–HÑVH
+]X˜\ÙWÜ›ÛK]X˜\ÙWÛ˜[YJKÒPÒÈ
+XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆØœÙ\™YØ]
+BŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+ˆ™\Ù\˜][Û—ÚYURQ’SPT–HÑVKÜ\˜][Û—ÚYV“Õ•SS’TUQKY™™XİÚYV“Õ•SS’TUQKˆš[™[™×ÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sš[™[™È”ÓÓˆ“Õ•Sˆš[™[™×Ù]X˜\ÙWÜÚLMˆÒTŠ
+H“Õ•Sˆ™]›ØØ][Û—Ü™YœÈ”ÓÓˆ“Õ•SˆÛÛœİ[YWİÚÙ[—ÜÚLMˆÒTŠ
+H“Õ•SØ[˜Ù[İÚÙ[—ÜÚLMˆÒTŠ
+H“Õ•Sˆ\›İ˜[Ü™XÙZ\ÚYV“Õ•SˆYÙ]Ü™XÙZ\ÚYV“Õ•SÜİÚYV“Õ•S™\Ù\™YØÛÜİİ\Ù•SQT’PÈ“Õ•Sˆ™\Ù\™YØ]SQTÕSTˆ“Õ•S™\Ù\˜][Û—Ù^\™\×Ø]SQTÕSTˆ“Õ•SˆX^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÈS•QÑTˆ“Õ•SÒPÒÈ
+X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\È‘UÑQSˆLS‘ÍŒ
+KˆÛÛœİ[\[Û—ÚYURQS’TUQKÛÛœİ[YYØ]SQTÕST‹X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆÒTŠ
+KˆX\ÙWÚYURQİ\Ü™\]Y\İÚYURQX\ÙWÚ\ÜİYYØ]SQTÕST‹ˆX\ÙWÙ^\™\×Ø]SQTÕST‹X\ÙWÙ\˜][Û—Û\ÈS•QÑT‹ˆ™Y[\[Û—İÚÙ[—ÜÚLMˆÒTŠ
+KÛÛ›ÛİÚÙ[—ÜÚLMˆÒTŠ
+Kˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HVœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆVˆœ›ÚÙ\—Ù]X˜\ÙWÜ›ÛHVœ›ÚÙ\—Ù]X˜\ÙWÛ˜[YHVœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆÒTŠ
+Kˆ™Y[\[Û—ÚYURQ™Y[\[Û—Ü™\]Y\İÚYURQİ\Ø]]Üš^™YØ]SQTÕST‹ˆÛÛ[Z]YØÛÜİİ\Ù•SQT’PËˆ[›™\—ØÛZ[WÚYURQ[›™\—ØÛZ[WÜ™\]Y\İÚYURQ[›™\—ØÛZ[WØXØÙ\YØ]SQTÕST‹ˆ[›™\—ØÛZ[WÙ^\™\×Ø]SQTÕST‹[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ]SQTÕST‹ˆ[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]SQTÕST‹[›™\—ÚYV[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆVˆ[›™\—Ú[œİ[˜ÙWÚYV[›™\—Ü[[YWÚYV[›™\—ÚÜİÚYVˆ[›™\—ØÚ[›™[Øš[™[™×ÜÚLMˆÒTŠ
+KX\™X]İÚÙ[—ÜÚLMˆÒTŠ
+Kˆİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆÒTŠ
+Kİ]ÛÛYWİÚÙ[—ÜÚLMˆÒTŠ
+Kˆ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆÒTŠ
+K›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYVˆ[›™\—Û][˜ÚØ][\ÚYV[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛˆS•QÑT‹ˆ[›™\—Ü™]›ØØ][Û—Ü™YœÈ”ÓÓ‹ˆ[›™\—ÚX\™X]ÚYURQ[›™\—ÚX\™X]Ü™\]Y\İÚYURQS’TUQKˆ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙHS•QÑT‹[›™\—ÚX\™X]ØXØÙ\YØ]SQTÕST‹ˆ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+Kˆ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYURQ[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYURQS’TUQKˆ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]SQTÕST‹ˆ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]SQTÕST‹[›™\—Ü›ØÙ\Ü×Üİ\YØ]SQTÕST‹ˆ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆÒTŠ
+HS’TUQK[›™\—Üİ\Ù]šY[˜ÙWÜ™YˆVS’TUQKˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMˆÒTŠ
+HS’TUQKˆ[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+Kˆ[›™\—Ûİ]ÛÛYWÚYURQ[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYURQS’TUQK[›™\—Ûİ]ÛÛYWÙ]™[ÚYURQS’TUQKˆ[›™\—Ûİ]ÛÛYWÚÚ[™V[›™\—Ûİ]ÛÛYWØXØÙ\YØ]SQTÕST‹ˆ[›™\—Ûİ]ÛÛYWØ]SQTÕST‹[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]SQTÕST‹ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YˆVS’TUQK[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMˆÒTŠ
+HS’TUQKˆ[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+K[›™\—Ù^]Ù\ÜÜÚ][ÛˆVˆ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YY“ÓÓPS‹ˆİ]HV“Õ•SÒPÒÈ
+İ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	Ë	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	Ë	ØØ[˜Ù[Y	Ë	Ù^\™Y	ÊJBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÚX\™X]İÚÙ[œÈ
+ˆÚÙ[—ÜÚLMˆÒTŠ
+H’SPT–HÑVK™\Ù\˜][Û—ÚYURQ“Õ•SˆÙ\]Y[˜ÙHS•QÑTˆ“Õ•SÒPÒÈ
+Ù\]Y[˜ÙHH
+Kˆ\ÜİYYØWÜ™\]Y\İÚYURQ“Õ•S\ÜİYYØ]SQTÕSTˆ“Õ•SˆÚ[™V“Õ•SÒPÒÈ
+Ú[™Sˆ
+	ØÛZ[IË	ÚX\™X]	ÊJKˆS’TUQH
+™\Ù\˜][Û—ÚYÙ\]Y[˜ÙJBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈ
+ˆÚÙ[—ÜÚLMˆÒTŠ
+H’SPT–HÑVK™\Ù\˜][Û—ÚYURQ“Õ•SˆÙ\]Y[˜ÙHS•QÑTˆ“Õ•SÒPÒÈ
+Ù\]Y[˜ÙHH
+Kˆ\ÜİYYØWÜ™\]Y\İÚYURQ“Õ•S\ÜİYYØ]SQTÕSTˆ“Õ•SˆÚ[™V“Õ•SÒPÒÈ
+Ú[™Sˆ
+	ØÛZ[IË	İ\ØYÙKY]šY[˜ÙIÊJKˆS’TUQH
+™\Ù\˜][Û—ÚYÙ\]Y[˜ÙJBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙH
+ˆ\ØYÙWÙ]šY[˜ÙWÚYURQ’SPT–HÑVK\ØYÙWÜ™\]Y\İÚYURQ“Õ•SS’TUQKˆ\ØYÙWÜÙ\]Y[˜ÙHS•QÑTˆ“Õ•SÒPÒÈ
+\ØYÙWÜÙ\]Y[˜ÙHHJKˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛˆV“Õ•Sˆ›İšY\—Ù]™[ÚYURQ“Õ•SS’TUQK™\Ù\˜][Û—ÚYURQ“Õ•SˆÛZ[WÚYURQ“Õ•Sİ]ÛÛYWÚYURQ“Õ•SˆÜ\˜][Û—ÚYV“Õ•SY™™XİÚYV“Õ•Sš[™[™×ÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sˆ™\šYšY\—Ù]X˜\ÙWÜ›ÛHV“Õ•S™\šYšY\—Ù]X˜\ÙWÛ˜[YHV“Õ•Sˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆÒTŠ
+H“Õ•Sˆ›İšY\—ÚYV“Õ•S›İšY\—ØXØÛİ[Ü™YˆV“Õ•Sˆ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYV“Õ•SY]\—ÚYV“Õ•Sˆ]šY[˜ÙWÜ™YˆV“Õ•SS’TUQK]šY[˜ÙWÜÚLMˆÒTŠ
+H“Õ•SS’TUQKˆ\ØYÙWÜİ\YØ]SQTÕSTˆ“Õ•S\ØYÙWÙ[™YØ]SQTÕSTˆ“Õ•Sˆİ][Y[Üİ]\ÈV“Õ•SÒPÒÈ
+İ][Y[Üİ]\ÈSˆ
+	Ü›İš\Ú[Û˜[	Ë	Ùš[˜[	ÊJKˆİ][Y[Ùš[˜[^™YØ]SQTÕST‹ˆ]šY[˜ÙWÛØœÙ\™YØ]SQTÕSTˆ“Õ•SXØÙ\YØ]SQTÕSTˆ“Õ•Sˆİ\œ™[˜ŞHÒTŠÊH“Õ•SÒPÒÈ
+İ\œ™[˜ŞOIÕTÑ	ÊKˆİ[][]]™WØÛÜİİ\Ù•SQT’PÊŒLŠH“Õ•SÒPÒÈ
+İ[][]]™WØÛÜİİ\ÙH
+Kˆ]]Üš^™YØÛÜİİ\Ù•SQT’PÊŒŠH“Õ•SÒPÒÈ
+]]Üš^™YØÛÜİİ\ÙH
+KˆYÙ]Øœ™XXÚÛØœÙ\™Y“ÓÓPSˆ“Õ•Sˆ™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+H“Õ•Sˆ™^İÚÙ[—ÜÚLMˆÒTŠ
+H“Õ•Sˆ\ÜİY\ˆV“Õ•SÙ^WÚYV“Õ•Sˆ]]—ÚÚ[™V“Õ•SÒPÒÈ
+]]—ÚÚ[™IÜ›İšY\‹\ÚYÛ™Y\İ][Y[	ÊKˆÓÓ”ÕRS•İØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙWÜØÚ[XWİ™\œÚ[Û—ØÚXÚÈÒPÒÈ
+ˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛˆSˆ
+	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIË	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ÊBˆ
+KˆS’TUQH
+™\Ù\˜][Û—ÚY\ØYÙWÜÙ\]Y[˜ÙJKˆÒPÒÈ
+\ØYÙWÜİ\YØ]H\ØYÙWÙ[™YØ]
+KˆÒPÒÈ
+\ØYÙWÙ[™YØ]H]šY[˜ÙWÛØœÙ\™YØ]
+KˆÒPÒÈ
+
+İ][Y[Üİ]\ÏIÙš[˜[	ÈS‘İ][Y[Ùš[˜[^™YØ]TÈ“Õ•SˆS‘\ØYÙWÙ[™YØ]Hİ][Y[Ùš[˜[^™YØ]S‘İ][Y[Ùš[˜[^™YØ]H]šY[˜ÙWÛØœÙ\™YØ]
+BˆÔˆ
+İ][Y[Üİ]\ÏIÜ›İš\Ú[Û˜[	ÈS‘İ][Y[Ùš[˜[^™YØ]TÈ•S
+JBŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØYÙ]ÚÛÈ
+ˆ™\Ù\˜][Û—ÚYURQ“Õ•SÚ[™İ×ÚYV“Õ•S™\Ù\™YØÛÜİİ\Ù•SQT’PÈ“Õ•SÒPÒÈ
+™\Ù\™YØÛÜİİ\ÙH
+Kˆ’SPT–HÑVH
+™\Ù\˜][Û—ÚYÚ[™İ×ÚY
+BŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™[[İWÜİÜÜš[˜Ú\[È
+ˆ]X˜\ÙWÜ›ÛHV“Õ•S]X˜\ÙWÛ˜[YHV“Õ•Sˆ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sˆİ\\š\ÛÜ—ÚYV“Õ•SS’TUQKİ\\š\ÛÜ—Ú[œİ[˜ÙWÚYV“Õ•SS’TUQKˆİ\\š\ÛÜ—Ù\ØÚS•QÑTˆ“Õ•SÒPÒÈ
+İ\\š\ÛÜ—Ù\ØÚHJKˆØœÙ\™YØ]SQTÕSTˆ“Õ•SXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]SQTÕSTˆ“Õ•Sˆİ]HV“Õ•SÒPÒÈ
+İ]HSˆ
+	Ü™XYIË	Ù\ØX›Y	ÊJK]šY[˜ÙH”ÓÓˆ“Õ•Sˆ’SPT–HÑVH
+]X˜\ÙWÜ›ÛK]X˜\ÙWÛ˜[YJKÒPÒÈ
+XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆØœÙ\™YØ]
+BŠNÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™[[İWÜİÜØXÚÛ›İÛYÙ[Y[È
+ˆXÚÛ›İÛYÙ[Y[ÚYURQ’SPT–HÑVKİÜÜ™\]Y\İÚYURQ“Õ•SS’TUQKˆİÜÜ™\]Y\İØ]Y]ÜÙ\H’QÒS•“Õ•SS’TUQK™\Ù\˜][Û—ÚYURQ“Õ•SS’TUQKˆÛZ[WÚYURQ“Õ•SÜ\˜][Û—ÚYV“Õ•Sš[™[™×ÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sˆ™\]Y\İÜÚLMˆÒTŠ
+H“Õ•SS’TUQK]šY[˜ÙWÜ™YˆV“Õ•SS’TUQKˆ]šY[˜ÙWÜÚLMˆÒTŠ
+H“Õ•SS’TUQKİ\\š\ÛÜ—ÚYV“Õ•Sˆİ\\š\ÛÜ—Ú[œİ[˜ÙWÚYV“Õ•Sİ\\š\ÛÜ—Ù\ØÚS•QÑTˆ“Õ•SÒPÒÈ
+İ\\š\ÛÜ—Ù\ØÚHJKˆØœÙ\™YÜİÜÙ™[˜ÙWÙÙ[™\˜][ÛˆS•QÑTˆ“Õ•SÒPÒÈ
+ØœÙ\™YÜİÜÙ™[˜ÙWÙÙ[™\˜][ÛˆHŠKˆ™\]Y\İÜ^[ØY”ÓÓˆ“Õ•SXÚÛ›İÛYÙ[Y[Ü^[ØY”ÓÓˆ“Õ•SˆXÚÛ›İÛYÙ[Y[Ø[™WÜÚLMˆÒTŠ
+H“Õ•SS’TUQKXØÙ\YØ]SQTÕSTˆ“Õ•Sˆ™\šYšY\—Ù]X˜\ÙWÜ›ÛHV“Õ•S™\šYšY\—Ù]X˜\ÙWÛ˜[YHV“Õ•Sˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆÒTŠ
+H“Õ•SŠNÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓSSˆQˆ“ÕVTÕÈ™\šYšY\—Ù]X˜\ÙWÜ›ÛHVˆ“Õ•SQUS	ÛYØXŞK][˜]\İY	ÎÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓSSˆQˆ“ÕVTÕÈ™\šYšY\—Ù]X˜\ÙWÛ˜[YHVˆ“Õ•SQUS	ÛYØXŞK][˜]\İY	ÎÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓSSˆQˆ“ÕVTÕÈ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆÒTŠ
+Bˆ“Õ•SQUS	ÉÉÌ	Ëœ™\X]
+
+_IÎÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓSSˆQˆ“ÕVTÕÈ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛˆVˆ“Õ•SQUS	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÎÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHSTˆÓÓSSˆ™\šYšY\—Ù]X˜\ÙWÜ›ÛH“ÔQUSÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHSTˆÓÓSSˆ™\šYšY\—Ù]X˜\ÙWÛ˜[YH“ÔQUSÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHSTˆÓÓSSˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆ“ÔQUSÂSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHSTˆÓÓSSˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[Ûˆ“ÔQUSÂ‘È	\ØYÙWÙ]šY[˜ÙWÜØÚ[XWØÛÛœİ˜Z[	‘QÒS‚ˆQˆ“ÕVTÕÈ
+ÑSPÕH”“ÓH×ØÛÛœİ˜Z[ˆÒT‘HÛÛ›˜[YOIÜİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙWÜØÚ[XWİ™\œÚ[Û—ØÚXÚÉÂˆS‘ÛÛœ™[YIÜX›XËœİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙIÎœ™YØÛ\ÜÊHS‚ˆSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓ”ÕRS•ˆİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙWÜØÚ[XWİ™\œÚ[Û—ØÚXÚÈÒPÒÈ
+ˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛˆSˆ
+	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIËˆ	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ÊBˆ
+NÂˆS‘QÂ‘S‘‰\ØYÙWÙ]šY[˜ÙWÜØÚ[XWØÛÛœİ˜Z[	Â‘È	\ØYÙWØÛÜİÜ™XÚ\Ú[Û—ÛZYÜ˜][Û‰‘PÓT‘BˆİÜ™YÜ™XÚ\Ú[ÛˆS•QÑTÂˆİÜ™YÜØØ[HS•QÑTÂ‘QÒS‚ˆÑSPÕ[Y\šX×Ü™XÚ\Ú[Û‹[Y\šX×ÜØØ[HS•ÈİÜ™YÜ™XÚ\Ú[Û‹İÜ™YÜØØ[Bˆ”“ÓH[™›Ü›X][Û—ÜØÚ[XK˜ÛÛ[[œÂˆÒT‘HX›WÜØÚ[XOIÜX›XÉÈS‘X›WÛ˜[YOIÜİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙIÂˆS‘ÛÛ[[—Û˜[YOIØİ[][]]™WØÛÜİİ\Ù	ÎÂˆQˆİÜ™YÜ™XÚ\Ú[ÛLŒS‘İÜ™YÜØØ[OMˆS‚ˆQˆVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙBˆÒT‘Hİ[][]]™WØÛÜİİ\ÙÔˆİ[][]]™WØÛÜİİ\ÙLL›[Y\šXÊHS‚ˆRTÑHVÑTSÓˆ	ÛYØXŞH›İšY\ˆ\ØYÙHÛÜİØ[››İZYÜ˜]HÈHŒˆ™XÚ\Ú[Ûˆ[™[ÜIÎÂˆS‘QÂˆSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙBˆSTˆÓÓSSˆİ[][]]™WØÛÜİİ\ÙTH•SQT’PÊŒLŠBˆTÒS‘Èİ[][]]™WØÛÜİİ\Ù“•SQT’PÊŒLŠNÂˆSÒQˆİÜ™YÜ™XÚ\Ú[ÛˆTÈTÕSÕ”“ÓHŒÔˆİÜ™YÜØØ[HTÈTÕSÕ”“ÓHLˆS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙHÛÜİ™XÚ\Ú[Ûˆ\È[™^XİYˆ•SQT’PÊ	K	JIËİÜ™YÜ™XÚ\Ú[Û‹İÜ™YÜØØ[NÂˆS‘QÂ‘S‘‰\ØYÙWØÛÜİÜ™XÚ\Ú[Û—ÛZYÜ˜][Û‰ÂÔ‘PUHP“HQˆ“ÕVTÕÈİØ\›WØ]]Üš]WØ]Y]
+ˆÙ\H’QÔÑT’PS’SPT–HÑVK]™[V“Õ•SÒPÒÈ
+]™[Sˆ
+	ØYZ]Y	Ë	Ü™\Ù\™Y	Ë	Ù[šYY	Ë	Ü™]›ÚÙY	Ë	ØØ[˜Ù[Y	Ë	ØÛÛœİ[YY	Ë	ØÛÛœİ[YKY[šYY	Ë	Üİ\[X\ÙKZ\ÜİYY	Ë	Üİ\[X\ÙKY[šYY	Ë	Üİ\X]]Üš]K\™YY[YY	Ë	Üİ\\™Y[\[Û‹Y[šYY	Ë	Ü[›™\‹XÛZ[KXXØÙ\Y	Ë	Ü[›™\‹XÛZ[KY[šYY	Ë	Ü[›™\‹ZX\™X]XXØÙ\Y	Ë	Ü[›™\‹ZX\™X]Y[šYY	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	Ü[›™\‹\İ\Y[šYY	Ë	Ü[›™\‹[İ]ÛÛYK[ØœÙ\™Y	Ë	Ü[›™\‹[İ]ÛÛYKY[šYY	Ë	Ü[›™\‹]\ØYÙKY]šY[˜ÙK[ØœÙ\™Y	Ë	Ü[›™\‹]\ØYÙKY]šY[˜ÙKY[šYY	Ë	Ü[›™\‹]\ØYÙKXYÙ]Xœ™XXÚ	Ë	Ü[›™\‹\™[[İK\İÜXXÚÛ›İÛYÙY	Ë	Ü[›™\‹\™[[İK\İÜXXÚÛ›İÛYÙ[Y[Y[šYY	Ë	ÚÜİXØ\XÚ]K\™[X\ÙY	Ë	ÜİÜ\™\]Y\İY	Ë	Ü™\Ù\˜][Û‹XØ[˜Ù[Y	Ë	Ù^\™Y	Ë	ØYÙ]]Ú[™İË\™YÚ\İ\™Y	Ë	ØYÙ]]Ú[™İËY[šYY	Ë	Øœ›ÚÙ\‹\š[˜Ú\[\™YÚ\İ\™Y	Ë	Øœ›ÚÙ\‹\š[˜Ú\[Y\ØX›Y	Ë	Ü™[[İK\İÜ\š[˜Ú\[\™YÚ\İ\™Y	Ë	Ü™[[İK\İÜ\š[˜Ú\[Y\ØX›Y	ÊJKˆÜ\˜][Û—ÚYV“Õ•Sš[™[™×ÙYÙ\İÜÚLMˆÒTŠ
+H“Õ•Sˆ]SQTÕSTˆ“Õ•S]Z[”ÓÓˆ“Õ•SŠNÂ‚‹KH\Ü˜YHHX\›Y\‹™]™\‹Y\ŞYYˆÌ™\Ù\˜][Û‹[Û›HØÚ[XKˆ]È›İÜÂ‹KHØ[››İ™HØY™[HÛÛœİ[YY™XØ]\ÙH›È™X\™\ˆYÙ\İÜˆ\˜X›Hš[™[™È^\İË‹KHÛÈ^H\™HØ[˜Ù[Y\È™\^HÛXœİÛ™\È[™Z\ˆ\‹\™XÙZ\ÛÈ™[X\ÙY‚STˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓSSˆQˆ“ÕVTÕÈØ\XÚ]WÜÛİÈS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓSSˆQˆ“ÕVTÕÈ™\Ù\™YÜÛİÈS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓSSˆQˆ“ÕVTÕÈ]]Üš^™YÜÛİÈS•QÑTˆ“Õ•SQUSÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]ÈQÓÓSSˆQˆ“ÕVTÕÈÛÛ[Z]Yİ\Ù•SQT’PÈ“Õ•SQUSÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈQÓÓSSˆQˆ“ÕVTÕÈÛÛ[Z]Yİ\Ù•SQT’PÈ“Õ•SQUSÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈš[™[™È”ÓÓÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈš[™[™×Ù]X˜\ÙWÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ™]›ØØ][Û—Ü™YœÈ”ÓÓÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈÛÛœİ[YWİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈØ[˜Ù[İÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÈS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈÛÛœİ[\[Û—ÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈÛÛœİ[YYØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\ÙWØÛZ[WİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\ÙWÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈİ\Ü™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\ÙWÚ\ÜİYYØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\ÙWÙ^\™\×Ø]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\ÙWÙ\˜][Û—Û\ÈS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ™Y[\[Û—İÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈÛÛ›ÛİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈœ›ÚÙ\—Ù]X˜\ÙWÜ›ÛHVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈœ›ÚÙ\—Ù]X˜\ÙWÛ˜[YHVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ™Y[\[Û—ÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ™Y[\[Û—Ü™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈİ\Ø]]Üš^™YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈÛÛ[Z]YØÛÜİİ\Ù•SQT’PÎÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØÛZ[WÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØÛZ[WÜ™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØÛZ[WØXØÙ\YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØÛZ[WÙ^\™\×Ø]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ú[œİ[˜ÙWÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ü[[YWÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚÜİÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ØÚ[›™[Øš[™[™×ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈX\™X]İÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈİ]ÛÛYWİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Û][˜ÚØ][\ÚYVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛˆS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ü™]›ØØ][Û—Ü™YœÈ”ÓÓÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚX\™X]ÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚX\™X]Ü™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙHS•QÑTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚX\™X]ØXØÙ\YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ü›ØÙ\Ü×Üİ\YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\Ù]šY[˜ÙWÜ™YˆVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÙ]™[ÚYURQÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÚÚ[™VÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWØXØÙ\YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]SQTÕSTÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YˆVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLMˆÒTŠ
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ù^]Ù\ÜÜÚ][ÛˆVÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓSSˆQˆ“ÕVTÕÈ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YY“ÓÓPSÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWÜ™\]Y\İİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚY
+HÒT‘H[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWÙ]™[İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ûİ]ÛÛYWÙ]™[ÚY
+HÒT‘H[›™\—Ûİ]ÛÛYWÙ]™[ÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™Y—İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YŠHÒT‘H[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚWİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMŠHÒT‘H[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWİÚÙ[—İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+İ]ÛÛYWİÚÙ[—ÜÚLMŠHÒT‘Hİ]ÛÛYWİÚÙ[—ÜÚLMˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—İ\ØYÙWİÚÙ[—İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMŠBˆÒT‘H\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ›İšY\—İ\ØYÙWØÛÜœ™[][Û—İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚY
+BˆÒT‘H›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Û][˜ÚØ][\İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Û][˜ÚØ][\ÚY
+HÒT‘H[›™\—Û][˜ÚØ][\ÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ûİ]ÛÛYWÚYİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ûİ]ÛÛYWÚY
+HÒT‘H[›™\—Ûİ]ÛÛYWÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—ÚX\™X]Ü™\]Y\İİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—ÚX\™X]Ü™\]Y\İÚY
+BˆÒT‘H[›™\—ÚX\™X]Ü™\]Y\İÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Üİ\Ü™\]Y\İİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚY
+BˆÒT‘H[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Ü›ØÙ\Ü×İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMŠBˆÒT‘H[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Üİ\Ù]šY[˜ÙWÜ™Y—İ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Üİ\Ù]šY[˜ÙWÜ™YŠBˆÒT‘H[›™\—Üİ\Ù]šY[˜ÙWÜ™YˆTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ[›™\—Üİ\Ù]šY[˜ÙWİ[š\]YBˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ
+[›™\—Üİ\Ù]šY[˜ÙWÜÚLMŠBˆÒT‘H[›™\—Üİ\Ù]šY[˜ÙWÜÚLMˆTÈ“Õ•SÂ‚‹KHHÜ˜[XÛÛ˜XİYÙ\İÚ[™ÙHØ[››İÚ[[H[š\š][ˆ[™XYKX]]Üš^™Y‹KH[›™\‹ˆ]X\˜[[™H^\İ[™ÈÜÚ]]™H]]Üš]H[™™]Z[ˆÛÛ[Z]YYÙ\œÂ‹KH[[HÙ\\˜][H™]šY]ÙY™XÛİ™\H]^\İË‚•ÒU]X\˜[[™YTÈ
+ˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	ÂˆÒT‘Hİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊBˆS‘œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆTÈTÕSÕ”“ÓH	ÉĞ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŸIÂˆ‘UT“’S‘È™\Ù\˜][Û—ÚYÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‚ŠB’S”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+B”ÑSPÕ	ÜİÜ\™\]Y\İY	ËÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹ÛØÚ×İ[Y\İ[\
+
+KˆœÛÛ˜—ØZ[ÛØš™Xİ
+	Ü™\Ù\˜][Û—ÚY	Ë™\Ù\˜][Û—ÚY	Ü™X\ÛÛ‰Ë	Øœ›ÚÙ\ˆ›ÛHÛÛ˜XİÚ[™ÙY\š[™ÈZYÜ˜][Û‰Ëˆ	Ù^Xİ][Û—Üİ]IË	İ[šÛ›İÛ‰Ë	Ü™[X\ÙYØÛÜİİ\Ù	Ë
+B‘”“ÓH]X\˜[[™YÂ‚’S”ÑT•S•ÈİØ\›WØ]]Üš]WÚX\™X]İÚÙ[œÂˆ
+ÚÙ[—ÜÚLM‹™\Ù\˜][Û—ÚYÙ\]Y[˜ÙK\ÜİYYØWÜ™\]Y\İÚY\ÜİYYØ]Ú[™
+B”ÑSPÕX\™X]İÚÙ[—ÜÚLM‹™\Ù\˜][Û—ÚYÓĞSTĞÑJ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙK
+KˆÓĞSTĞÑJ[›™\—ÚX\™X]Ü™\]Y\İÚY[›™\—ØÛZ[WÜ™\]Y\İÚY
+KˆÓĞSTĞÑJ[›™\—ÚX\™X]ØXØÙ\YØ][›™\—ØÛZ[WØXØÙ\YØ]
+KˆĞTÑHÒSˆ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙHTÈ•SSˆ	ØÛZ[IÈSÑH	ÚX\™X]	ÈS‘‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚•ÒT‘HX\™X]İÚÙ[—ÜÚLMˆTÈ“Õ•SˆS‘“ÕVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÚX\™X]İÚÙ[œÈˆÒT‘HÚÙ[—ÜÚLM\‹šX\™X]İÚÙ[—ÜÚLM‚ˆ
+NÂ‚‘È	X\™X]İÚÙ[—Ú[YÜš]I‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆQ•“ÒSˆİØ\›WØ]]Üš]WÚX\™X]İÚÙ[œÈˆÓˆÚÙ[—ÜÚLM\‹šX\™X]İÚÙ[—ÜÚLM‚ˆÒT‘H‹šX\™X]İÚÙ[—ÜÚLMˆTÈ“Õ•SS‘
+ˆÚÙ[—ÜÚLMˆTÈ•SÔˆœ™\Ù\˜][Û—ÚYœ‹œ™\Ù\˜][Û—ÚYˆÔˆœÙ\]Y[˜ÙOÓĞSTĞÑJ‹œ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙK
+Bˆ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	Øİ\œ™[X\™X]Ü™Y[X[\İÜH\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂ‘S‘‰X\™X]İÚÙ[—Ú[YÜš]IÂ‚’S”ÑT•S•ÈİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÂˆ
+ÚÙ[—ÜÚLM‹™\Ù\˜][Û—ÚYÙ\]Y[˜ÙK\ÜİYYØWÜ™\]Y\İÚY\ÜİYYØ]Ú[™
+B”ÑSPÕ‹\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‹‹œ™\Ù\˜][Û—ÚYˆÓĞSTĞÑJ
+ÑSPÕPV
+K\ØYÙWÜÙ\]Y[˜ÙJH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆÒT‘HKœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+K
+KˆÓĞSTĞÑJ
+ÑSPÕK\ØYÙWÜ™\]Y\İÚY”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆÒT‘HKœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚYÔ‘Tˆ–HK\ØYÙWÜÙ\]Y[˜ÙHTĞÈSRUJK‹œ[›™\—ØÛZ[WÜ™\]Y\İÚY
+KˆÓĞSTĞÑJ
+ÑSPÕK˜XØÙ\YØ]”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆÒT‘HKœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚYÔ‘Tˆ–HK\ØYÙWÜÙ\]Y[˜ÙHTĞÈSRUJK‹œ[›™\—ØÛZ[WØXØÙ\YØ]
+KˆĞTÑHÒSˆVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆÒT‘HKœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+HSˆ	İ\ØYÙKY]šY[˜ÙIÈSÑH	ØÛZ[IÈS‘‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚•ÒT‘H‹\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆTÈ“Õ•SˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈˆÒT‘HÚÙ[—ÜÚLM\‹\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMŠNÂ‚‘È	\ØYÙWİÚÙ[—Ú[YÜš]I‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆQ•“ÒSˆİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈˆÓˆÚÙ[—ÜÚLM\‹\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‚ˆÒT‘H‹\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆTÈ“Õ•SS‘
+ˆÚÙ[—ÜÚLMˆTÈ•SÔˆœ™\Ù\˜][Û—ÚYœ‹œ™\Ù\˜][Û—ÚYˆÔˆœÙ\]Y[˜ÙOÓĞSTĞÑJ
+ÑSPÕPV
+K\ØYÙWÜÙ\]Y[˜ÙJBˆ”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHHÒT‘HKœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+K
+Bˆ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	Øİ\œ™[\ØYÙHÜ™Y[X[\İÜH\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂ‘S‘‰\ØYÙWİÚÙ[—Ú[YÜš]IÂ‚‘È	\ØYÙWÙ]šY[˜ÙWÚ[YÜš]I‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆQ•“ÒSˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈˆÓˆ‹œ™\Ù\˜][Û—ÚYYKœ™\Ù\˜][Û—ÚYˆÒT‘H‹œ™\Ù\˜][Û—ÚYTÈ•SˆÔˆ‹œİ]H“ÕSˆ
+	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊBˆÔˆK˜ÛZ[WÚYTÈTÕSÕ”“ÓH‹œ[›™\—ØÛZ[WÚYˆÔˆK›İ]ÛÛYWÚYTÈTÕSÕ”“ÓH‹œ[›™\—Ûİ]ÛÛYWÚYˆÔˆK›Ü\˜][Û—ÚYTÈTÕSÕ”“ÓH‹›Ü\˜][Û—ÚYˆÔˆK™Y™™XİÚYTÈTÕSÕ”“ÓH‹™Y™™XİÚYˆÔˆK˜š[™[™×ÙYÙ\İÜÚLMˆTÈTÕSÕ”“ÓH‹˜š[™[™×ÙYÙ\İÜÚLM‚ˆÔˆKœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYTÈTÕSÕ”“ÓH‹œ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYˆÔˆK˜]]Üš^™YØÛÜİİ\ÙTÈTÕSÕ”“ÓH‹˜ÛÛ[Z]YØÛÜİİ\ÙˆÔˆK™]šY[˜ÙWÜØÚ[XWİ™\œÚ[Ûˆ“ÕSˆ
+	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIËˆ	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ÊBˆÔˆ
+K™]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛIÜİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÂˆS‘K˜İ[][]]™WØÛÜİİ\Ù[˜ÊK˜İ[][]]™WØÛÜİİ\ÙŠJBˆÔˆK˜İ[][]]™WØÛÜİİ\ÙLL›[Y\šXÂˆÔˆK\ØYÙWÜİ\YØ]]Wİ[˜Ê	ÛZ[\ÙXÛÛ™ÉË‹œ[›™\—ØÛZ[WØXØÙ\YØ]
+BˆÔˆK\ØYÙWÙ[™YØ]ˆ]Wİ[˜Ê	ÛZ[\ÙXÛÛ™ÉË‹œ[›™\—Ûİ]ÛÛYWØ]
+BˆÔˆK˜YÙ]Øœ™XXÚÛØœÙ\™YTÈTÕSÕ”“ÓH
+ˆK˜İ[][]]™WØÛÜİİ\ÙˆK˜]]Üš^™YØÛÜİİ\ÙˆÔˆ
+‹œ[›™\—Ûİ]ÛÛYWÚÚ[™IÛ™]™\‹\İ\Y	ÈS‘K˜İ[][]]™WØÛÜİİ\ÙŒ›[Y\šXÊBˆ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙH]šY[˜ÙHš[™[™ÈÜˆœ™XXÚ]šX][Ûˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙBˆÔ“ÕT–H™\Ù\˜][Û—ÚYˆU’S‘ÈRSŠ\ØYÙWÜÙ\]Y[˜ÙJOŒHÔˆPV
+\ØYÙWÜÙ\]Y[˜ÙJOÓÕS•
+
+ŠBˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘Hİ][Y[Üİ]\ÏIÙš[˜[	ÊOŒBˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙH]šY[˜ÙHÙ\]Y[˜ÙHÜˆš[˜[]H\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÒUÜ™\™YTÈ
+ˆÑSPÕKŠ‹ˆQÊ›İšY\—ÚY
+HÕ‘TˆÚZ[ˆTÈš[Ü—Ü›İšY\—ÚYˆQÊ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛŠHÕ‘TˆÚZ[ˆTÈš[Ü—Ù]šY[˜ÙWÜØÚ[XWİ™\œÚ[Û‹ˆQÊ›İšY\—ØXØÛİ[Ü™YŠHÕ‘TˆÚZ[ˆTÈš[Ü—Ü›İšY\—ØXØÛİ[Ü™Y‹ˆQÊ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚY
+HÕ‘TˆÚZ[ˆTÈš[Ü—ØÛÜœ™[][Û‹ˆQÊY]\—ÚY
+HÕ‘TˆÚZ[ˆTÈš[Ü—ÛY]\—ÚYˆQÊİ\œ™[˜ŞJHÕ‘TˆÚZ[ˆTÈš[Ü—Øİ\œ™[˜ŞKˆQÊ]]—ÚÚ[™
+HÕ‘TˆÚZ[ˆTÈš[Ü—Ø]]—ÚÚ[™ˆQÊ\ÜİY\ŠHÕ‘TˆÚZ[ˆTÈš[Ü—Ú\ÜİY\‹ˆQÊÙ^WÚY
+HÕ‘TˆÚZ[ˆTÈš[Ü—ÚÙ^WÚYˆQÊ\ØYÙWÜİ\YØ]
+HÕ‘TˆÚZ[ˆTÈš[Ü—İ\ØYÙWÜİ\YØ]ˆQÊ\ØYÙWÙ[™YØ]
+HÕ‘TˆÚZ[ˆTÈš[Ü—İ\ØYÙWÙ[™YØ]ˆQÊİ[][]]™WØÛÜİİ\Ù
+HÕ‘TˆÚZ[ˆTÈš[Ü—Øİ[][]]™WØÛÜİİ\ÙˆQÊİ][Y[Üİ]\ÊHÕ‘TˆÚZ[ˆTÈš[Ü—Üİ][Y[Üİ]\Âˆ”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆÒS‘ÕÈÚZ[ˆTÈ
+T•USÓˆ–H™\Ù\˜][Û—ÚYÔ‘Tˆ–H\ØYÙWÜÙ\]Y[˜ÙJBˆ
+BˆÑSPÕH”“ÓHÜ™\™YÒT‘H\ØYÙWÜÙ\]Y[˜ÙOŒHS‘
+ˆ›İšY\—ÚYTÈTÕSÕ”“ÓHš[Ü—Ü›İšY\—ÚYˆÔˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛˆTÈTÕSÕ”“ÓHš[Ü—Ù]šY[˜ÙWÜØÚ[XWİ™\œÚ[Û‚ˆÔˆ›İšY\—ØXØÛİ[Ü™YˆTÈTÕSÕ”“ÓHš[Ü—Ü›İšY\—ØXØÛİ[Ü™Y‚ˆÔˆ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYTÈTÕSÕ”“ÓHš[Ü—ØÛÜœ™[][Û‚ˆÔˆY]\—ÚYTÈTÕSÕ”“ÓHš[Ü—ÛY]\—ÚYˆÔˆİ\œ™[˜ŞHTÈTÕSÕ”“ÓHš[Ü—Øİ\œ™[˜ŞBˆÔˆ]]—ÚÚ[™TÈTÕSÕ”“ÓHš[Ü—Ø]]—ÚÚ[™ˆÔˆ\ÜİY\ˆTÈTÕSÕ”“ÓHš[Ü—Ú\ÜİY\‚ˆÔˆÙ^WÚYTÈTÕSÕ”“ÓHš[Ü—ÚÙ^WÚYˆÔˆ\ØYÙWÜİ\YØ]TÈTÕSÕ”“ÓHš[Ü—İ\ØYÙWÜİ\YØ]ˆÔˆ\ØYÙWÙ[™YØ]š[Ü—İ\ØYÙWÙ[™YØ]ˆÔˆİ[][]]™WØÛÜİİ\Ùš[Ü—Øİ[][]]™WØÛÜİİ\ÙˆÔˆš[Ü—Üİ][Y[Üİ]\ÏIÙš[˜[	Âˆ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙH]šY[˜ÙHİ™X[HšYYÜˆ™YÜ™\ÜÙY	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHBˆQ•“ÒSˆİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈ™\Ù[YˆÓˆ™\Ù[Yœ™\Ù\˜][Û—ÚYYKœ™\Ù\˜][Û—ÚYˆS‘™\Ù[YœÙ\]Y[˜ÙOYK\ØYÙWÜÙ\]Y[˜ÙKLBˆS‘™\Ù[YÚÙ[—ÜÚLMYKœ™\Ù[YİÚÙ[—ÜÚLM‚ˆQ•“ÒSˆİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈ™^İÚÙ[‚ˆÓˆ™^İÚÙ[‹œ™\Ù\˜][Û—ÚYYKœ™\Ù\˜][Û—ÚYˆS‘™^İÚÙ[‹œÙ\]Y[˜ÙOYK\ØYÙWÜÙ\]Y[˜ÙBˆS‘™^İÚÙ[‹ÚÙ[—ÜÚLMYK›™^İÚÙ[—ÜÚLM‚ˆS‘™^İÚÙ[‹š\ÜİYYØWÜ™\]Y\İÚYYK\ØYÙWÜ™\]Y\İÚYˆÒT‘H™\Ù[YÚÙ[—ÜÚLMˆTÈ•SÔˆ™^İÚÙ[‹ÚÙ[—ÜÚLMˆTÈ•Sˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙH]šY[˜ÙHÚÙ[ˆÚZ[ˆ\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈˆQ•“ÒSˆ
+ˆÑSPÕ™\Ù\˜][Û—ÚYÓĞSTĞÑJPV
+\ØYÙWÜÙ\]Y[˜ÙJK
+JÌHTÈ^XİYİÚÙ[œÂˆ”“ÓHİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHÔ“ÕT–H™\Ù\˜][Û—ÚYˆ
+H]šY[˜ÙHÓˆ]šY[˜ÙKœ™\Ù\˜][Û—ÚY]œ™\Ù\˜][Û—ÚYˆÔ“ÕT–Hœ™\Ù\˜][Û—ÚY]šY[˜ÙK™^XİYİÚÙ[œÂˆU’S‘ÈÓÕS•
+
+ŠOÓĞSTĞÑJ]šY[˜ÙK™^XİYİÚÙ[œËJBˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü›İšY\ˆ\ØYÙHÚÙ[ˆ\İÜH\ÈZ\ÜÚ[™ÈÜˆ^Ù\ÜÈ[šY\ÉÎÂˆS‘QÂ‘S‘‰\ØYÙWÙ]šY[˜ÙWÚ[YÜš]IÂ‚‘È	ZYÜ˜][Û‰‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓH
+ˆÑSPÕYÙ]Ü™XÙZ\ÚYÕSJ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SÔ“ÕT–HYÙ]Ü™XÙZ\ÚYˆ
+HYØXŞHQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÈˆÓˆ‹œ™XÙZ\ÚY[YØXŞK˜YÙ]Ü™XÙZ\ÚYˆÒT‘H‹œ™XÙZ\ÚYTÈ•SÔˆYØXŞK˜ÛÜİÔˆ‹œ™\Ù\™Yİ\ÙYØXŞK˜ÛÜİˆ
+HS‚ˆRTÑHVÑTSÓˆ	ÛYØXŞH™\Ù\˜][ÛˆYÙ]YÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆQ•“ÒSˆİØ\›WØ]]Üš]WÚÜİÈÓˆšÜİÚY\‹šÜİÚYˆÒT‘H‹˜ÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SS‘
+ˆšÜİÚYTÈ•SÔˆœÛÛ˜—İ\[ÙŠ™]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊHˆ	Û[X™\‰ÂˆÔˆ
+™]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊN’S•QÑTˆˆ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	ÛYØXŞH™\Ù\˜][ÛˆÜİYÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂ‘S‘‰ZYÜ˜][Û‰Â‚•TUHİØ\›WØ]]Üš]WØYÙ]ÈˆÑU™\Ù\™Yİ\ÙX‹œ™\Ù\™Yİ\Ù[YØXŞK˜ÛÜİ‘”“ÓH
+ˆÑSPÕYÙ]Ü™XÙZ\ÚYÕSJ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SÔ“ÕT–HYÙ]Ü™XÙZ\ÚYŠHYØXŞHÒT‘H‹œ™XÙZ\ÚY[YØXŞK˜YÙ]Ü™XÙZ\ÚYÂ•TUHİØ\›WØ]]Üš]WÚÜİÈÑUˆØ\XÚ]WÜÛİÏPÓĞSTĞÑJ
+™]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊN’S•QÑT‹
+JÛYØXŞKœÛİËˆ™\Ù\™YÜÛİÏLˆ]šY[˜ÙOJ™]šY[˜ÙKIØ]˜Z[X›WÜÛİÉÊHœÛÛ˜—ØZ[ÛØš™Xİ
+ˆ	ØØ\XÚ]WÜÛİÉËÓĞSTĞÑJ
+™]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊN’S•QÑT‹
+JÛYØXŞKœÛİÂˆ
+B‘”“ÓH
+ˆÑSPÕÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SÔ“ÕT–HÜİÚYŠHYØXŞHÒT‘HšÜİÚY[YØXŞKšÜİÚYS‘˜Ø\XÚ]WÜÛİÈTÈ•SÂ•TUHİØ\›WØ]]Üš]WÚÜİÈÑUˆØ\XÚ]WÜÛİÏPÓĞSTĞÑJØ\XÚ]WÜÛİË
+]šY[˜ÙKO‰ØØ\XÚ]WÜÛİÉÊN’S•QÑT‹
+]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊN’S•QÑT‹
+Kˆ™\Ù\™YÜÛİÏPÓĞSTĞÑJ™\Ù\™YÜÛİË
+Kˆ]šY[˜ÙOJ]šY[˜ÙKIØ]˜Z[X›WÜÛİÉÊHœÛÛ˜—ØZ[ÛØš™Xİ
+ˆ	ØØ\XÚ]WÜÛİÉËÓĞSTĞÑJØ\XÚ]WÜÛİË
+]šY[˜ÙKO‰ØØ\XÚ]WÜÛİÉÊN’S•QÑT‹
+]šY[˜ÙKO‰Ø]˜Z[X›WÜÛİÉÊN’S•QÑT‹
+Bˆ
+NÂ‚STˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Üİ]WØÚXÚÎÂ’S”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+B”ÑSPÕ	ØØ[˜Ù[Y	ËÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹ÛØÚ×İ[Y\İ[\
+
+KˆœÛÛ˜—ØZ[ÛØš™Xİ
+	Ü™\Ù\˜][Û—ÚY	Ë™\Ù\˜][Û—ÚY	Ü™X\ÛÛ‰Ë	ÛYØXŞH™\Ù\˜][ÛˆXÚÙYY™XŞXÛHÜ™Y[X[ÉÊB‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SÂ•TUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIØØ[˜Ù[Y	Ëš[™[™ÏIŞßIÎšœÛÛ˜‹™]›ØØ][Û—Ü™YœÏIÖ×IÎšœÛÛ˜‹ˆÛÛœİ[YWİÚÙ[—ÜÚLM\™\X]
+	Ì	Ë
+KØ[˜Ù[İÚÙ[—ÜÚLM\™\X]
+	Ì	Ë
+KX^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÏLÌ•ÒT‘HÛÛœİ[YWİÚÙ[—ÜÚLMˆTÈ•SÂ‚‹KHYØXŞH™\Ù\˜][Ûˆ›İÜÈ]™H›İÈ™Y[ˆÛXœİÛ™YÚ]HÛÛ˜Ü™]Hš[™[™Ë‹KHÛÈH]X˜\ÙHØ[ˆ[™›Ü˜ÙH]ÈİÛˆÚXÚÜİ[H›Üˆ]™\Hİ\œ™[[™]\™H›İË‚•TUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÑUš[™[™×Ù]X˜\ÙWÜÚLMY[˜ÛÙJÚLMŠÛÛ™\İÊš[™[™Î^	ÕU	ÊJK	Ú^	ÊBˆÒT‘Hš[™[™ÈTÈ“Õ•SS‘š[™[™×Ù]X˜\ÙWÜÚLMˆTÈ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆš[™[™×Ù]X˜\ÙWÜÚLMˆÑU“Õ•SÂ‘È	š[™[™×Ù]X˜\ÙWÙYÙ\İØÛÛœİ˜Z[	‘QÒS‚ˆQˆ“ÕVTÕÈ
+ˆÑSPÕH”“ÓH×ØØ][ÙËœ×ØÛÛœİ˜Z[ˆÒT‘HÛÛœ™[YIÜX›XËœİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÉÎœ×ØØ][ÙËœ™YØÛ\ÜÂˆS‘ÛÛ›˜[YOIÜİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Øš[™[™×Ù]X˜\ÙWÙYÙ\İØÚXÚÉÂˆ
+HS‚ˆSTˆP“HX›XËœİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆQÓÓ”ÕRS•İØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Øš[™[™×Ù]X˜\ÙWÙYÙ\İØÚXÚÂˆÒPÒÈ
+š[™[™×Ù]X˜\ÙWÜÚLMY[˜ÛÙJÚLMŠÛÛ™\İÊš[™[™Î^	ÕU	ÊJK	Ú^	ÊJNÂˆS‘QÂ‘S‘‰š[™[™×Ù]X˜\ÙWÙYÙ\İØÛÛœİ˜Z[	Â‚‹KHHY™XŞXÛH™\Ù\˜][ÛˆÜ™X]Y™Y›Ü™HYÙÜ™YØ]K]Ú[™İÈš[™[™ÈØ[››İ™B‹KHÜ˜[™˜]\™YØY™[KˆØ[˜Ù[H›Û‹\İ\YÛ[™™XÛÛ˜Ú[H]^XİK‚‘È	YÙÜ™YØ]WÛZYÜ˜][Û‰‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓH
+ˆÑSPÕ‹˜YÙ]Ü™XÙZ\ÚYÕSJ‹œ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈÒT‘Hœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+BˆÔ“ÕT–HYÙ]Ü™XÙZ\ÚYˆ
+H[™[™ÈQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÈˆÓˆ‹œ™XÙZ\ÚY\[™[™Ë˜YÙ]Ü™XÙZ\ÚYˆÒT‘H‹œ™XÙZ\ÚYTÈ•SÔˆ[™[™Ë˜ÛÜİÔˆ‹œ™\Ù\™Yİ\Ù[™[™Ë˜ÛÜİˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü™KXYÙÜ™YØ]H™\Ù\˜][ÛˆYÙ]YÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓH
+ˆÑSPÕ‹šÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈˆÒT‘H‹œ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+BˆÔ“ÕT–HÜİÚYˆ
+H[™[™ÈQ•“ÒSˆİØ\›WØ]]Üš]WÚÜİÈÓˆšÜİÚY\[™[™ËšÜİÚYˆÒT‘HšÜİÚYTÈ•SÔˆœ™\Ù\™YÜÛİÈ[™[™ËœÛİÂˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ü™KXYÙÜ™YØ]H™\Ù\˜][ÛˆÜİYÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂ‘S‘‰YÙÜ™YØ]WÛZYÜ˜][Û‰Â•TUHİØ\›WØ]]Üš]WØYÙ]ÈˆÑU™\Ù\™Yİ\ÙX‹œ™\Ù\™Yİ\Ù\[™[™Ë˜ÛÜİ‘”“ÓH
+ˆÑSPÕ‹˜YÙ]Ü™XÙZ\ÚYÕSJ‹œ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈÒT‘Hœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+BˆÔ“ÕT–HYÙ]Ü™XÙZ\ÚYŠH[™[™ÈÒT‘H‹œ™XÙZ\ÚY\[™[™Ë˜YÙ]Ü™XÙZ\ÚYÂ•TUHİØ\›WØ]]Üš]WÚÜİÈÑU™\Ù\™YÜÛİÏ\™\Ù\™YÜÛİË\[™[™ËœÛİÂ‘”“ÓH
+ˆÑSPÕ‹šÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈˆÒT‘H‹œ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+BˆÔ“ÕT–HÜİÚYŠH[™[™ÈÒT‘HšÜİÚY\[™[™ËšÜİÚYÂ’S”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+B”ÑSPÕ	Ü™\Ù\˜][Û‹XØ[˜Ù[Y	ËÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹ÛØÚ×İ[Y\İ[\
+
+KˆœÛÛ˜—ØZ[ÛØš™Xİ
+	Ü™\Ù\˜][Û—ÚY	Ë™\Ù\˜][Û—ÚY	Ü™X\ÛÛ‰Ë	Ü™\Ù\˜][Ûˆ™Y]YYÙÜ™YØ]HYÙ]š[™[™ÉË	Ü™[X\ÙYØÛÜİİ\Ù	Ë™\Ù\™YØÛÜİİ\Ù
+B‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚•ÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈÒT‘Hœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+NÂ•TUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈˆÑUİ]OIØØ[˜Ù[Y	Â•ÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆS‘“ÕVTÕÈ
+ÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈÒT‘Hœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚY
+NÂ‚‹KHX\Ù\È\ÜİYY™Y›Ü™H™Y[\[Ûˆ[™ÛÛ›ÛÜ™Y[X[È^\İYØ[››İ™B‹KHÜ™Y[X[YÜ˜YYØY™[Kˆ^H™]™\ˆ]]Üš^™YH[›™\‹ÛÈØ[˜Ù[[H\Â‹KH™\^HÛXœİÛ™\È[™™[X\ÙHZ\ˆİ[\™\Ù\™Y™\Ûİ\˜Ù\È^XİHÛ˜ÙK‚‘È	YØXŞWÛX\ÙWÛZYÜ˜][Û‰‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓH
+ˆÑSPÕYÙ]Ü™XÙZ\ÚYÕSJ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+BˆÔ“ÕT–HYÙ]Ü™XÙZ\ÚYˆ
+HYØXŞHQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÈˆÓˆ‹œ™XÙZ\ÚY[YØXŞK˜YÙ]Ü™XÙZ\ÚYˆÒT‘H‹œ™XÙZ\ÚYTÈ•SÔˆYØXŞK˜ÛÜİÔˆ‹œ™\Ù\™Yİ\ÙYØXŞK˜ÛÜİˆ
+HS‚ˆRTÑHVÑTSÓˆ	ÛYØXŞHİ\X\ÙHYÙ]YÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓH
+ˆÑSPÕÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+BˆÔ“ÕT–HÜİÚYˆ
+HYØXŞHQ•“ÒSˆİØ\›WØ]]Üš]WÚÜİÈÓˆšÜİÚY[YØXŞKšÜİÚYˆÒT‘HšÜİÚYTÈ•SÔˆœ™\Ù\™YÜÛİÈYØXŞKœÛİÂˆ
+HS‚ˆRTÑHVÑTSÓˆ	ÛYØXŞHİ\X\ÙHÜİYÙ\ˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂ‘S‘‰YØXŞWÛX\ÙWÛZYÜ˜][Û‰Â•TUHİØ\›WØ]]Üš]WØYÙ]ÈˆÑU™\Ù\™Yİ\Ù\™\Ù\™Yİ\Ù[YØXŞK˜ÛÜİ‘”“ÓH
+ˆÑSPÕYÙ]Ü™XÙZ\ÚYÕSJ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+BˆÔ“ÕT–HYÙ]Ü™XÙZ\ÚYŠHYØXŞHÒT‘H‹œ™XÙZ\ÚY[YØXŞK˜YÙ]Ü™XÙZ\ÚYÂ•TUHİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÈÑU™\Ù\™Yİ\Ù\™\Ù\™Yİ\Ù[YØXŞK˜ÛÜİ‘”“ÓH
+ˆÑSPÕÚ[™İ×ÚYÕSJœ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈˆ“ÒSˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈˆÓˆ‹œ™\Ù\˜][Û—ÚYZœ™\Ù\˜][Û—ÚYˆÒT‘H‹œİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+‹œ™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆ‹˜ÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆ‹˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆ‹˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+BˆÔ“ÕT–HÚ[™İ×ÚYŠHYØXŞHÒT‘HËÚ[™İ×ÚY[YØXŞKÚ[™İ×ÚYS‘Ëœ™\Ù\™Yİ\ÙHYØXŞK˜ÛÜİÂ•TUHİØ\›WØ]]Üš]WÚÜİÈÑU™\Ù\™YÜÛİÏ\™\Ù\™YÜÛİË[YØXŞKœÛİÂ‘”“ÓH
+ˆÑSPÕÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+BˆÔ“ÕT–HÜİÚYŠHYØXŞHÒT‘HšÜİÚY[YØXŞKšÜİÚYS‘œ™\Ù\™YÜÛİÈHYØXŞKœÛİÎÂ’S”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+B”ÑSPÕ	Ü™\Ù\˜][Û‹XØ[˜Ù[Y	ËÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹ÛØÚ×İ[Y\İ[\
+
+KˆœÛÛ˜—ØZ[ÛØš™Xİ
+	Ü™\Ù\˜][Û—ÚY	Ë™\Ù\˜][Û—ÚY	ÛX\ÙWÚY	ËX\ÙWÚYˆ	Ü™X\ÛÛ‰Ë	ÛX\ÙH™Y]Y™Y[\[Ûˆ[™ÛÛ›ÛÜ™Y[X[ÉË	Ü™[X\ÙYØÛÜİİ\Ù	Ë™\Ù\™YØÛÜİİ\Ù
+B‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂ•ÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+NÂ•TUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIØØ[˜Ù[Y	Â•ÒT‘Hİ]OIÛX\ÙY[›İ\İ\Y	ÂˆS‘
+™Y[\[Û—İÚÙ[—ÜÚLMˆTÈ•SÔˆÛÛ›ÛİÚÙ[—ÜÚLMˆTÈ•SˆÔˆœ›ÚÙ\—Ù^Xİ][Û—ÚY[]HTÈ•SÔˆœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆTÈ•S
+NÂ‚‹KHX\›Y\ˆİ\X]]Üš^™Y›İÜÈY›İš[™H]][XØ]Y]X˜\ÙB‹KHš[˜Ú\[ˆ™\Ù\™HZ\ˆÛÛœÙ\˜]]™HÛÛ[Z]YYÙ\œË]]X\˜[[™B‹KH[HÛÈ^HØ[ˆ™]™\ˆ™H™]\›™Y\Èİ\œ™[ÜÚ]]™H]]Üš]K‚’S”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+B”ÑSPÕ	ÜİÜ\™\]Y\İY	ËÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹ÛØÚ×İ[Y\İ[\
+
+KˆœÛÛ˜—ØZ[ÛØš™Xİ
+	Ü™\Ù\˜][Û—ÚY	Ë™\Ù\˜][Û—ÚYˆ	Ü™X\ÛÛ‰Ë	Üİ\]]Üš^˜][Ûˆ™Y]Y]][XØ]Yœ›ÚÙ\ˆ]X˜\ÙHš[˜Ú\[	Ëˆ	Ù^Xİ][Û—Üİ]IË	İ[šÛ›İÛ‰Ë	Ü™[X\ÙYØÛÜİİ\Ù	Ë
+B‘”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂ•ÒT‘Hİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊBˆS‘
+[WÛ›Û›[Êœ›ÚÙ\—Ù]X˜\ÙWÜ›ÛKœ›ÚÙ\—Ù]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMŠHˆÂˆÔˆœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆˆ	ÉĞ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŸIÊNÂ•TUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	Â•ÒT‘Hİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊBˆS‘
+[WÛ›Û›[Êœ›ÚÙ\—Ù]X˜\ÙWÜ›ÛKœ›ÚÙ\—Ù]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMŠHˆÂˆÔˆœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆˆ	ÉĞ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŸIÊNÂ‚‹KH[H]šX]YXİ]™H™\Ù\˜][Ûˆ]\İ™H›İ[™È^XİHÛ™HÛXŞH[™Û™B‹KHZ[HÚ[™İÈ›Üˆ]ÈÚYÛ™YÛXŞK[™]™\HYÙÜ™YØ]HYÙ\ˆ]\İ™XÛÛ˜Ú[B‹KH^XİHÈHXİ]™HÛËˆ\X[Üˆ˜XœšXØ]Y]šX][Ûˆ˜Z[ÈZYÜ˜][Û‹‚‘È	YÙÜ™YØ]WÚ[YÜš]I‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÚÛÈÓˆœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚYˆQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÈÓˆËÚ[™İ×ÚYZÚ[™İ×ÚYˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆÔ“ÕT–H‹œ™\Ù\˜][Û—ÚY‹˜š[™[™Ë‹œ™\Ù\™YØÛÜİİ\ÙˆU’S‘ÈÓÕS•
+Ú[™İ×ÚY
+Hˆ‚ˆÔˆ‹œ™\Ù\™YØÛÜİİ\ÙTÈTÕSÕ”“ÓH
+‹˜š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÂˆÔˆÓÕS•
+TÕSÕËšÚ[™
+Hˆ‚ˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËšÚ[™IÜÛXŞIÊHˆBˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËšÚ[™IÙZ[IÊHˆBˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËœÛXŞWÚYTÈTÕSÕ”“ÓH‹˜š[™[™ËO‰ØYÙ]ÜÛXŞWÚY	ÂˆÔˆË˜İ\œ™[˜ŞHTÈTÕSÕ”“ÓH	ÕTÑ	ÈÔˆœ™\Ù\™YØÛÜİİ\ÙTÈTÕSÕ”“ÓH‹œ™\Ù\™YØÛÜİİ\Ù
+Hˆˆ
+HS‚ˆRTÑHVÑTSÓˆ	ØXİ]™HYÙÜ™YØ]HYÙ]]šX][Ûˆ\È[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÂˆQ•“ÒSˆ
+ˆÑSPÕÚ[™İ×ÚYÕSJœ™\Ù\™YØÛÜİİ\Ù
+HTÈ[ˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈˆ“ÒSˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈˆÓˆ‹œ™\Ù\˜][Û—ÚYZœ™\Ù\˜][Û—ÚYˆÒT‘H‹œİ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊBˆÔ“ÕT–HÚ[™İ×ÚYˆ
+HXİ]™HÓˆXİ]™KÚ[™İ×ÚY]ËÚ[™İ×ÚYˆÒT‘HËœ™\Ù\™Yİ\ÙTÈTÕSÕ”“ÓHÓĞSTĞÑJXİ]™Kš[
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	ØYÙÜ™YØ]HYÙ]Ú[™İÈYÙ\ˆÙ\È›İ™XÛÛ˜Ú[HÈXİ]™HÛÉÎÂˆS‘QÂ‘S‘‰YÙÜ™YØ]WÚ[YÜš]IÂ‚‘È	İ\Ø]]Üš]WÚ[YÜš]I‘QÒS‚ˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ‚ˆQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÈˆÓˆ‹œ™XÙZ\ÚY\‹˜YÙ]Ü™XÙZ\ÚYˆQ•“ÒSˆİØ\›WØ]]Üš]WÚÜİÈÜİÓˆÜİšÜİÚY\‹šÜİÚYˆQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]ÚÛÈÓˆœ™\Ù\˜][Û—ÚY\‹œ™\Ù\˜][Û—ÚYˆQ•“ÒSˆİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÈÓˆËÚ[™İ×ÚYZÚ[™İ×ÚYˆÒT‘H‹œİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊBˆÔ“ÕT–H‹œ™\Ù\˜][Û—ÚY‹˜š[™[™Ë‹œ™\Ù\™YØÛÜİİ\Ù‹˜ÛÛ[Z]YØÛÜİİ\Ùˆ‹œ™XÙZ\ÚYÜİšÜİÚYˆU’S‘È‹œ™XÙZ\ÚYTÈ•SÔˆÜİšÜİÚYTÈ•SˆÔˆ‹šÜİÚYTÈTÕSÕ”“ÓH‹˜š[™[™ËO‰ÚÜİÚY	ÂˆÔˆ‹œ™\Ù\™YØÛÜİİ\ÙTÈTÕSÕ”“ÓH
+‹˜š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÂˆÔˆ‹˜ÛÛ[Z]YØÛÜİİ\ÙTÈTÕSÕ”“ÓH‹œ™\Ù\™YØÛÜİİ\ÙˆÔˆÓÕS•
+Ú[™İ×ÚY
+HˆˆÔˆÓÕS•
+TÕSÕËšÚ[™
+Hˆ‚ˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËšÚ[™IÜÛXŞIÊHˆBˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËšÚ[™IÙZ[IÊHˆBˆÔˆÓÕS•
+
+ŠH’STˆ
+ÒT‘HËœÛXŞWÚYTÈTÕSÕ”“ÓH‹˜š[™[™ËO‰ØYÙ]ÜÛXŞWÚY	ÂˆÔˆË˜İ\œ™[˜ŞHTÈTÕSÕ”“ÓH	ÕTÑ	ÂˆÔˆœ™\Ù\™YØÛÜİİ\ÙTÈTÕSÕ”“ÓH‹œ™\Ù\™YØÛÜİİ\Ù
+Hˆˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ø]]Üš^™YÜ\˜][Ûˆ]šX][Ûˆ\ÈZ\ÜÚ[™Ë[XšYİ[İ\ËÜˆ[˜ÛÛœÚ\İ[	ÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]È‚ˆQ•“ÒSˆ
+ˆÑSPÕYÙ]Ü™XÙZ\ÚYÕSJ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊBˆÔ“ÕT–HYÙ]Ü™XÙZ\ÚYˆ
+HÛÛ[Z]YÓˆÛÛ[Z]Y˜YÙ]Ü™XÙZ\ÚYX‹œ™XÙZ\ÚYˆÒT‘H‹˜ÛÛ[Z]Yİ\ÙTÈTÕSÕ”“ÓHÓĞSTĞÑJÛÛ[Z]Y˜ÛÜİ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	ØÛÛ[Z]Y™XÙZ\YÙ]YÙ\ˆÙ\È›İ™XÛÛ˜Ú[IÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÂˆQ•“ÒSˆ
+ˆÑSPÕÚ[™İ×ÚYÕSJœ™\Ù\™YØÛÜİİ\Ù
+HTÈÛÜİˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÚÛÈˆ“ÒSˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈˆÓˆ‹œ™\Ù\˜][Û—ÚYZœ™\Ù\˜][Û—ÚYˆÒT‘H‹œİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊBˆÔ“ÕT–HÚ[™İ×ÚYˆ
+HÛÛ[Z]YÓˆÛÛ[Z]YÚ[™İ×ÚY]ËÚ[™İ×ÚYˆÒT‘HË˜ÛÛ[Z]Yİ\ÙTÈTÕSÕ”“ÓHÓĞSTĞÑJÛÛ[Z]Y˜ÛÜİ
+Bˆ
+HS‚ˆRTÑHVÑTSÓˆ	ØÛÛ[Z]YYÙÜ™YØ]HYÙ]YÙ\ˆÙ\È›İ™XÛÛ˜Ú[IÎÂˆS‘QÂˆQˆVTÕÈ
+ˆÑSPÕH”“ÓHİØ\›WØ]]Üš]WÚÜİÈˆQ•“ÒSˆ
+ˆÑSPÕÜİÚYÓÕS•
+
+ŠN’S•QÑTˆTÈÛİÂˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘Hİ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÊBˆÔ“ÕT–HÜİÚYˆ
+H]]Üš^™YÓˆ]]Üš^™YšÜİÚYZšÜİÚYˆÒT‘H˜]]Üš^™YÜÛİÈTÈTÕSÕ”“ÓHÓĞSTĞÑJ]]Üš^™YœÛİË
+BˆÔˆœ™\Ù\™YÜÛİÈ
+È˜]]Üš^™YÜÛİÈˆ˜Ø\XÚ]WÜÛİÂˆ
+HS‚ˆRTÑHVÑTSÓˆ	Ø]]Üš^™YÜİYÙ\ˆÙ\È›İ™XÛÛ˜Ú[IÎÂˆS‘QÂ‘S‘‰İ\Ø]]Üš]WÚ[YÜš]IÂ‚‘È	YÙÜ™YØ]WØÛÛœİ˜Z[É‘QÒS‚ˆQˆ“ÕVTÕÈ
+ÑSPÕH”“ÓH×ØÛÛœİ˜Z[ÒT‘HÛÛ›˜[YOIÜİØ\›WØ]]Üš]WØYÙ]ÚÛ×Ü™\Ù\˜][Û—ÙšÉÊHS‚ˆSTˆP“HİØ\›WØ]]Üš]WØYÙ]ÚÛÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WØYÙ]ÚÛ×Ü™\Ù\˜][Û—ÙšÂˆ“Ô‘RQÓˆÑVH
+™\Ù\˜][Û—ÚY
+H‘Q‘T‘SÑTÈİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ™\Ù\˜][Û—ÚY
+NÂˆS‘QÂˆQˆ“ÕVTÕÈ
+ÑSPÕH”“ÓH×ØÛÛœİ˜Z[ÒT‘HÛÛ›˜[YOIÜİØ\›WØ]]Üš]WØYÙ]ÚÛ×İÚ[™İ×ÙšÉÊHS‚ˆSTˆP“HİØ\›WØ]]Üš]WØYÙ]ÚÛÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WØYÙ]ÚÛ×İÚ[™İ×ÙšÂˆ“Ô‘RQÓˆÑVH
+Ú[™İ×ÚY
+H‘Q‘T‘SÑTÈİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÊÚ[™İ×ÚY
+NÂˆS‘QÂˆQˆ“ÕVTÕÈ
+ÑSPÕH”“ÓH×ØÛÛœİ˜Z[ÒT‘HÛÛ›˜[YOIÜİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œ×Ü™\Ù\˜][Û—ÙšÉÊHS‚ˆSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œÈQÓÓ”ÕRS•İØ\›WØ]]Üš]Wİ\ØYÙWİÚÙ[œ×Ü™\Ù\˜][Û—ÙšÂˆ“Ô‘RQÓˆÑVH
+™\Ù\˜][Û—ÚY
+H‘Q‘T‘SÑTÈİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ™\Ù\˜][Û—ÚY
+NÂˆS‘QÂˆQˆ“ÕVTÕÈ
+ÑSPÕH”“ÓH×ØÛÛœİ˜Z[ÒT‘HÛÛ›˜[YOIÜİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙWÜ™\Ù\˜][Û—ÙšÉÊHS‚ˆSTˆP“HİØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙHQÓÓ”ÕRS•İØ\›WØ]]Üš]Wİ\ØYÙWÙ]šY[˜ÙWÜ™\Ù\˜][Û—ÙšÂˆ“Ô‘RQÓˆÑVH
+™\Ù\˜][Û—ÚY
+H‘Q‘T‘SÑTÈİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ™\Ù\˜][Û—ÚY
+NÂˆS‘QÂ‘S‘‰YÙÜ™YØ]WØÛÛœİ˜Z[ÉÂ‚STˆP“HİØ\›WØ]]Üš]WÚÜİÈSTˆÓÓSSˆØ\XÚ]WÜÛİÈÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈSTˆÓÓSSˆ™\Ù\™YÜÛİÈÑUQUSÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈSTˆÓÓSSˆ™\Ù\™YÜÛİÈÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈSTˆÓÓSSˆ]]Üš^™YÜÛİÈÑUQUSÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈSTˆÓÓSSˆ]]Üš^™YÜÛİÈÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÚÜİ×ØØ\XÚ]WÜÛİ×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÚÜİ×ØØ\XÚ]WÜÛİ×ØÚXÚÈÒPÒÈ
+Ø\XÚ]WÜÛİÈH
+NÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÚÜİ×Ü™\Ù\™YÜÛİ×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÚÜİ×Ü™\Ù\™YÜÛİ×ØÚXÚÈÒPÒÈ
+™\Ù\™YÜÛİÈH
+NÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÚÜİ×Ø]]Üš^™YÜÛİ×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÚÜİ×Ø]]Üš^™YÜÛİ×ØÚXÚÈÒPÒÈ
+]]Üš^™YÜÛİÈH
+NÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÚÜİ×İİ[ÜÛİ×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÚÜİÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÚÜİ×İİ[ÜÛİ×ØÚXÚÈÒPÒÈ
+™\Ù\™YÜÛİÈ
+È]]Üš^™YÜÛİÈHØ\XÚ]WÜÛİÊNÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]È“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WØYÙ]×İİ[İ\ÙØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]ÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WØYÙ]×İİ[İ\ÙØÚXÚÈÒPÒÈ
+™\Ù\™Yİ\Ù
+ÈÛÛ[Z]Yİ\ÙH\™Û[Z]İ\Ù
+NÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜ×İİ[İ\ÙØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WØYÙ]İÚ[™İÜ×İİ[İ\ÙØÚXÚÈÒPÒÈ
+™\Ù\™Yİ\Ù
+ÈÛÛ[Z]Yİ\ÙH\™Û[Z]İ\Ù
+NÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆš[™[™ÈÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆ™]›ØØ][Û—Ü™YœÈÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆÛÛœİ[YWİÚÙ[—ÜÚLMˆÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆØ[˜Ù[İÚÙ[—ÜÚLMˆÑU“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈSTˆÓÓSSˆX^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÈÑU“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×ÛX\ÙWÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊX\ÙWÚY
+HÒT‘HX\ÙWÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Üİ\Ü™\]Y\İÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊİ\Ü™\]Y\İÚY
+HÒT‘Hİ\Ü™\]Y\İÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ü™Y[\[Û—ÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ™Y[\[Û—ÚY
+HÒT‘H™Y[\[Û—ÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ü™Y[\[Û—Ü™\]Y\İÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ™Y[\[Û—Ü™\]Y\İÚY
+HÒT‘H™Y[\[Û—Ü™\]Y\İÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ü[›™\—ØÛZ[WÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ[›™\—ØÛZ[WÚY
+HÒT‘H[›™\—ØÛZ[WÚYTÈ“Õ•SÂÔ‘PUHS’TUQHS‘VQˆ“ÕVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ü[›™\—ØÛZ[WÜ™\]Y\İÚYİ\BˆÓˆİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÊ[›™\—ØÛZ[WÜ™\]Y\İÚY
+HÒT‘H[›™\—ØÛZ[WÜ™\]Y\İÚYTÈ“Õ•SÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×ÛX\ÙWÙšY[×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×ÛX\ÙWÙšY[×ØÚXÚÈÒPÒÈ
+ˆ[WÛ›Û›[ÊX\ÙWÚYİ\Ü™\]Y\İÚYX\ÙWÚ\ÜİYYØ]X\ÙWÙ^\™\×Ø]X\ÙWÙ\˜][Û—Û\ÊHSˆ
+JBˆS‘
+X\ÙWÚYTÈ•SÔˆ
+ˆX\ÙWÙ\˜][Û—Û\È‘UÑQSˆLS‘LˆS‘X\ÙWÙ^\™\×Ø][X\ÙWÚ\ÜİYYØ]
+ÊX\ÙWÙ\˜][Û—Û\Ê’S•T•S	ÌHZ[\ÙXÛÛ™	ÊBˆ
+JBˆS‘
+İ]Hˆ	Ü™\Ù\™Y[›İ\İ\Y	ÈÔˆ
+X\ÙWÚYTÈ•SS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆTÈ•S
+JBˆS‘
+İ]HSˆ
+	ØØ[˜Ù[Y	Ë	Ù^\™Y	ÊHÔˆÛÛœİ[YWİÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLMŠBˆS‘
+İ]Hˆ	ØÛÛœİ[YY[›İ\İ\Y	ÈÔˆ
+ˆX\ÙWÚYTÈ•SˆS‘
+X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆTÈ•SÔˆ
+ˆÛÛœİ[YWİÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆ
+JBˆ
+JBˆS‘
+İ]Hˆ	ÛX\ÙY[›İ\İ\Y	ÈÔˆ
+ˆX\ÙWÚYTÈ“Õ•SS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆTÈ“Õ•SˆS‘[WÛ›Û›[Ê™Y[\[Û—İÚÙ[—ÜÚLM‹ÛÛ›ÛİÚÙ[—ÜÚLM‹œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Kœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YŠOMˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘™Y[\[Û—İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆ
+JBˆS‘
+İ]H“ÕSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÔˆ
+ˆX\ÙWÚYTÈ“Õ•SS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆTÈ“Õ•SˆS‘[WÛ›Û›[Ê™Y[\[Û—İÚÙ[—ÜÚLM‹ÛÛ›ÛİÚÙ[—ÜÚLM‹œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Kœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YŠOMˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘Ø[˜Ù[İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘ÛÛœİ[YWİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘X\ÙWØÛZ[WİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘™Y[\[Û—İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘[WÛ›Û›[Ê™Y[\[Û—ÚY™Y[\[Û—Ü™\]Y\İÚYİ\Ø]]Üš^™YØ]ÛÛ[Z]YØÛÜİİ\Ù
+OMˆS‘ÛÛ[Z]YØÛÜİİ\Ù\™\Ù\™YØÛÜİİ\Ùˆ
+JBˆS‘
+İ]H“ÕSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊHÔˆ
+ˆ[WÛ›Û›[Êœ›ÚÙ\—Ù]X˜\ÙWÜ›ÛKœ›ÚÙ\—Ù]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMŠOLÂˆS‘œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMIÉĞ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŸIÂˆ
+JBˆS‘
+İ]H“ÕSˆ
+	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÔˆ
+ˆ[WÛ›Û›[Ê[›™\—ØÛZ[WÚY[›™\—ØÛZ[WÜ™\]Y\İÚY[›™\—ØÛZ[WØXØÙ\YØ][›™\—ØÛZ[WÙ^\™\×Ø]ˆ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ][›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ[›™\—ÚY[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹[›™\—Ú[œİ[˜ÙWÚY[›™\—Ü[[YWÚY[›™\—ÚÜİÚYˆ[›™\—ØÚ[›™[Øš[™[™×ÜÚLM‹X\™X]İÚÙ[—ÜÚLM‹İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‹İ]ÛÛYWİÚÙ[—ÜÚLM‹ˆ[›™\—Û][˜ÚØ][\ÚY[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][Û‹[›™\—Ü™]›ØØ][Û—Ü™YœÊOLNˆS‘[WÛ›Û›[Ê\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‹›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚY
+HSˆ
+ŠBˆS‘[›™\—ØÛZ[WÙ^\™\×Ø]ˆ[›™\—ØÛZ[WØXØÙ\YØ]ˆS‘[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ]ˆS‘[›™\—ØÛZ[WÙ^\™\×Ø]H[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆS‘[›™\—Ü[[YWÚYXš[™[™ËO‰Ü[[YWÚY	ÂˆS‘[›™\—ÚÜİÚYZÜİÚYˆS‘[›™\—ÚYXš[™[™ËO‰Ù^Xİ][Û—ÚY[]IÂˆS‘[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YXš[™[™ËO‰ÚY[]WÙ]šY[˜ÙWÜ™Y‰ÂˆS‘X\™X]İÚÙ[—ÜÚLMˆˆÛÛœİ[YWİÚÙ[—ÜÚLM‚ˆS‘X\™X]İÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLM‚ˆS‘X\™X]İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘X\™X]İÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘X\™X]İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆÛÛœİ[YWİÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆˆX\™X]İÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆÛÛœİ[YWİÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆX\™X]İÚÙ[—ÜÚLM‚ˆS‘İ]ÛÛYWİÚÙ[—ÜÚLMˆˆİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆÛÛœİ[YWİÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆX\™X]İÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‚ˆS‘\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆˆİ]ÛÛYWİÚÙ[—ÜÚLM‚ˆS‘[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛˆHBˆS‘œÛÛ˜—İ\[ÙŠ[›™\—Ü™]›ØØ][Û—Ü™YœÊHH	Ø\œ˜^IÂˆS‘
+[WÛ›Û›[Ê[›™\—ÚX\™X]ÚY[›™\—ÚX\™X]Ü™\]Y\İÚYˆ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙK[›™\—ÚX\™X]ØXØÙ\YØ]ˆ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMŠOLÔˆ
+ˆ[WÛ›Û›[Ê[›™\—ÚX\™X]ÚY[›™\—ÚX\™X]Ü™\]Y\İÚYˆ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙK[›™\—ÚX\™X]ØXØÙ\YØ]ˆ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMŠOMBˆS‘[›™\—ÚX\™X]ÜÙ\]Y[˜ÙHHBˆS‘[›™\—ÚX\™X]ØXØÙ\YØ]H[›™\—ØÛZ[WØXØÙ\YØ]ˆS‘[›™\—ØÛZ[WÙ^\™\×Ø]ˆ[›™\—ÚX\™X]ØXØÙ\YØ]ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆX\™X]İÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆÛÛœİ[YWİÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆØ[˜Ù[İÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆX\ÙWØÛZ[WİÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆ™Y[\[Û—İÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆÛÛ›ÛİÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆİ]ÛÛYWİÚÙ[—ÜÚLM‚ˆS‘[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMˆˆ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‚ˆ
+JBˆ
+JBˆS‘
+İ]H“ÕSˆ
+	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÔˆ
+ˆ[WÛ›Û›[Ê[›™\—Üİ\ÛØœÙ\˜][Û—ÚY[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYˆ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ][›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]ˆ[›™\—Ü›ØÙ\Ü×Üİ\YØ][›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹[›™\—Üİ\Ù]šY[˜ÙWÜ™Y‹ˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLM‹[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMŠONBˆS‘[›™\—Ü›ØÙ\Ü×Üİ\YØ]H[›™\—ØÛZ[WØXØÙ\YØ]ˆS‘[›™\—Ü›ØÙ\Ü×Üİ\YØ]H[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]ˆS‘[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]H[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]ˆS‘[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ][›™\—ØÛZ[WÙ^\™\×Ø]ˆS‘[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLM\İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‚ˆ
+JBˆS‘
+İ]H“ÕSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	Ë	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	ØØ[˜Ù[Y	Ë	Ù^\™Y	ÊHÔ‚ˆ[WÛ›Û›[Ê[›™\—ØÛZ[WÚY[›™\—ØÛZ[WÜ™\]Y\İÚY[›™\—ØÛZ[WØXØÙ\YØ][›™\—ØÛZ[WÙ^\™\×Ø]ˆ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ][›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ[›™\—ÚY[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹[›™\—Ú[œİ[˜ÙWÚY[›™\—Ü[[YWÚY[›™\—ÚÜİÚYˆ[›™\—ØÚ[›™[Øš[™[™×ÜÚLM‹X\™X]İÚÙ[—ÜÚLM‹İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‹İ]ÛÛYWİÚÙ[—ÜÚLM‹ˆ[›™\—Û][˜ÚØ][\ÚY[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][Û‹[›™\—Ü™]›ØØ][Û—Ü™YœËˆ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‹›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚY
+OL
+BˆS‘
+İ]HSˆ
+	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÔ‚ˆ[WÛ›Û›[Ê[›™\—ÚX\™X]ÚY[›™\—ÚX\™X]Ü™\]Y\İÚYˆ[›™\—ÚX\™X]ÜÙ\]Y[˜ÙK[›™\—ÚX\™X]ØXØÙ\YØ]ˆ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLMŠOL
+BˆS‘
+İ]HSˆ
+	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	ÊHÔ‚ˆ[WÛ›Û›[Ê[›™\—Üİ\ÛØœÙ\˜][Û—ÚY[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYˆ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ][›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]ˆ[›™\—Ü›ØÙ\Ü×Üİ\YØ][›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹[›™\—Üİ\Ù]šY[˜ÙWÜ™Y‹ˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLM‹[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMŠOL
+BˆS‘
+İ]H“ÕSˆ
+	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÔˆ
+ˆ[WÛ›Û›[Ê[›™\—Ûİ]ÛÛYWÚY[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚY[›™\—Ûİ]ÛÛYWÙ]™[ÚYˆ[›™\—Ûİ]ÛÛYWÚÚ[™[›™\—Ûİ]ÛÛYWØXØÙ\YØ][›™\—Ûİ]ÛÛYWØ]ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ][›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™Y‹ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLM‹[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLM‹ˆ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YY
+OLLBˆS‘[›™\—Ûİ]ÛÛYWØ]H[›™\—ØÛZ[WØXØÙ\YØ]ˆS‘[›™\—Ûİ]ÛÛYWØ]H[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]ˆS‘[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]H[›™\—Ûİ]ÛÛYWØXØÙ\YØ]ˆS‘[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLM[İ]ÛÛYWİÚÙ[—ÜÚLM‚ˆS‘
+
+İ]OIÜ[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÈS‘[›™\—Ûİ]ÛÛYWÚÚ[™IÛ™]™\‹\İ\Y	ÂˆS‘[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆTÈ•SS‘[›™\—Ù^]Ù\ÜÜÚ][ÛˆTÈ•S
+BˆÔˆ
+İ]OIÜ[›™\‹]\›Z[˜[[ØœÙ\™Y	ÈS‘[›™\—Ûİ]ÛÛYWÚÚ[™IÜ›ØÙ\ÜË]\›Z[˜[	ÂˆS‘[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆTÈ“Õ•SS‘[›™\—Ù^]Ù\ÜÜÚ][ÛˆTÈ“Õ•S
+JBˆ
+JBˆS‘
+İ]HSˆ
+	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	ÊHÔ‚ˆ[WÛ›Û›[Ê[›™\—Ûİ]ÛÛYWÚY[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚY[›™\—Ûİ]ÛÛYWÙ]™[ÚYˆ[›™\—Ûİ]ÛÛYWÚÚ[™[›™\—Ûİ]ÛÛYWØXØÙ\YØ][›™\—Ûİ]ÛÛYWØ]ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ][›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™Y‹ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLM‹[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLM‹ˆ[›™\—Ù^]Ù\ÜÜÚ][Û‹[›™\—Ü™[[İWÜİÜØÛÛ™š\›YY
+OL
+BˆS‘
+İ]Hˆ	ÜİÜ\™\]Y\İY	ÈÔ‚ˆ[WÛ›Û›[Ê[›™\—Ûİ]ÛÛYWÚY[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚY[›™\—Ûİ]ÛÛYWÙ]™[ÚYˆ[›™\—Ûİ]ÛÛYWÚÚ[™[›™\—Ûİ]ÛÛYWØXØÙ\YØ][›™\—Ûİ]ÛÛYWØ]ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ][›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™Y‹ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLM‹[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLM‹ˆ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YY
+HSˆ
+LJJBˆS‘
+İ]Hˆ	ÜİÜ\™\]Y\İY	ÈÔˆ[›™\—Ûİ]ÛÛYWÚYTÈ•SˆÔˆ
+[›™\—Ûİ]ÛÛYWÚÚ[™IÛ™]™\‹\İ\Y	ÈS‘[›™\—Ù^]Ù\ÜÜÚ][ÛˆTÈ•S
+JBŠNÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈ“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ûİ]ÛÛYWİ˜[Y\×ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Ûİ]ÛÛYWİ˜[Y\×ØÚXÚÈÒPÒÈ
+ˆ
+[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛˆTÈ•SÔˆ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛˆHJBˆS‘
+[›™\—Ûİ]ÛÛYWÚÚ[™TÈ•SÔˆ[›™\—Ûİ]ÛÛYWÚÚ[™Sˆ
+	Û™]™\‹\İ\Y	Ë	Ü›ØÙ\ÜË]\›Z[˜[	ÊJBˆS‘
+[›™\—Ù^]Ù\ÜÜÚ][ÛˆTÈ•SÔˆ[›™\—Ù^]Ù\ÜÜÚ][ÛˆS‚ˆ
+	Ù^]Y^™\›ÉË	Ù^]Y[›Û™\›ÉË	ÜÚYÛ˜[	Ë	Üİ\\š\ÛÜ‹ZÚ[Y	Ë	İ[šÛ›İÛ‰ÊJBŠNÂSTˆP“HİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈQÓÓ”ÕRS•İØ\›WØ]]Üš]WÜ™\Ù\˜][Ûœ×Üİ]WØÚXÚÂˆÒPÒÈ
+İ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	Ë	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	Ë	ØØ[˜Ù[Y	Ë	Ù^\™Y	ÊJNÂSTˆP“HİØ\›WØ]]Üš]WØ]Y]“ÔÓÓ”ÕRS•QˆVTÕÈİØ\›WØ]]Üš]WØ]Y]Ù]™[ØÚXÚÎÂSTˆP“HİØ\›WØ]]Üš]WØ]Y]QÓÓ”ÕRS•İØ\›WØ]]Üš]WØ]Y]Ù]™[ØÚXÚÂˆÒPÒÈ
+]™[Sˆ
+	ØYZ]Y	Ë	Ü™\Ù\™Y	Ë	Ù[šYY	Ë	Ü™]›ÚÙY	Ë	ØØ[˜Ù[Y	Ë	ØÛÛœİ[YY	Ë	ØÛÛœİ[YKY[šYY	Ë	Üİ\[X\ÙKZ\ÜİYY	Ë	Üİ\[X\ÙKY[šYY	Ë	Üİ\X]]Üš]K\™YY[YY	Ë	Üİ\\™Y[\[Û‹Y[šYY	Ë	Ü[›™\‹XÛZ[KXXØÙ\Y	Ë	Ü[›™\‹XÛZ[KY[šYY	Ë	Ü[›™\‹ZX\™X]XXØÙ\Y	Ë	Ü[›™\‹ZX\™X]Y[šYY	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	Ü[›™\‹\İ\Y[šYY	Ë	Ü[›™\‹[İ]ÛÛYK[ØœÙ\™Y	Ë	Ü[›™\‹[İ]ÛÛYKY[šYY	Ë	Ü[›™\‹]\ØYÙKY]šY[˜ÙK[ØœÙ\™Y	Ë	Ü[›™\‹]\ØYÙKY]šY[˜ÙKY[šYY	Ë	Ü[›™\‹]\ØYÙKXYÙ]Xœ™XXÚ	Ë	Ü[›™\‹\™[[İK\İÜXXÚÛ›İÛYÙY	Ë	Ü[›™\‹\™[[İK\İÜXXÚÛ›İÛYÙ[Y[Y[šYY	Ë	ÚÜİXØ\XÚ]K\™[X\ÙY	Ë	ÜİÜ\™\]Y\İY	Ë	Ü™\Ù\˜][Û‹XØ[˜Ù[Y	Ë	Ù^\™Y	Ë	ØYÙ]]Ú[™İË\™YÚ\İ\™Y	Ë	ØYÙ]]Ú[™İËY[šYY	Ë	Øœ›ÚÙ\‹\š[˜Ú\[\™YÚ\İ\™Y	Ë	Øœ›ÚÙ\‹\š[˜Ú\[Y\ØX›Y	Ë	Ü™[[İK\İÜ\š[˜Ú\[\™YÚ\İ\™Y	Ë	Ü™[[İK\İÜ\š[˜Ú\[Y\ØX›Y	ÊJNÂ‰ÕTĞQÑWĞUUÔ’UWÔ“ÕUS‘WÔÔSB‰Ô‘SSÕWÔÕÔĞUUÔ’UWÔ“ÕUS‘WÔÔSB˜Â‚š[\™˜XÙHÜ[™\İ[È›İÜÎˆ™XÛÜ™İš[™Ë[šÛ›İÛ–×NÈ›İĞÛİ[Îˆ[X™\ˆ[B™^Ü[\™˜XÙH]]Üš]TÜ[ÛY[Âˆ]Y\JÜ[ˆİš[™Ë˜[Y\ÏÎˆ[šÛ›İÛ–×JNˆ›ÛZ\ÙOÜ[™\İ[Âˆ™[X\ÙOÊ
+Nˆ›ÚYÂŸB™^Ü[\™˜XÙH]]Üš]TÜ[ÛÛÈÛÛ›™Xİ
+
+Nˆ›ÛZ\ÙO]]Üš]TÜ[ÛY[ˆB‚™^Ü[\™˜XÙHÜİÜ™\ÓÜ\˜][Û]]Üš]SÜ[ÛœÈÂˆX^œ›ÚÙ\‘]šY[˜ÙPYÙS\ÏÎˆ[X™\Âˆœ›ÚÙ\”Ù\ÜÚ[Û]\İÜÎˆœ›ÚÙ\‘]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆX^[›™\‘]šY[˜ÙPYÙS\ÏÎˆ[X™\ÂˆZ[”[›™\’X\™X][\˜[\ÏÎˆ[X™\Âˆ[›™\”Ù\ÜÚ[Û]\İÜÎˆ[›™\”Ù\ÜÚ[Û]\İÜÂˆ[›™\”İ\]šY[˜ÙP]\İÜÎˆ[›™\”İ\]šY[˜ÙP]\İÜÂˆ[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜÎˆ[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜÂˆ[›™\•\ØYÙQ]šY[˜ÙP]\İÜÎˆ[›™\•\ØYÙQ]šY[˜ÙP]\İÜÂˆ\ØYÙQ]šY[˜ÙTÛÛÎˆ]]Üš]TÜ[ÛÛÂˆ\ØYÙQ]šY[˜ÙTÙ\ÜÚ[Û]\İÜÎˆ\ØYÙQ]šY[˜ÙQ]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆ™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛÎˆ]]Üš]TÜ[ÛÛÂˆ™[[İTİÜÙ\ÜÚ[Û]\İÜÎˆ™[[İTİÜ]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆ™[[İTİÜXÚÛ›İÛYÙ[Y[]\İÜÎˆ
+[œ]ˆÂˆ™\]Y\İˆ™[[İTİÜ™\]Y\İÂˆ™\]Y\İÜÚLMˆİš[™ÎÂˆJHOˆ›ÛZ\ÙO™[[İTİÜXÚÛ›İÛYÙ[Y[]\İ][ÛÂŸB‚‹ËÈ\ÙHÙZ[[™ÜÈ\™H[ÛÈ[™›Ü˜ÙY[œÚYHH[˜İ[Û‹[Û›H\ØYÙH]]Üš]K‚‹ËÈ[İÚ[™ÈHÛÜÙ\ˆ]X˜\ÙH›İ][™H[ˆHÛÛ™šYİ\™YİÜ™HÛİ[]B‹ËÈ\™Xİ›İ][™HØ[\ˆ\\ÜÈHX›XÈTIÜÈœ™\Ú™\ÜÈÛXŞK‚™^ÜÛÛœİ”“ÒÑT—ÑU’QSÑWÓPVĞQÑWÓTÈHH
+ˆŒÌÂ™^ÜÛÛœİ•S“‘T—ÑU’QSÑWÓPVĞQÑWÓTÈHŒÌÂ‚™[˜İ[Ûˆ[šX[
+›ØÚÙ\ˆİš[™ÊNˆYZ\ÜÚ[Û”™\İ[Âˆ™]\›ˆÈYZ]Yˆ˜[ÙK™\Ù\˜][Ûˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[ÛˆÛÛœİ[\[Û‘[šYY
+›ØÚÙ\ˆİš[™ÊNˆÛÛœİ[\[Û”™\İ[Âˆ™]\›ˆÈÛÛœİ[YYˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆİ\X\ÙQ[šYY
+›ØÚÙ\ˆİš[™ÊNˆİ\X\ÙT™\İ[Âˆ™]\›ˆÈX\ÙYˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆİ\™Y[\[Û‘[šYY
+›ØÚÙ\ˆİš[™ÊNˆİ\™Y[\[Û”™\İ[Âˆ™]\›ˆÈ™YY[YYˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆ[›™\ÛZ[Q[šYY
+›ØÚÙ\ˆİš[™ÊNˆ[›™\ÛZ[T™\İ[Âˆ™]\›ˆÈÛZ[YYˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆ[›™\’X\™X][šYY
+›ØÚÙ\ˆİš[™ÊNˆ[›™\’X\™X]™\İ[Âˆ™]\›ˆÈXØÙ\Yˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆ[›™\”İ\ØœÙ\˜][Û‘[šYY
+›ØÚÙ\ˆİš[™ÊNˆ[›™\”İ\ØœÙ\˜][Û”™\İ[Âˆ™]\›ˆÈØœÙ\™Yˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆ[›™\“İ]ÛÛYQ[šYY
+›ØÚÙ\ˆİš[™ÊNˆ[›™\“İ]ÛÛYT™\İ[Âˆ™]\›ˆÈÙ]Yˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[Ûˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+›ØÚÙ\ˆİš[™ÊNˆ[›™\•\ØYÙQ]šY[˜ÙT™\İ[Âˆ™]\›ˆÈ™XÛÜ™Yˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆØ›ØÚÙ\—HNÂŸB‚™[˜İ[ÛˆØ[˜Ù[][Û‘[šYY
+ˆ™\Ù\˜][Û’Yˆİš[™Ëˆ›ØÚÙ\ˆİš[™Ëˆİ]Nˆ[	Ù^\™Y	È	ÜİÜ\™\]Y\İY	ÈH[ˆ[™XYU\›Z[˜[H˜[ÙKŠNˆØ[˜Ù[][Û”™\İ[Âˆ™]\›ˆÂˆØ[˜Ù[Yˆ˜[ÙKˆ™\Ù\˜][Û—ÚYˆ™\Ù\˜][Û’Yˆİ]Kˆ[™XYWİ\›Z[˜[ˆ[™XYU\›Z[˜[ˆ™[X\ÙYØÛÜİİ\Ùˆˆ›ØÚÙ\œÎˆØ›ØÚÙ\—KˆNÂŸB‚™[˜İ[ÛˆÜ[[œİ[
+˜[YNˆ[šÛ›İÛŠNˆİš[™ÈÂˆÛÛœİ\œÙYH˜[YH[œİ[˜Ù[Ùˆ]HÈ˜[YHˆ™]È]Jİš[™Ê˜[YJJNÂˆYˆ
+S[X™\‹š\Ñš[š]J\œÙY™Ù][YJ
+JJH›İÈ™]È\œ›ÜŠ	Ñ]X˜\ÙH™]\›™Y[ˆ[˜[Y˜[œØXİ[Ûˆ[Y\İ[\‰ÊNÂˆ™]\›ˆ\œÙYÒTÓÔİš[™Ê
+NÂŸB‚™[˜İ[ÛˆØ[›ÛšXØ[\Ù
+˜[YNˆ[šÛ›İÛŠNˆİš[™ÈÂˆÛÛœİ˜]ÈHİš[™Ê˜[YJNÂˆÛÛœİX]ÚH×ŠÌKNWVÌNW^ÌßJJÎ—ŠÌNW^ÌKŸJJOÉË™^XÊ˜]ÊNÂˆYˆ
+[X]Ú
+H›İÈ™]È\œ›ÜŠ	Ñ]X˜\ÙH™]\›™YH›Û‹XØ[›ÛšXØ[TÑ[[İ[‰ÊNÂˆ™]\›ˆ	ÛX]ÚÌW_K‰ÊX]ÚÌ—HÏÈ	ÉÊKœY[™
+‹	Ì	Ê_XÂŸB‚™[˜İ[ÛˆØ[›ÛšXØ[›İšY\•\Ù
+ˆ˜[YNˆ[šÛ›İÛ‹ˆØÚ[XU™\œÚ[Ûˆ	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÈ	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ËŠNˆİš[™ÈÂˆÛÛœİ˜]ÈHİš[™Ê˜[YJNÂˆÛÛœİX]ÚH×ŠÌKNWVÌNW^ÌßJJÎ—ŠÌNW^ÌKLŸJJOÉË™^XÊ˜]ÊNÂˆYˆ
+[X]Ú
+H›İÈ™]È\œ›ÜŠ	Ñ]X˜\ÙH™]\›™YH›İšY\ˆTÑ[[İ[İ]ÚYHH™XÚ\Ú[Ûˆ[™[ÜK‰ÊNÂˆÛÛœİœ˜Xİ[Û˜[H
+X]ÚÌ—HÏÈ	ÉÊKœY[™
+L‹	Ì	ÊNÂˆYˆ
+ØÚ[XU™\œÚ[ÛˆOOH	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÊHÂˆYˆ
+K×ŒÍŸIË\İ
+œ˜Xİ[Û˜[œÛXÙJŠJJHÂˆ›İÈ™]È\œ›ÜŠ	Ñ]X˜\ÙH™]\›™YHŒH›İšY\ˆTÑ[[İ[Ú]^Ù\ÜÈ™XÚ\Ú[Û‹‰ÊNÂˆBˆ™]\›ˆ	ÛX]ÚÌW_K‰Ùœ˜Xİ[Û˜[œÛXÙJŠ_XÂˆBˆ™]\›ˆ	ÛX]ÚÌW_K‰Ùœ˜Xİ[Û˜[XÂŸB‚™[˜İ[ÛˆÜİ]šY[˜ÙJ›İÎˆ™XÛÜ™İš[™Ë[šÛ›İÛˆ[™Yš[™Y
+Nˆ\İYÜİ]šY[˜ÙH[ÂˆÛÛœİ\œÙYHÜİ]šY[˜ÙTØÚ[XKœØY™T\œÙJ›İÏË™]šY[˜ÙJNÂˆ™]\›ˆ\œÙYœİXØÙ\ÜÈÈ\œÙY™]Hˆ[ÂŸB‚˜\Ş[˜È[˜İ[ÛˆØÚĞ]]Üš]JÛY[ˆ]]Üš]TÜ[ÛY[
+Nˆ›ÛZ\ÙO›ÛÛX[ˆÂˆÛÛœİÛÛ›ÛH]ØZ]ÛY[œ]Y\J	ÔÑSPÕİ\›YÚØ]]Üš]WÛØÚÊ
+HTÈØÚÙY	ÊNÂˆ™]\›ˆÛÛ›Ûœ›İÜË›[™İOOHH	‰ˆÛÛ›Ûœ›İÜÖÌOË›ØÚÙYOOHYNÂŸB‚˜\Ş[˜È[˜İ[ÛˆØ[ÛØÚÊÛY[ˆ]]Üš]TÜ[ÛY[
+Nˆ›ÛZ\ÙOİš[™ÏˆÂˆËÈ[›ZÙH˜[œØXİ[Û—İ[Y\İ[\
+
+KÓ“ÕÊ
+K\ÈY˜[˜Ù\ÈÚ[HH˜[œØXİ[ÛˆØZ]È›ÜˆHØÚË‚ˆÛÛœİ™\İ[H]ØZ]ÛY[œ]Y\J	ÔÑSPÕÛØÚ×İ[Y\İ[\
+
+HTÈ›İÉÊNÂˆ™]\›ˆÜ[[œİ[
+™\İ[œ›İÜÖÌOË››İÊNÂŸB‚‹ÊŠˆÜİÜ™TÔS\ÈHÛÛ˜İ\œ™[˜ŞH›İ[™\NÈ]™\H]]X›HYZ\ÜÚ[ÛˆÚXÚÈ[œÈ[ˆÛ™H˜[œØXİ[Û‹ˆ
+‹Â™^ÜÛ\ÜÈÜİÜ™\ÓÜ\˜][Û]]Üš]TİÜ™H[\[Y[ÈÜ\˜][Û]]Üš]TİÜ™HÂˆ™XYÛ›H\˜X›HHYNÂˆš]˜]H™XYÛ›HX^œ›ÚÙ\‘]šY[˜ÙPYÙS\Îˆ[X™\Âˆš]˜]H™XYÛ›Hœ›ÚÙ\”Ù\ÜÚ[Û]\İÜˆœ›ÚÙ\‘]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆš]˜]H™XYÛ›HX^[›™\‘]šY[˜ÙPYÙS\Îˆ[X™\Âˆš]˜]H™XYÛ›HZ[”[›™\’X\™X][\˜[\Îˆ[X™\Âˆš]˜]H™XYÛ›H[›™\”Ù\ÜÚ[Û]\İÜˆ[›™\”Ù\ÜÚ[Û]\İÜÂˆš]˜]H™XYÛ›H[›™\”İ\]šY[˜ÙP]\İÜˆ[›™\”İ\]šY[˜ÙP]\İÜÂˆš]˜]H™XYÛ›H[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜˆ[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜÂˆš]˜]H™XYÛ›H[›™\•\ØYÙQ]šY[˜ÙP]\İÜˆ[›™\•\ØYÙQ]šY[˜ÙP]\İÜÂˆš]˜]H™XYÛ›H\ØYÙQ]šY[˜ÙTÛÛÎˆ]]Üš]TÜ[ÛÛÂˆš]˜]H™XYÛ›H\ØYÙQ]šY[˜ÙTÙ\ÜÚ[Û]\İÜˆ\ØYÙQ]šY[˜ÙQ]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆš]˜]H™XYÛ›H™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛÎˆ]]Üš]TÜ[ÛÛÂˆš]˜]H™XYÛ›H™[[İTİÜÙ\ÜÚ[Û]\İÜˆ™[[İTİÜ]X˜\ÙTÙ\ÜÚ[Û]\İÜÂˆš]˜]H™XYÛ›H™[[İTİÜXÚÛ›İÛYÙ[Y[]\İÜÎˆ
+[œ]ˆÂˆ™\]Y\İˆ™[[İTİÜ™\]Y\İÂˆ™\]Y\İÜÚLMˆİš[™ÎÂˆJHOˆ›ÛZ\ÙO™[[İTİÜXÚÛ›İÛYÙ[Y[]\İ][ÛÂ‚ˆÛÛœİXİÜŠˆš]˜]H™XYÛ›HÛÛˆ]]Üš]TÜ[ÛÛˆÜ[ÛœÎˆÜİÜ™\ÓÜ\˜][Û]]Üš]SÜ[ÛœÈHßKˆ
+HÂˆ\Ë›X^œ›ÚÙ\‘]šY[˜ÙPYÙS\ÈHÜ[ÛœË›X^œ›ÚÙ\‘]šY[˜ÙPYÙS\ÈÏÈ”“ÒÑT—ÑU’QSÑWÓPVĞQÑWÓTÎÂˆYˆ
+\Ë›X^œ›ÚÙ\‘]šY[˜øë½û¶‰Ëkºwµç[›™\—ØÚ[›™[Øš[™[™×ÜÚLMŠKˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆİš[™Ê›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMŠKˆ]šY[˜ÙWÜ™Yˆİš[™Ê›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜ™YŠKˆ]šY[˜ÙWÜÚLMˆİš[™Ê›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMŠKˆ›ØÙ\Ü×Üİ\YØ]ˆÜ[[œİ[
+›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+Kˆ]šY[˜ÙWÛØœÙ\™YØ]ˆÜ[[œİ[
+›İËœ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]
+KˆXØÙ\YØ]ˆÜ[[œİ[
+›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]
+Kˆ˜[œÜÜÜİ]Nˆ	Ø]\İY[›İY\ŞYY	Ëˆ\Ü]ÚÜİ]Nˆ	Û›İY\Ü]ÚY	Ëˆ^Xİ][Û—ÛØœÙ\™YˆYKˆÛÜšÛØYÙY™™XİÛØœÙ\™Yˆ˜[ÙKˆİ]Nˆ	Ü[›™\‹\İ\[ØœÙ\™Y	ËˆJNÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆ]ØZ]ÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XË×İ[\	ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JH™]\›ˆ]ØZ][J	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆ]H]ØZ]Ø[ÛØÚÊÛY[
+NÂˆÛÛœİ›İÓ\ÈH]Kœ\œÙJ]
+NÂ‚ˆÛÛœİœ›ÚÙ\]\İ][ÛˆH]ØZ]\Ë˜œ›ÚÙ\”Ù\ÜÚ[Û]\İÜŠÛY[
+NÂˆYˆ
+Xœ›ÚÙ\]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][Jœ›ÚÙ\ˆ]X˜\ÙHÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	Øœ›ÚÙ\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ[›™\]\İ][ÛˆH]ØZ]\Ëœ[›™\”Ù\ÜÚ[Û]\İÜŠÛY[
+NÂˆYˆ
+\[›™\]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][J[›™\ˆ˜[œÜÜÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	Ü[›™\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ\œÙY[›™\ˆH[›™\”Ù\ÜÚ[Û”ØÚ[XKœØY™T\œÙJ[›™\]\İ][Û‹œÙ\ÜÚ[ÛŠNÂˆYˆ
+\\œÙY[›™\‹œİXØÙ\ÜÊH™]\›ˆ]ØZ][J	Ô[›™\ˆ˜[œÜÜ]\İ][Ûˆ\ÈX[›Ü›YY‰ÊNÂˆÛÛœİ[›™\ˆH\œÙY[›™\‹™]NÂˆÛÛœİİ\]\İ][ÛˆH]ØZ]\Ëœ[›™\”İ\]šY[˜ÙP]\İÜŠÛY[
+NÂˆYˆ
+\İ\]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][J[›™\ˆİ\]šY[˜ÙH\È›İ]]Üš^™Yˆ	Üİ\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ\œÙY]šY[˜ÙHH[›™\”İ\]šY[˜ÙTØÚ[XKœØY™T\œÙJİ\]\İ][Û‹™]šY[˜ÙJNÂˆYˆ
+\\œÙY]šY[˜ÙKœİXØÙ\ÜÊH™]\›ˆ]ØZ][J	Ô[›™\ˆİ\]šY[˜ÙH\ÈX[›Ü›YY‰ÊNÂˆÛÛœİ]šY[˜ÙHH\œÙY]šY[˜ÙK™]NÂˆÛÛœİ[›™\“ØœÙ\™Y\ÈH]Kœ\œÙJ[›™\‹›ØœÙ\™YØ]
+NÂˆÛÛœİ]šY[˜ÙSØœÙ\™Y\ÈH]Kœ\œÙJ]šY[˜ÙK›ØœÙ\™YØ]
+NÂˆYˆ
+[›™\“ØœÙ\™Y\Èˆ›İÓ\È
+ÈŒÌ›İÓ\ÈH[›™\“ØœÙ\™Y\Èˆ\Ë›X^[›™\‘]šY[˜ÙPYÙS\Âˆ]šY[˜ÙSØœÙ\™Y\Èˆ›İÓ\ÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆ˜[œÜÜÜˆİ\]šY[˜ÙH\Èİ[HÜˆœ›ÛHH]\™K‰ÊNÂˆBˆYˆ
+]Kœ\œÙJ[›™\‹˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\Âˆ]Kœ\œÙJ]šY[˜ÙK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\ÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆ˜[œÜÜÜˆİ\Y]šY[˜ÙHXØÙ\ÜÈ™]šY]È\È^\™Y‰ÊNÂˆBˆYˆ
+]šY[˜ÙKœ™\Ù\˜][Û—ÚYOOH™\]Y\İœ™\Ù\˜][Û—ÚY]šY[˜ÙK˜ÛZ[WÚYOOH™\]Y\İ˜ÛZ[WÚYˆ]šY[˜ÙK›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚY]šY[˜ÙK™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ]šY[˜ÙK˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ][J	ÔÙ\™\‹[İÛ™Yİ\]šY[˜ÙHÙ\È›İš[™H™\]Y\İYÜ\˜][Ûˆ[™ÛZ[K‰ÊNÂˆBˆYˆ
+]šY[˜ÙKœ[›™\—ÚYOOH[›™\‹œ[›™\—ÚYˆ]šY[˜ÙKœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH[›™\‹œ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ]šY[˜ÙKœ[›™\—Ú[œİ[˜ÙWÚYOOH[›™\‹œ[›™\—Ú[œİ[˜ÙWÚY]šY[˜ÙKœ[[YWÚYOOH[›™\‹œ[[YWÚYˆ]šY[˜ÙKšÜİÚYOOH[›™\‹šÜİÚY]šY[˜ÙK˜Ú[›™[Øš[™[™×ÜÚLMˆOOH[›™\‹˜Ú[›™[Øš[™[™×ÜÚLM‚ˆ]šY[˜ÙK›][˜ÚØ][\ÚYOOH[›™\‹›][˜ÚØ][\ÚYˆ]šY[˜ÙK™™[˜Ú[™×ÙÙ[™\˜][ÛˆOOH[›™\‹™™[˜Ú[™×ÙÙ[™\˜][ÛŠHÂˆ™]\›ˆ]ØZ][J	ÔÙ\™\‹[İÛ™Yİ\]šY[˜ÙHÙ\È›İX]ÚH]][XØ]Y[›™\ˆÙ\ÜÚ[Û‹‰ÊNÂˆB‚ˆÛÛœİİ\ÚÙ[‘YÙ\İHÜ™X]R\Ú
+	ÜÚLM‰ÊK\]J™\]Y\İœİ\ÛØœÙ\˜][Û—İÚÙ[‹	İ]	ÊK™YÙ\İ
+	Ú^	ÊNÂˆÛÛœİ›İ[™H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+‹ˆ
+™\Ù\™YØÛÜİİ\ÙTÈ“ÕTÕSÕ”“ÓH
+š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÊHTÈÛÜİÛX]Ú\×Øš[™[™Âˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘[›™\—ØÛZ[WÚYI]ZY“ÔˆTUXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY™\]Y\İ˜ÛZ[WÚYKˆ
+NÂˆÛÛœİ›İÈH›İ[™œ›İÜÖÌNÂˆYˆ
+\›İÊH™]\›ˆ]ØZ][J	Ô[›™\ˆÛZ[HÙ\È›İ^\İ‰ÊNÂˆYˆ
+›İË›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚY›İË™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ›İË˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆİ\ØœÙ\˜][ÛˆÙ\È›İX]ÚHÛZ[YYÜ\˜][Û‹‰ÊNÂˆBˆYˆ
+›İËœİ]HOOH	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÊHÂˆÛÛœİÙ[™\˜][Û“X]Ú\ÈH›İËœİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆOOHİ\ÚÙ[‘YÙ\İˆ	‰ˆ›İËœ[›™\—ÚYOOH[›™\‹œ[›™\—ÚYˆ	‰ˆ›İËœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH[›™\‹œ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆ›İËœ[›™\—Ú[œİ[˜ÙWÚYOOH[›™\‹œ[›™\—Ú[œİ[˜ÙWÚYˆ	‰ˆ›İËœ[›™\—Ü[[YWÚYOOH[›™\‹œ[[YWÚYˆ	‰ˆ›İËœ[›™\—ÚÜİÚYOOH[›™\‹šÜİÚYˆ	‰ˆ›İËœ[›™\—ØÚ[›™[Øš[™[™×ÜÚLMˆOOH[›™\‹˜Ú[›™[Øš[™[™×ÜÚLM‚ˆ	‰ˆ›İËœ[›™\—Û][˜ÚØ][\ÚYOOH[›™\‹›][˜ÚØ][\ÚYˆ	‰ˆ[X™\Š›İËœ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛŠHOOH[›™\‹™™[˜Ú[™×ÙÙ[™\˜][Û‚ˆ	‰ˆ]Kœ\œÙJ]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]
+HH]Kœ\œÙJİš[™Ê›İËœ[›™\—ØÛZ[WØXØÙ\YØ]
+JNÂˆYˆ
+YÙ[™\˜][Û“X]Ú\ÊHÂˆ™]\›ˆ]ØZ][J	ĞÛÛ˜YXİÜHİ\]šY[˜ÙHÙ\È›İX]ÚHÙ]Y^Xİ][ÛˆÙ[™\˜][Û‹‰ÊNÂˆBˆÛÛœİ\XØ]HH]ØZ]ÛY[œ]Y\JˆÑSPÕ™\Ù\˜][Û—ÚY”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYIN]ZYÔˆ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMI‚ˆÔˆ[›™\—Üİ\Ù]šY[˜ÙWÜ™YIÈÔˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMISRUXˆÜ™\]Y\İ›ØœÙ\˜][Û—Ü™\]Y\İÚY]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM—Kˆ
+NÂˆYˆ
+\XØ]Kœ›İÜË›[™İ
+H™]\›ˆ]ØZ][J	ĞÛÛ˜YXİÜHİ\™\]Y\İÜˆ]šY[˜ÙH\È[™XYH›İ[™‰ÊNÂˆÛÛœİÛÛ™›XİYH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	Ëˆ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYI]ZY[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYIÎ]ZYˆ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]I[Y\İ[\‹ˆ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]IN[Y\İ[\‹[›™\—Ü›ØÙ\Ü×Üİ\YØ]I[Y\İ[\‹ˆ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMIË[›™\—Üİ\Ù]šY[˜ÙWÜ™YIˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMIK[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMILˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]OIÜ[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÂˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMIL‘UT“’S‘È™\Ù\˜][Û—ÚYˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY˜[™ÛUURQ
+
+K™\]Y\İ›ØœÙ\˜][Û—Ü™\]Y\İÚY]ˆ]šY[˜ÙK›ØœÙ\™YØ]]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹ˆ]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM‹İ\ÚÙ[‘YÙ\İKˆ
+NÂˆYˆ
+ÛÛ™›XİYœ›İÜË›[™İOOHJH™]\›ˆ]ØZ][J	ĞÛÛ˜YXİÜHİ\]šY[˜ÙHÜİ]È]X\˜[[™H˜XÙK‰ÊNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	ÜİÜ\™\]Y\İY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆ™X\ÛÛˆ	Ø]][XØ]Yİ\]šY[˜ÙHÛÛ˜YXİYÙ]Y™]™\‹\İ\Y]šY[˜ÙIËˆ^Xİ][Û—Üİ]Nˆ	ØÛÛ™›XİY	Ë™[X\ÙYØÛÜİİ\Ùˆ™[X\ÙYÚÜİÜÛİÎˆˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆ[›™\”İ\ØœÙ\˜][Û‘[šYY
+	Ğ]][XØ]Yİ\]šY[˜ÙHÛÛ˜YXİY™]™\‹\İ\Y]šY[˜ÙNÈ]]Üš]H\È]X\˜[[™Y‰ÊNÂˆBˆÛÛœİ^Xİ™\]Y\İH›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	Âˆ	‰ˆ›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYOOH™\]Y\İ›ØœÙ\˜][Û—Ü™\]Y\İÚYÂˆÛÛœİ]X\˜[[™HH\Ş[˜È
+™X\ÛÛˆİš[™Ë›ØÚÙ\ˆİš[™ÊNˆ›ÛZ\ÙO[›™\”İ\ØœÙ\˜][Û”™\İ[ˆOˆÂˆÛÛœİİÜYH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	ÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]HSˆ
+	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊBˆ‘UT“’S‘È™\Ù\˜][Û—ÚYˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYKˆ
+NÂˆYˆ
+İÜYœ›İÜË›[™İOOHJH™]\›ˆ]ØZ][J	Ô[›™\‹\İ\]X\˜[[™HÜİ]È]]Üš]H˜XÙK‰ÊNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	ÜİÜ\™\]Y\İY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚY™X\ÛÛ‹ˆ^Xİ][Û—Üİ]Nˆ^Xİ™\]Y\İÈ	Üİ\Y[Ü‹][šÛ›İÛ‰Èˆ	İ[šÛ›İÛ‰Ë™[X\ÙYØÛÜİİ\ÙˆˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆ[›™\”İ\ØœÙ\˜][Û‘[šYY
+›ØÚÙ\ŠNÂˆNÂˆYˆ
+›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	È	‰ˆY^Xİ™\]Y\İ
+HÂˆ™]\›ˆ]ØZ][J	ĞHY™™\™[İ\ØœÙ\˜][Ûˆ[™XYHİÛœÈ\È[›™\ˆÛZ[K‰ÊNÂˆBˆYˆ
+›İËœİ]HOOH	Ü[›™\‹XÛZ[YY[›İ\İ\Y	È	‰ˆY^Xİ™\]Y\İ
+HÂˆ™]\›ˆ]ØZ][J[›™\ˆİ\Ø[››İ™HØœÙ\™Yœ›ÛHİ]H	Ôİš[™Ê›İËœİ]J_K˜
+NÂˆBˆYˆ
+Y^Xİ™\]Y\İ	‰ˆ›İÓ\ÈH]šY[˜ÙSØœÙ\™Y\Èˆ\Ë›X^[›™\‘]šY[˜ÙPYÙS\ÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆİ\]šY[˜ÙH\Èİ[K‰ÊNÂˆB‚ˆÛÛœİš[™[™ÈHÜ\˜][Ûš[™[™ÔØÚ[XKœØY™T\œÙJ›İË˜š[™[™ÊNÂˆYˆ
+Xš[™[™ËœİXØÙ\ÜÈÚLM‘YÙ\İ
+š[™[™Ë™]JHOOH›İË˜š[™[™×ÙYÙ\İÜÚLMˆ›İË˜ÛÜİÛX]Ú\×Øš[™[™ÈOOHYJHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	ÜİÜ™Yš[™[™È[˜[Y™Y›Ü™H[›™\ˆİ\ØœÙ\˜][Û‰Ë	ÔİÜ™Y™\Ù\˜][Ûˆš[™[™ÈÜˆÚYÛ™YÛÜİ\È[˜[Y‰ÊNÂˆBˆÛÛœİš^Y]]Üš]PØ\\ÈHX]›Z[Šˆ]Kœ\œÙJİš[™Ê›İËœ™\Ù\˜][Û—Ù^\™\×Ø]
+JKˆ]Kœ\œÙJİš[™Ê›İË›X\ÙWÙ^\™\×Ø]
+JKˆ]Kœ\œÙJİš[™Ê›İËœİ\Ø]]Üš^™YØ]
+JH
+Èš[™[™Ë™]K[Y[İ]Û\Ëˆ
+NÂˆÛÛœİİ\œ™[]šY[˜ÙSØœÙ\™Y\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ]
+JNÂˆÛÛœİİ\œ™[XØÙ\ÜÔ™]šY]Ñ^\™\Ó\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+JNÂˆÛÛœİİ\œ™[ÛZ[Q^\S\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—ØÛZ[WÙ^\™\×Ø]
+JNÂˆÛÛœİİ\œ™[]]Üš]PØ\\ÈHX]›Z[Šˆİ\œ™[XØÙ\ÜÔ™]šY]Ñ^\™\Ó\Ëˆİ\œ™[]šY[˜ÙSØœÙ\™Y\È
+È\Ë›X^[›™\‘]šY[˜ÙPYÙS\Ëˆš^Y]]Üš]PØ\\Ëˆ
+NÂˆYˆ
+S[X™\‹š\Ñš[š]Jİ\œ™[]]Üš]PØ\\ÊHİ\œ™[ÛZ[Q^\S\ÈOOHİ\œ™[]]Üš]PØ\\Âˆİ\œ™[ÛZ[Q^\S\ÈH›İÓ\ÊHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆ]]Üš]H^\™YÜˆšYY™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô[›™\ˆ]]Üš]H^\™YÜˆšYY™Y›Ü™Hİ\ØœÙ\˜][Û‹‰ÊNÂˆBˆÛÛœİÛZ[PXØÙ\Y\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—ØÛZ[WØXØÙ\YØ]
+JNÂˆÛÛœİ]\İ]™[™\ÜĞ]\ÈH›İËœ[›™\—ÚX\™X]ØXØÙ\YØ]OOH[ˆÈÛZ[PXØÙ\Y\Èˆ]Kœ\œÙJİš[™Ê›İËœ[›™\—ÚX\™X]ØXØÙ\YØ]
+JNÂˆÛÛœİİÜ™Y›ØÙ\ÜÔİ\Y\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+JNÂˆÛÛœİİÜ™Yİ\]šY[˜ÙSØœÙ\™Y\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]
+JNÂˆÛÛœİİÜ™Yİ\XØÙ\Y\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]
+JNÂˆÛÛœİİÜ™YÚ›Û›ÛÙŞR[˜[YH^Xİ™\]Y\İ	‰ˆ
+ˆS[X™\‹š\Ñš[š]JİÜ™Y›ØÙ\ÜÔİ\Y\ÊHS[X™\‹š\Ñš[š]JİÜ™Yİ\]šY[˜ÙSØœÙ\™Y\ÊBˆS[X™\‹š\Ñš[š]JİÜ™Yİ\XØÙ\Y\ÊHİÜ™Y›ØÙ\ÜÔİ\Y\ÈÛZ[PXØÙ\Y\ÂˆİÜ™Y›ØÙ\ÜÔİ\Y\ÈˆİÜ™Yİ\]šY[˜ÙSØœÙ\™Y\ÂˆİÜ™Yİ\]šY[˜ÙSØœÙ\™Y\ÈˆİÜ™Yİ\XØÙ\Y\ÂˆİÜ™Yİ\XØÙ\Y\ÈHİ\œ™[ÛZ[Q^\S\Âˆ
+NÂˆYˆ
+]Kœ\œÙJ]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]
+HÛZ[PXØÙ\Y\Âˆ
+Y^Xİ™\]Y\İ	‰ˆ]šY[˜ÙSØœÙ\™Y\È]\İ]™[™\ÜĞ]\ÊBˆ]šY[˜ÙSØœÙ\™Y\Èˆ›İÓ\ÈİÜ™YÚ›Û›ÛÙŞR[˜[Y
+HÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆİ\Ú›Û›ÛÙŞHšYY	Ë	Ô[›™\ˆİ\]šY[˜ÙHÚ›Û›ÛÙŞH\È[˜[Y‰ÊNÂˆBˆÛÛœİİÜ™YÜ™Y[X[YÙ\İÈHÂˆ›İË˜ÛÛœİ[YWİÚÙ[—ÜÚLM‹›İË˜Ø[˜Ù[İÚÙ[—ÜÚLM‹›İË›X\ÙWØÛZ[WİÚÙ[—ÜÚLM‹ˆ›İËœ™Y[\[Û—İÚÙ[—ÜÚLM‹›İË˜ÛÛ›ÛİÚÙ[—ÜÚLM‹›İËšX\™X]İÚÙ[—ÜÚLM‹ˆ›İËœİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‹›İË›İ]ÛÛYWİÚÙ[—ÜÚLM‹ˆ›İË\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLM‹ˆNÂˆYˆ
+İÜ™YÜ™Y[X[YÙ\İËœÛÛYJ
+YÙ\İ
+HOˆ\[ÙˆYÙ\İOOH	Üİš[™ÉÊBˆ™]ÈÙ]
+İÜ™YÜ™Y[X[YÙ\İÊKœÚ^™HOOHİÜ™YÜ™Y[X[YÙ\İË›[™İˆ›İËœİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMˆOOHİ\ÚÙ[‘YÙ\İ
+HÂˆ™]\›ˆ^Xİ™\]Y\İˆÈ]ØZ]]X\˜[[™J	Üİ\[ØœÙ\˜][ÛˆÜ™Y[X[šYYÛˆ™]IË	Ôİ\[ØœÙ\˜][ÛˆÜ™Y[X[šYYÛˆ™]K‰ÊBˆˆ]ØZ][J	Ôİ\[ØœÙ\˜][ÛˆÜ™Y[X[\È[˜[YÜˆ[X\Ù\È[›İ\ˆY™XŞXÛHÜ™Y[X[‰ÊNÂˆBˆYˆ
+[›™\‹œ[›™\—ÚYOOHš[™[™Ë™]K™^Xİ][Û—ÚY[]Bˆ[›™\‹œ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOHš[™[™Ë™]KšY[]WÙ]šY[˜ÙWÜ™Y‚ˆ[›™\‹œ[[YWÚYOOHš[™[™Ë™]Kœ[[YWÚY[›™\‹šÜİÚYOOH›İËšÜİÚYˆ›İËœ[›™\—ÚYOOH[›™\‹œ[›™\—ÚY›İËœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH[›™\‹œ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ›İËœ[›™\—Ú[œİ[˜ÙWÚYOOH[›™\‹œ[›™\—Ú[œİ[˜ÙWÚY›İËœ[›™\—Ü[[YWÚYOOH[›™\‹œ[[YWÚYˆ›İËœ[›™\—ÚÜİÚYOOH[›™\‹šÜİÚY›İËœ[›™\—ØÚ[›™[Øš[™[™×ÜÚLMˆOOH[›™\‹˜Ú[›™[Øš[™[™×ÜÚLM‚ˆ›İËœ[›™\—Û][˜ÚØ][\ÚYOOH[›™\‹›][˜ÚØ][\ÚYˆ[X™\Š›İËœ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛŠHOOH[›™\‹™™[˜Ú[™×ÙÙ[™\˜][ÛŠHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆY[]HÜˆÚ[›™[šYY™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô[›™\ˆY[]KXÙ[Y[ÜˆÚ[›™[šYY™Y›Ü™Hİ\ØœÙ\˜][Û‹‰ÊNÂˆBˆYˆ
+›İË˜œ›ÚÙ\—Ù]X˜\ÙWÜ›ÛHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛBˆ›İË˜œ›ÚÙ\—Ù]X˜\ÙWÛ˜[YHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YBˆ›İË˜œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹˜ÛÛ˜XİÙYÙ\İÜÚLM‚ˆ›İË˜œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŠHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ø]][XØ]Yœ›ÚÙ\ˆš[˜Ú\[šYY™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ğ]][XØ]Yœ›ÚÙ\ˆš[˜Ú\[šYY™Y›Ü™Hİ\ØœÙ\˜][Û‹‰ÊNÂˆBˆÛÛœİš[˜Ú\[H]ØZ]ÛY[œ]Y\JˆÑSPÕ]X˜\ÙWÜ›ÛK]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ù^Xİ][Û—ÚY[]Kœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹ˆ]]—ÚÚ[™›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‹ØœÙ\™YØ]XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]İ]K]šY[˜ÙBˆ”“ÓHİØ\›WØ]]Üš]WØœ›ÚÙ\—Üš[˜Ú\[ÂˆÒT‘H]X˜\ÙWÜ›ÛOIHS‘]X˜\ÙWÛ˜[YOI˜ˆØœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛKœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YWKˆ
+NÂˆÛÛœİš[˜Ú\[]šY[˜ÙHHœ›ÚÙ\”š[˜Ú\[]šY[˜ÙTØÚ[XKœØY™T\œÙJš[˜Ú\[œ›İÜÖÌOË™]šY[˜ÙJNÂˆÛÛœİš[˜Ú\[›İÈHš[˜Ú\[œ›İÜÖÌNÂˆÛÛœİš[˜Ú\[İ\œ™[Hš[˜Ú\[œ›İÜË›[™İOOHH	‰ˆš[˜Ú\[]šY[˜ÙKœİXØÙ\ÜÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÜ›ÛHOOHš[˜Ú\[›İË™]X˜\ÙWÜ›ÛBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÛ˜[YHOOHš[˜Ú\[›İË™]X˜\ÙWÛ˜[YBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOHš[˜Ú\[›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOHš[˜Ú\[›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜]]—ÚÚ[™OOHš[˜Ú\[›İË˜]]—ÚÚ[™ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOHš[˜Ú\[›İËœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOHš[˜Ú\[›İËœİ]Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË›ØœÙ\™YØ]
+Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOH	Ü™XYIÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÜ›ÛHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÛ˜[YHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOH›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‚ˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH›İÓ\È
+ÈŒÌˆ	‰ˆ›İÓ\ÈH]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH\Ë›X^œ›ÚÙ\‘]šY[˜ÙPYÙS\Âˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Hˆ›İÓ\ÎÂˆYˆ
+\š[˜Ú\[İ\œ™[
+HÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Øœ›ÚÙ\ˆš[˜Ú\[[˜]˜Z[X›H™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ğœ›ÚÙ\ˆš[˜Ú\[\È[˜]˜Z[X›Kİ[K\ØX›YÜˆšYY‰ÊNÂˆB‚ˆÛÛœİİÜ™YÜ\˜][Û”™YœÈH™]›ØØ][Û”™YœÔØÚ[XKœØY™T\œÙJ›İËœ™]›ØØ][Û—Ü™YœÊNÂˆÛÛœİİÜ™Y[›™\”™YœÈH™]›ØØ][Û”™YœÔØÚ[XKœØY™T\œÙJ›İËœ[›™\—Ü™]›ØØ][Û—Ü™YœÊNÂˆYˆ
+\İÜ™YÜ\˜][Û”™YœËœİXØÙ\ÜÈ\İÜ™Y[›™\”™YœËœİXØÙ\ÜÊHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	ÜİÜ™Y™]›ØØ][Ûˆš[™[™È[˜[Y™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	ÔİÜ™Y™]›ØØ][Ûˆš[™[™È\È[˜[Y‰ÊNÂˆBˆÛÛœİ™YœÈH™]›ØØ][Û”™YœÔØÚ[XKœØY™T\œÙJÂˆ‹‹œİÜ™YÜ\˜][Û”™YœË™]Kˆ[›™\‰Ü[›™\‹œ[›™\—ÚYX[›™\‹Z[œİ[˜ÙN‰Ü[›™\‹œ[›™\—Ú[œİ[˜ÙWÚYXˆY[]N‰Ü[›™\‹œ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YŸXÚ[›™[‰Ü[›™\‹˜Ú[›™[Øš[™[™×ÜÚLMŸXˆJNÂˆYˆ
+\™YœËœİXØÙ\ÜÈ”ÓÓ‹œİš[™ÚYJ™YœË™]JHOOH”ÓÓ‹œİš[™ÚYJİÜ™Y[›™\”™YœË™]JJHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆ™]›ØØ][Ûˆš[™[™ÈšYY™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô[›™\ˆ™]›ØØ][Ûˆš[™[™ÈšYY™Y›Ü™Hİ\ØœÙ\˜][Û‹‰ÊNÂˆBˆÛÛœİ™]›ÚÙYH]ØZ]ÛY[œ]Y\J	ÔÑSPÕ™Yˆ”“ÓHİØ\›WØ]]Üš]WÜ™]›ØØ][ÛœÈÒT‘H™YˆHS–J	N^×JHSRUIËÜ™YœË™]WJNÂˆYˆ
+™]›ÚÙYœ›İÜË›[™İ
+HÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆÜˆÜ\˜][Ûˆ]]Üš]H™]›ÚÙY™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô[›™\ˆÜˆÜ\˜][Ûˆ]]Üš]H\È™]›ÚÙY‰ÊNÂˆBˆÛÛœİ™\\™YH]ØZ]ÛY[œ]Y\Jˆ	ÔÑSPÕš[™[™×ÙYÙ\İÜÚLM‹İ]H”“ÓHİØ\›WØ]]Üš]WÜ™\\™YÛÜ\˜][ÛœÈÒT‘HÜ\˜][Û—ÚYIIËˆÜ™\]Y\İ›Ü\˜][Û—ÚYKˆ
+NÂˆYˆ
+™\\™Yœ›İÜÖÌOËœİ]HOOH	Ü™XYIÈ™\\™Yœ›İÜÖÌOË˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü™\\™YÜ\˜][Ûˆ[˜]˜Z[X›H™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô™\\™YÜ\˜][Ûˆ\È[˜]˜Z[X›HÜˆšYY‰ÊNÂˆBˆÛÛœİÜİ™\İ[H]ØZ]ÛY[œ]Y\JˆÑSPÕ]šY[˜ÙKØ\XÚ]WÜÛİË™\Ù\™YÜÛİË]]Üš^™YÜÛİËˆ
+]]Üš^™YÜÛİÈTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓÕS•
+
+ŠNš[YÙ\ˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘HÜİÚYIHS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Âˆ”“ÓHİØ\›WØ]]Üš]WÚÜİÈÒT‘HÜİÚYIH“ÔˆTUXÜ›İËšÜİÚYKˆ
+NÂˆÛÛœİÜİHÜİ]šY[˜ÙJÜİ™\İ[œ›İÜÖÌJNÂˆYˆ
+ZÜİÜİœİ]\ÈOOH	Ü™XYIÈZÜİœÙXÜ™]Ü™XY[™\ÜÈÜİšÜİÚYOOH[›™\‹šÜİÚYˆÜİ˜Ø\XÚ]WÜÛİÈOOH[X™\ŠÜİ™\İ[œ›İÜÖÌOË˜Ø\XÚ]WÜÛİÊBˆÜİ™\İ[œ›İÜÖÌOËœ™XÛÛ˜Ú[\ÈOOHYBˆ]Kœ\œÙJÜİ›ØœÙ\™YØ]
+Hˆ›İÓ\È
+ÈŒÌˆ›İÓ\ÈH]Kœ\œÙJÜİ›ØœÙ\™YØ]
+Hˆ[X™\Š›İË›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÊBˆ]Kœ\œÙJÜİ˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\Âˆš[™[™Ë™]K˜Ø\Xš[]Y\ËœÛÛYJ
+Ø\Xš[]JHOˆZÜİ˜[İÙYØØ\Xš[]Y\Ëš[˜ÛY\ÊØ\Xš[]JJJHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	ÚÜİ]]Üš]H[˜]˜Z[X›H™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	ÒÜİ]]Üš]H\È[˜]˜Z[X›Kİ[KÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆYˆ
+X]ØZ]\Ëœ™XYYÙ]Ú[™İÜÊÛY[™\]Y\İœ™\Ù\˜][Û—ÚYš[™[™Ë™]K˜YÙ]ÜÛXŞWÚYš[™[™Ë™]Kœ™\]Y\İYØÛÜİİ\Ù
+JHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	ØYÙÜ™YØ]HYÙ][˜[Y™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	ĞYÙÜ™YØ]HYÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆÛÛœİYÙ]H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+ÛÛ[Z]Yİ\ÙTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓĞSTĞÑJÕSJ™\Ù\™YØÛÜİİ\Ù
+K
+Bˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HYÙ]Ü™XÙZ\ÚYIBˆS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Ëˆ
+™\Ù\™Yİ\Ù
+ØÛÛ[Z]Yİ\ÙH\™Û[Z]İ\Ù
+HTÈÚ][—ØÙZ[[™Âˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÈÒT‘H™XÙZ\ÚYIH“ÔˆTUXÜ›İË˜YÙ]Ü™XÙZ\ÚYKˆ
+NÂˆYˆ
+YÙ]œ›İÜË›[™İOOHHYÙ]œ›İÜÖÌKœ™XÛÛ˜Ú[\ÈOOHYHYÙ]œ›İÜÖÌKÚ][—ØÙZ[[™ÈOOHYJHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü™XÙZ\YÙ][˜[Y™Y›Ü™Hİ\ØœÙ\˜][Û‰Ë	Ô™XÙZ\YÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆB‚ˆYˆ
+^Xİ™\]Y\İ
+HÂˆYˆ
+›İËœ[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMˆOOHİ\ÚÙ[‘YÙ\İˆ›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‚ˆ›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜ™YˆOOH]šY[˜ÙK™]šY[˜ÙWÜ™Y‚ˆ›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMˆOOH]šY[˜ÙK™]šY[˜ÙWÜÚLM‚ˆÜ[[œİ[
+›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+HOOHÜ[[œİ[
+]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]
+BˆÜ[[œİ[
+›İËœ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]
+HOOHÜ[[œİ[
+]šY[˜ÙK›ØœÙ\™YØ]
+JHÂˆ™]\›ˆ]ØZ]]X\˜[[™J	Ü[›™\ˆİ\™\^H]šY[˜ÙHšYY	Ë	Ô[›™\ˆİ\™\^H]šY[˜ÙHšYY‰ÊNÂˆBˆÛÛœİ™XÙZ\H™XÙZ\œ›ÛJ›İÊNÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈØœÙ\™YˆYK™XÙZ\›ØÚÙ\œÎˆ×HNÂˆBˆÛÛœİ\XØ]\ÈH]ØZ]ÛY[œ]Y\JˆÑSPÕ™\Ù\˜][Û—ÚY”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYIN]ZYÔˆ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMI‚ˆÔˆ[›™\—Üİ\Ù]šY[˜ÙWÜ™YIÈÔˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMISRUXˆÜ™\]Y\İ›ØœÙ\˜][Û—Ü™\]Y\İÚY]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM—Kˆ
+NÂˆYˆ
+\XØ]\Ëœ›İÜË›[™İ
+H™]\›ˆ]ØZ][J	Ô[›™\ˆİ\™\]Y\İÜˆ]šY[˜ÙH\È[™XYH›İ[™È[›İ\ˆ™\Ù\˜][Û‹‰ÊNÂ‚ˆÛÛœİØœÙ\˜][Û’YH˜[™ÛUURQ
+
+NÂˆÛÛœİ˜[œÚ][Û™YH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜ[›™\‹\İ\[ØœÙ\™Y	Ëˆ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYI]ZY[›™\—Üİ\ÛØœÙ\˜][Û—Ü™\]Y\İÚYIÎ]ZYˆ[›™\—Üİ\ÛØœÙ\˜][Û—ØXØÙ\YØ]I[Y\İ[\‹ˆ[›™\—Üİ\Ù]šY[˜ÙWÛØœÙ\™YØ]IN[Y\İ[\‹[›™\—Ü›ØÙ\Ü×Üİ\YØ]I[Y\İ[\‹ˆ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMIË[›™\—Üİ\Ù]šY[˜ÙWÜ™YIˆ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMIK[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLMILˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]OIÜ[›™\‹XÛZ[YY[›İ\İ\Y	ÂˆS‘İ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLMIL‘UT“’S‘È
+˜ˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYØœÙ\˜][Û’Y™\]Y\İ›ØœÙ\˜][Û—Ü™\]Y\İÚY]ˆ]šY[˜ÙK›ØœÙ\™YØ]]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹ˆ]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM‹İ\ÚÙ[‘YÙ\İKˆ
+NÂˆYˆ
+˜[œÚ][Û™Yœ›İÜË›[™İOOHJH™]\›ˆ]ØZ][J	Ô[›™\ˆİ\ØœÙ\˜][ÛˆÛİ[›İ™HXØÙ\Y^XİHÛ˜ÙK‰ÊNÂˆÛÛœİ™XÙZ\H™XÙZ\œ›ÛJ˜[œÚ][Û™Yœ›İÜÖÌJNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJ™XÙZ\
+WKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈØœÙ\™YˆYK™XÙZ\›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ]ØZ]\Ëœ™XÛÜ™[YÜš]T™Y\Ø[
+ÛY[™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ÂˆXİ[Ûˆ	ÛØœÙ\™K\[›™\‹\İ\	Ë™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ\œ›Üˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆ[›™\‹\İ\ØœÙ\˜][Ûˆ˜Z[\™IËˆJNÂˆ›İÈ\œ›ÜÂˆHš[˜[HÈÛY[œ™[X\ÙOËŠ
+NÈBˆB‚ˆ\Ş[˜ÈÙ]T[›™\“İ]ÛÛYJ[œ]ˆ[›™\“İ]ÛÛYR[œ]
+Nˆ›ÛZ\ÙO[›™\“İ]ÛÛYT™\İ[ˆÂˆÛÛœİ\œÙYH[›™\“İ]ÛÛYR[œ]ØÚ[XKœØY™T\œÙJ[œ]
+NÂˆYˆ
+\\œÙYœİXØÙ\ÜÊH™]\›ˆ[›™\“İ]ÛÛYQ[šYY
+	Ô[›™\ˆİ]ÛÛYH™\]Y\İ\È[˜[Y‰ÊNÂˆÛÛœİ™\]Y\İH\œÙY™]NÂˆÛÛœİÛY[H]ØZ]\ËœÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]]H™]È]J
+KÒTÓÔİš[™Ê
+NÂˆÛÛœİ[HH\Ş[˜È
+›ØÚÙ\ˆİš[™ÊNˆ›ÛZ\ÙO[›™\“İ]ÛÛYT™\İ[ˆOˆÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü[›™\‹[İ]ÛÛYKY[šYY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆİ]ÛÛYWÜ™\]Y\İÚYˆ™\]Y\İ›İ]ÛÛYWÜ™\]Y\İÚY›ØÚÙ\œÎˆØ›ØÚÙ\—KˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆ[›™\“İ]ÛÛYQ[šYY
+›ØÚÙ\ŠNÂˆNÂˆÛÛœİ™XÙZ\œ›ÛHH
+›İÎˆ™XÛÜ™İš[™Ë[šÛ›İÛŠNˆ[›™\“İ]ÛÛYT™XÙZ\Oˆ
+ÂˆØÚ[XWİ™\œÚ[Ûˆ	Üİ\›YÚœ[›™\—Ûİ]ÛÛYKŒIËˆİ]ÛÛYWÚYˆİš[™Ê›İËœ[›™\—Ûİ]ÛÛYWÚY
+Kˆİ]ÛÛYWÜ™\]Y\İÚYˆİš[™Ê›İËœ[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚY
+Kˆİ]ÛÛYWÙ]™[ÚYˆİš[™Ê›İËœ[›™\—Ûİ]ÛÛYWÙ]™[ÚY
+Kˆİ]ÛÛYWÚÚ[™ˆ›İËœ[›™\—Ûİ]ÛÛYWÚÚ[™\È	Û™]™\‹\İ\Y	È	Ü›ØÙ\ÜË]\›Z[˜[	ËˆÛZ[WÚYˆİš[™Ê›İËœ[›™\—ØÛZ[WÚY
+Kˆ™\Ù\˜][Û—ÚYˆİš[™Ê›İËœ™\Ù\˜][Û—ÚY
+KˆÜ\˜][Û—ÚYˆİš[™Ê›İË›Ü\˜][Û—ÚY
+KˆY™™XİÚYˆİš[™Ê›İË™Y™™XİÚY
+Kˆš[™[™×ÙYÙ\İÜÚLMˆİš[™Ê›İË˜š[™[™×ÙYÙ\İÜÚLMŠKˆ[›™\—ÚYˆİš[™Ê›İËœ[›™\—ÚY
+Kˆ[›™\—Ú[œİ[˜ÙWÚYˆİš[™Ê›İËœ[›™\—Ú[œİ[˜ÙWÚY
+Kˆ[[YWÚYˆİš[™Ê›İËœ[›™\—Ü[[YWÚY
+KˆÜİÚYˆİš[™Ê›İËœ[›™\—ÚÜİÚY
+KˆÚ[›™[Øš[™[™×ÜÚLMˆİš[™Ê›İËœ[›™\—ØÚ[›™[Øš[™[™×ÜÚLMŠKˆ][˜ÚØ][\ÚYˆİš[™Ê›İËœ[›™\—Û][˜ÚØ][\ÚY
+Kˆ™[˜Ú[™×ÙÙ[™\˜][Ûˆ[X™\Š›İËœ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛŠKˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH[È[ˆİš[™Ê›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMŠKˆ^]Ù\ÜÜÚ][Ûˆ›İËœ[›™\—Ù^]Ù\ÜÜÚ][ÛˆOOH[È[ˆˆ›İËœ[›™\—Ù^]Ù\ÜÜÚ][Ûˆ\È[›™\“İ]ÛÛYT™XÙZ\ÉÙ^]Ù\ÜÜÚ][Û‰×Kˆ]šY[˜ÙWÜ™Yˆİš[™Ê›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YŠKˆ]šY[˜ÙWÜÚLMˆİš[™Ê›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMŠKˆİ]ÛÛYWØ]ˆÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWØ]
+Kˆ]šY[˜ÙWÛØœÙ\™YØ]ˆÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]
+KˆXØÙ\YØ]ˆÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWØXØÙ\YØ]
+Kˆ™[[İWÜİÜØÛÛ™š\›YYˆ›İËœ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YYOOHYKˆ™\İ\Ù™[˜ÙYˆYKˆ][˜ÚÜ]Y]YWØÛÜÙYˆYKˆ\ØÙ[™[×Ü]ZY\ØÙYˆYKˆ˜[œÜÜÜİ]Nˆ	Ø]\İY[›İY\ŞYY	Ëˆ\Ü]ÚÜİ]Nˆ	Û›İY\Ü]ÚY	Ëˆ^Xİ][Û—ÛØœÙ\™Yˆ›İËœ[›™\—Ûİ]ÛÛYWÚÚ[™OOH	Ü›ØÙ\ÜË]\›Z[˜[	ËˆÛÜšÛØYÙY™™XİÛØœÙ\™Yˆ˜[ÙKˆXİX[İ\ØYÙWÜ™XÛÛ˜Ú[Yˆ˜[ÙKˆÜİØØ\XÚ]WÜ™[X\ÙYˆ›İËœİ]HOOH	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ËˆYÙ]ØÛÛ[Z]Y[Ü™[X\ÙYˆ˜[ÙKˆ™[X\ÙYÚÜİÜÛİÎˆ›İËœİ]HOOH	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÈÈHˆˆ™[X\ÙYØÛÜİİ\Ùˆˆ™]Z[™YØÛÛ[Z]YØÛÜİİ\Ùˆ[X™\Š›İË˜ÛÛ[Z]YØÛÜİİ\Ù
+Kˆİ]Nˆ›İËœİ]H\È	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	È	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ËˆJNÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆ]ØZ]ÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XË×İ[\	ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JH™]\›ˆ]ØZ][J	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆ]H]ØZ]Ø[ÛØÚÊÛY[
+NÂˆÛÛœİ›İÓ\ÈH]Kœ\œÙJ]
+NÂ‚ˆÛÛœİœ›ÚÙ\]\İ][ÛˆH]ØZ]\Ë˜œ›ÚÙ\”Ù\ÜÚ[Û]\İÜŠÛY[
+NÂˆYˆ
+Xœ›ÚÙ\]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][Jœ›ÚÙ\ˆ]X˜\ÙHÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	Øœ›ÚÙ\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİİ]ÛÛYP]\İ][ÛˆH]ØZ]\Ëœ[›™\“İ]ÛÛYQ]šY[˜ÙP]\İÜŠÛY[
+NÂˆYˆ
+[İ]ÛÛYP]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][J[›™\ˆİ]ÛÛYH]šY[˜ÙH\È[˜]˜Z[X›Nˆ	Ûİ]ÛÛYP]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ\œÙY]šY[˜ÙHH[›™\“İ]ÛÛYQ]šY[˜ÙTØÚ[XKœØY™T\œÙJİ]ÛÛYP]\İ][Û‹™]šY[˜ÙJNÂˆYˆ
+\\œÙY]šY[˜ÙKœİXØÙ\ÜÊH™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH]šY[˜ÙH\ÈX[›Ü›YY‰ÊNÂˆÛÛœİ]šY[˜ÙHH\œÙY]šY[˜ÙK™]NÂˆÛÛœİİ]ÛÛYQYÙ\İHÜ™X]R\Ú
+	ÜÚLM‰ÊK\]J™\]Y\İ›İ]ÛÛYWİÚÙ[‹	İ]	ÊK™YÙ\İ
+	Ú^	ÊNÂˆÛÛœİ›İ[™H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+‹ˆ
+™\Ù\™YØÛÜİİ\ÙTÈ“ÕTÕSÕ”“ÓH
+š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÊHTÈÛÜİÛX]Ú\×Øš[™[™Âˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘[›™\—ØÛZ[WÚYI]ZYS‘İ]ÛÛYWİÚÙ[—ÜÚLMIÈ“ÔˆTUXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY™\]Y\İ˜ÛZ[WÚYİ]ÛÛYQYÙ\İKˆ
+NÂˆÛÛœİ›İÈH›İ[™œ›İÜÖÌNÂˆYˆ
+\›İÊH™]\›ˆ]ØZ][J	Ô[›™\ˆÛZ[HÙ\È›İ^\İÜˆHİ]ÛÛYHÜ™Y[X[\È[˜[Y‰ÊNÂˆYˆ
+›İË›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚY›İË™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ›İË˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH™\]Y\İÙ\È›İX]ÚHÛZ[YYÜ\˜][Û‹‰ÊNÂˆBˆYˆ
+›İË˜œ›ÚÙ\—Ù]X˜\ÙWÜ›ÛHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛBˆ›İË˜œ›ÚÙ\—Ù]X˜\ÙWÛ˜[YHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YBˆ›İË˜œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‚ˆœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹˜ÛÛ˜XİÙYÙ\İÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŠHÂˆ™]\›ˆ]ØZ][J	Ğ]][XØ]Yœ›ÚÙ\ˆ]X˜\ÙHÙ\ÜÚ[ÛˆÙ\È›İX]ÚHÛZ[YYÜ\˜][Û‹‰ÊNÂˆBˆÛÛœİš[˜Ú\[H]ØZ]ÛY[œ]Y\JˆÑSPÕ]X˜\ÙWÜ›ÛK]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ù^Xİ][Û—ÚY[]Kœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹ˆ]]—ÚÚ[™›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‹ØœÙ\™YØ]XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]İ]K]šY[˜ÙBˆ”“ÓHİØ\›WØ]]Üš]WØœ›ÚÙ\—Üš[˜Ú\[ÂˆÒT‘H]X˜\ÙWÜ›ÛOIHS‘]X˜\ÙWÛ˜[YOI˜ˆØœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛKœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YWKˆ
+NÂˆÛÛœİš[˜Ú\[›İÈHš[˜Ú\[œ›İÜÖÌNÂˆÛÛœİš[˜Ú\[]šY[˜ÙHHœ›ÚÙ\”š[˜Ú\[]šY[˜ÙTØÚ[XKœØY™T\œÙJš[˜Ú\[›İÏË™]šY[˜ÙJNÂˆÛÛœİš[˜Ú\[İ\œ™[Hš[˜Ú\[œ›İÜË›[™İOOHH	‰ˆš[˜Ú\[]šY[˜ÙKœİXØÙ\ÜÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÜ›ÛHOOHš[˜Ú\[›İË™]X˜\ÙWÜ›ÛBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÛ˜[YHOOHš[˜Ú\[›İË™]X˜\ÙWÛ˜[YBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOHš[˜Ú\[›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOHš[˜Ú\[›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜]]—ÚÚ[™OOHš[˜Ú\[›İË˜]]—ÚÚ[™ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOHš[˜Ú\[›İËœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOHš[˜Ú\[›İËœİ]Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË›ØœÙ\™YØ]
+Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOH	Ü™XYIÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOH›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‚ˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH›İÓ\Âˆ	‰ˆ›İÓ\ÈH]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH\Ë›X^œ›ÚÙ\‘]šY[˜ÙPYÙS\Âˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Hˆ›İÓ\ÎÂˆYˆ
+\š[˜Ú\[İ\œ™[
+H™]\›ˆ]ØZ][J	Ğœ›ÚÙ\ˆš[˜Ú\[\È[˜]˜Z[X›Kİ[K\ØX›YÜˆšYY‰ÊNÂ‚ˆÛÛœİ^XİYİ]HH]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Û™]™\‹\İ\Y	ÂˆÈ	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Èˆ	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÎÂˆÛÛœİ^Xİ™]HH›İËœİ]HOOH^XİYİ]Bˆ	‰ˆ›İËœ[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYOOH™\]Y\İ›İ]ÛÛYWÜ™\]Y\İÚYÂˆYˆ
+›İËœİ]HOOH	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	È›İËœİ]HOOH	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊHÂˆYˆ
+Y^Xİ™]JH™]\›ˆ]ØZ][J	ĞHY™™\™[[[]]X›H[›™\ˆİ]ÛÛYH[™XYHÙ]Y\ÈÛZ[K‰ÊNÂˆB‚ˆÛÛœİš[™[™ÈHÜ\˜][Ûš[™[™ÔØÚ[XKœØY™T\œÙJ›İË˜š[™[™ÊNÂˆYˆ
+Xš[™[™ËœİXØÙ\ÜÈÚLM‘YÙ\İ
+š[™[™Ë™]JHOOH›İË˜š[™[™×ÙYÙ\İÜÚLM‚ˆ›İË˜ÛÜİÛX]Ú\×Øš[™[™ÈOOHYH›İË˜ÛÛ[Z]YØÛÜİİ\ÙOOH›İËœ™\Ù\™YØÛÜİİ\Ù
+HÂˆ™]\›ˆ]ØZ][J	ÔİÜ™YÜ\˜][ÛˆÜˆÛÛ[Z]YÛÜİ\È[˜[YÜˆšYY‰ÊNÂˆBˆÛÛœİš[™[™ÜÓX]ÚH]šY[˜ÙKœ™\Ù\˜][Û—ÚYOOH™\]Y\İœ™\Ù\˜][Û—ÚYˆ	‰ˆ]šY[˜ÙK˜ÛZ[WÚYOOH™\]Y\İ˜ÛZ[WÚYˆ	‰ˆ]šY[˜ÙK›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚYˆ	‰ˆ]šY[˜ÙK™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ	‰ˆ]šY[˜ÙK˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‚ˆ	‰ˆ]šY[˜ÙKœ[›™\—ÚYOOH›İËœ[›™\—ÚYˆ	‰ˆ]šY[˜ÙKœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH›İËœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆ]šY[˜ÙKœ[›™\—Ú[œİ[˜ÙWÚYOOH›İËœ[›™\—Ú[œİ[˜ÙWÚYˆ	‰ˆ]šY[˜ÙKœ[[YWÚYOOH›İËœ[›™\—Ü[[YWÚYˆ	‰ˆ]šY[˜ÙKšÜİÚYOOH›İËœ[›™\—ÚÜİÚYˆ	‰ˆ]šY[˜ÙK˜Ú[›™[Øš[™[™×ÜÚLMˆOOH›İËœ[›™\—ØÚ[›™[Øš[™[™×ÜÚLM‚ˆ	‰ˆ]šY[˜ÙK›][˜ÚØ][\ÚYOOH›İËœ[›™\—Û][˜ÚØ][\ÚYˆ	‰ˆ]šY[˜ÙK™™[˜Ú[™×ÙÙ[™\˜][ÛˆOOH[X™\Š›İËœ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛŠNÂˆYˆ
+Xš[™[™ÜÓX]Ú
+H™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH]šY[˜ÙH\È›İ[™È[›İ\ˆ^Xİ][ÛˆÙ[™\˜][Û‹‰ÊNÂ‚ˆÛÛœİİ]ÛÛYS\ÈH]Kœ\œÙJ]šY[˜ÙK›İ]ÛÛYWØ]
+NÂˆÛÛœİØœÙ\™Y\ÈH]Kœ\œÙJ]šY[˜ÙK›ØœÙ\™YØ]
+NÂˆYˆ
+İ]ÛÛYS\È]Kœ\œÙJİš[™Ê›İËœ[›™\—ØÛZ[WØXØÙ\YØ]
+JBˆØœÙ\™Y\Èˆ›İÓ\È›İÓ\ÈHØœÙ\™Y\Èˆ\Ë›X^[›™\‘]šY[˜ÙPYÙS\Âˆ]Kœ\œÙJ]šY[˜ÙK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\ÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH]šY[˜ÙHÚ›Û›ÛÙŞH\È[˜[Yİ[KÜˆ^\™Y‰ÊNÂˆBˆÛÛœİ\Ôİ\H›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYOOH[ˆ›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH[ˆ›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜ™YˆOOH[ˆ›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜÚLMˆOOH[ÂˆYˆ
+^Xİ™]JHÂˆÛÛœİ™]QšYYH›İËœ[›™\—Ûİ]ÛÛYWÙ]™[ÚYOOH]šY[˜ÙK›İ]ÛÛYWÙ]™[ÚYˆ›İËœ[›™\—Ûİ]ÛÛYWÚÚ[™OOH]šY[˜ÙK›İ]ÛÛYWÚÚ[™ˆ›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YˆOOH]šY[˜ÙK™]šY[˜ÙWÜ™Y‚ˆ›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMˆOOH]šY[˜ÙK™]šY[˜ÙWÜÚLM‚ˆ›İËœ[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLMˆOOHİ]ÛÛYQYÙ\İˆ›İËœ[›™\—Ù^]Ù\ÜÜÚ][ÛˆOOH]šY[˜ÙK™^]Ù\ÜÜÚ][Û‚ˆÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWØ]
+HOOHÜ[[œİ[
+]šY[˜ÙK›İ]ÛÛYWØ]
+BˆÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]
+HOOHÜ[[œİ[
+]šY[˜ÙK›ØœÙ\™YØ]
+Bˆ›İËœ[›™\—Ü™[[İWÜİÜØÛÛ™š\›YYOOH]šY[˜ÙKœ™[[İWÜİÜØÛÛ™š\›YYˆ
+]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Û™]™\‹\İ\Y	È	‰ˆ\Ôİ\
+Bˆ
+]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Ü›ØÙ\ÜË]\›Z[˜[	È	‰ˆ
+ˆZ\Ôİ\ˆ]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‚ˆ]šY[˜ÙKœİ\ÛØœÙ\˜][Û—ÚYOOH›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYˆ]šY[˜ÙKœİ\Ù]šY[˜ÙWÜ™YˆOOH›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜ™Y‚ˆ]šY[˜ÙKœİ\Ù]šY[˜ÙWÜÚLMˆOOH›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜÚLM‚ˆÜ[[œİ[
+]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]
+HOOHÜ[[œİ[
+›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+Bˆ
+JNÂˆYˆ
+™]QšYY
+H™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH™]H]šY[˜ÙHšYY‰ÊNÂˆÛÛœİ™XÙZ\H™XÙZ\œ›ÛJ›İÊNÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈÙ]YˆYK™XÙZ\›ØÚÙ\œÎˆ×HNÂˆBˆYˆ
+VÉÜ[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	×Kš[˜ÛY\Êİš[™Ê›İËœİ]JJJHÂˆ™]\›ˆ]ØZ][J[›™\ˆİ]ÛÛYHØ[››İ™HÙ]Yœ›ÛHİ]H	Ôİš[™Ê›İËœİ]J_K˜
+NÂˆBˆYˆ
+]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Û™]™\‹\İ\Y	ÊHÂˆYˆ
+›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	È\Ôİ\
+HÂˆ™]\›ˆ]ØZ][J	Ó™]™\‹\İ\Y]šY[˜ÙHØ[››İÙ]H[ˆ^Xİ][ÛˆÚ]İ\]šY[˜ÙK‰ÊNÂˆBˆH[ÙHÂˆYˆ
+
+›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	È	‰ˆ›İËœİ]HOOH	ÜİÜ\™\]Y\İY	ÊHZ\Ôİ\ˆ]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‚ˆ]šY[˜ÙKœİ\ÛØœÙ\˜][Û—ÚYOOH›İËœ[›™\—Üİ\ÛØœÙ\˜][Û—ÚYˆ]šY[˜ÙKœİ\Ù]šY[˜ÙWÜ™YˆOOH›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜ™Y‚ˆ]šY[˜ÙKœİ\Ù]šY[˜ÙWÜÚLMˆOOH›İËœ[›™\—Üİ\Ù]šY[˜ÙWÜÚLM‚ˆÜ[[œİ[
+]šY[˜ÙKœ›ØÙ\Ü×Üİ\YØ]
+HOOHÜ[[œİ[
+›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+Bˆİ]ÛÛYS\È]Kœ\œÙJİš[™Ê›İËœ[›™\—Ü›ØÙ\Ü×Üİ\YØ]
+JJHÂˆ™]\›ˆ]ØZ][J	Ô›ØÙ\ÜË]\›Z[˜[]šY[˜ÙHÙ\È›İX]ÚHİÜ™Yİ\ØœÙ\˜][Û‹‰ÊNÂˆBˆB‚ˆÛÛœİ\XØ]HH]ØZ]ÛY[œ]Y\JˆÑSPÕ™\Ù\˜][Û—ÚY”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYIN]ZYÔˆ[›™\—Ûİ]ÛÛYWÙ]™[ÚYI]ZYˆÔˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YIÈÔˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMISRUXˆÜ™\]Y\İ›İ]ÛÛYWÜ™\]Y\İÚY]šY[˜ÙK›İ]ÛÛYWÙ]™[ÚY]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM—Kˆ
+NÂˆYˆ
+\XØ]Kœ›İÜË›[™İ
+H™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYH™\]Y\İÜˆ]šY[˜ÙH\È[™XYH›İ[™È[›İ\ˆ™\Ù\˜][Û‹‰ÊNÂ‚ˆYˆ
+X]ØZ]\Ëœ™XYYÙ]Ú[™İÜÊÛY[™\]Y\İœ™\Ù\˜][Û—ÚYš[™[™Ë™]K˜YÙ]ÜÛXŞWÚYš[™[™Ë™]Kœ™\]Y\İYØÛÜİİ\Ù
+JHÂˆ™]\›ˆ]ØZ][J	ĞÛÛ[Z]YYÙÜ™YØ]HYÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆÛÛœİYÙ]H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+ÛÛ[Z]Yİ\ÙTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓĞSTĞÑJÕSJ™\Ù\™YØÛÜİİ\Ù
+K
+Bˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HYÙ]Ü™XÙZ\ÚYIBˆS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Âˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÈÒT‘H™XÙZ\ÚYIH“ÔˆTUXˆÜ›İË˜YÙ]Ü™XÙZ\ÚYKˆ
+NÂˆYˆ
+YÙ]œ›İÜË›[™İOOHHYÙ]œ›İÜÖÌKœ™XÛÛ˜Ú[\ÈOOHYJHÂˆ™]\›ˆ]ØZ][J	ĞÛÛ[Z]Y™XÙZ\YÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆÛÛœİÜİH]ØZ]ÛY[œ]Y\JˆÑSPÕ]]Üš^™YÜÛİËˆ
+]]Üš^™YÜÛİÈTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓÕS•
+
+ŠNš[YÙ\ˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘HÜİÚYIHS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Âˆ”“ÓHİØ\›WØ]]Üš]WÚÜİÈÒT‘HÜİÚYIH“ÔˆTUXˆÜ›İËšÜİÚYKˆ
+NÂˆYˆ
+Üİœ›İÜË›[™İOOHHÜİœ›İÜÖÌKœ™XÛÛ˜Ú[\ÈOOHYH[X™\ŠÜİœ›İÜÖÌK˜]]Üš^™YÜÛİÊHJHÂˆ™]\›ˆ]ØZ][J	Ğ]]Üš^™YÜİYÙ\ˆ\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆB‚ˆÛÛœİİ]ÛÛYRYH˜[™ÛUURQ
+
+NÂˆÛÛœİ˜[œÚ][Û™YH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OI‹ˆ[›™\—Ûİ]ÛÛYWÚYIÎ]ZY[›™\—Ûİ]ÛÛYWÜ™\]Y\İÚYI]ZYˆ[›™\—Ûİ]ÛÛYWÙ]™[ÚYIN]ZY[›™\—Ûİ]ÛÛYWÚÚ[™I‹ˆ[›™\—Ûİ]ÛÛYWØXØÙ\YØ]IÎ[Y\İ[\‹[›™\—Ûİ]ÛÛYWØ]I[Y\İ[\‹ˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÛØœÙ\™YØ]IN[Y\İ[\‹[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜ™YILˆ[›™\—Ûİ]ÛÛYWÙ]šY[˜ÙWÜÚLMILK[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLMIL‹ˆ[›™\—Ù^]Ù\ÜÜÚ][ÛILË[›™\—Ü™[[İWÜİÜØÛÛ™š\›YYIMˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYˆS‘İ]HSˆ
+	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	ÊH‘UT“’S‘È
+˜ˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY^XİYİ]Kİ]ÛÛYRY™\]Y\İ›İ]ÛÛYWÜ™\]Y\İÚYˆ]šY[˜ÙK›İ]ÛÛYWÙ]™[ÚY]šY[˜ÙK›İ]ÛÛYWÚÚ[™]]šY[˜ÙK›İ]ÛÛYWØ]ˆ]šY[˜ÙK›ØœÙ\™YØ]]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙK™]šY[˜ÙWÜÚLM‹İ]ÛÛYQYÙ\İˆ]šY[˜ÙK™^]Ù\ÜÜÚ][Û‹]šY[˜ÙKœ™[[İWÜİÜØÛÛ™š\›YYKˆ
+NÂˆYˆ
+˜[œÚ][Û™Yœ›İÜË›[™İOOHJH™]\›ˆ]ØZ][J	Ô[›™\ˆİ]ÛÛYHÙ][Y[Üİ]È]]Üš]H˜XÙK‰ÊNÂˆYˆ
+]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Ü›ØÙ\ÜË]\›Z[˜[	ÊHÂˆÛÛœİ™[X\ÙYH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÚÜİÈÑU]]Üš^™YÜÛİÏX]]Üš^™YÜÛİËLBˆÒT‘HÜİÚYIHS‘]]Üš^™YÜÛİÈHH‘UT“’S‘È]]Üš^™YÜÛİØˆÜ›İËšÜİÚYKˆ
+NÂˆYˆ
+™[X\ÙYœ›İÜË›[™İOOHJH›İÈ™]È\œ›ÜŠ	Ğ]]Üš^™YÜİXØ\XÚ]H™[X\ÙHÛİ[[™\™›İÈÜˆ™Y™\™[˜Ù\ÈHZ\ÜÚ[™ÈÜİ‰ÊNÂˆBˆÛÛœİÜİY\ˆH]ØZ]ÛY[œ]Y\JˆÑSPÕ
+]]Üš^™YÜÛİÈTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓÕS•
+
+ŠNš[YÙ\ˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘HÜİÚYIHS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Âˆ”“ÓHİØ\›WØ]]Üš]WÚÜİÈÒT‘HÜİÚYIXˆÜ›İËšÜİÚYKˆ
+NÂˆYˆ
+ÜİY\‹œ›İÜË›[™İOOHHÜİY\‹œ›İÜÖÌKœ™XÛÛ˜Ú[\ÈOOHYJHÂˆ›İÈ™]È\œ›ÜŠ	Ğ]]Üš^™YÜİYÙ\ˆ˜Z[YÈ™XÛÛ˜Ú[HY\ˆİ]ÛÛYHÙ][Y[‰ÊNÂˆBˆÛÛœİ™XÙZ\H™XÙZ\œ›ÛJ˜[œÚ][Û™Yœ›İÜÖÌJNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü[›™\‹[İ]ÛÛYK[ØœÙ\™Y	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJ™XÙZ\
+WKˆ
+NÂˆYˆ
+]šY[˜ÙK›İ]ÛÛYWÚÚ[™OOH	Ü›ØÙ\ÜË]\›Z[˜[	ÊHÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	ÚÜİXØ\XÚ]K\™[X\ÙY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆİ]ÛÛYWÚYˆİ]ÛÛYRY™[X\ÙYÚÜİÜÛİÎˆK™[X\ÙYØÛÜİİ\ÙˆˆXİX[İ\ØYÙWÜ™XÛÛ˜Ú[Yˆ˜[ÙKˆJWKˆ
+NÂˆBˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈÙ]YˆYK™XÙZ\›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ]ØZ]\Ëœ™XÛÜ™[YÜš]T™Y\Ø[
+ÛY[™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ÂˆXİ[Ûˆ	ÜÙ]K\[›™\‹[İ]ÛÛYIË™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ\œ›Üˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆ[›™\‹[İ]ÛÛYHÙ][Y[˜Z[\™IËˆJNÂˆ›İÈ\œ›ÜÂˆHš[˜[HÈÛY[œ™[X\ÙOËŠ
+NÈBˆB‚ˆ\Ş[˜È™XÛÜ™[›™\•\ØYÙQ]šY[˜ÙJ[œ]ˆ[›™\•\ØYÙQ]šY[˜ÙR[œ]
+Nˆ›ÛZ\ÙO[›™\•\ØYÙQ]šY[˜ÙT™\İ[ˆÂˆÛÛœİ\œÙYH[›™\•\ØYÙQ]šY[˜ÙR[œ]ØÚ[XKœØY™T\œÙJ[œ]
+NÂˆYˆ
+\\œÙYœİXØÙ\ÜÊH™]\›ˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+	Ô[›™\ˆ\ØYÙKY]šY[˜ÙH™\]Y\İ\È[˜[Y‰ÊNÂˆÛÛœİ™\]Y\İH\œÙY™]NÂˆYˆ
+]\Ë\ØYÙQ]šY[˜ÙTÛÛ
+HÂˆÛÛœİ›ØÚÙ\ˆH	ÑYXØ]Y\ØYÙKY]šY[˜ÙH]X˜\ÙH]]Üš]H\È›İÛÛ™šYİ\™Y‰ÎÂˆ]ØZ]\Ëœ™XÛÜ™[›™\•\ØYÙQ]šY[˜ÙT™Y\Ø[
+™\]Y\İ›ØÚÙ\‹˜[ÙJNÂˆ™]\›ˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+›ØÚÙ\ŠNÂˆBˆÛÛœİÛY[H]ØZ]\ËœÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]œ›ÚÙ\•˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ]œ›ÚÙ\ÛY[™[X\ÙYH˜[ÙNÂˆ]\ØYÙPÛY[ˆ]]Üš]TÜ[ÛY[[™Yš[™YÂˆ]\ØYÙU˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ]]H™]È]J
+KÒTÓÔİš[™Ê
+NÂˆÛÛœİ[HH\Ş[˜È
+›ØÚÙ\ˆİš[™ÊNˆ›ÛZ\ÙO[›™\•\ØYÙQ]šY[˜ÙT™\İ[ˆOˆÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü[›™\‹]\ØYÙKY]šY[˜ÙKY[šYY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆİ]ÛÛYWÚYˆ™\]Y\İ›İ]ÛÛYWÚY\ØYÙWÜ™\]Y\İÚYˆ™\]Y\İ\ØYÙWÜ™\]Y\İÚYˆ\ØYÙWÜÙ\]Y[˜ÙNˆ™\]Y\İ\ØYÙWÜÙ\]Y[˜ÙK›ØÚÙ\œÎˆØ›ØÚÙ\—K™[X\ÙYØÛÜİİ\Ùˆ	ÌŒ	ËˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+›ØÚÙ\ŠNÂˆNÂˆÛÛœİ™XÙZ\œ›ÛHH
+›İÎˆ™XÛÜ™İš[™Ë[šÛ›İÛŠNˆ[›™\•\ØYÙQ]šY[˜ÙT™XÙZ\OˆÂˆÛÛœİ›İšY\”ØÚ[XU™\œÚ[ÛˆHİš[™Ê›İË™]šY[˜ÙWÜØÚ[XWİ™\œÚ[ÛŠNÂˆYˆ
+›İšY\”ØÚ[XU™\œÚ[ÛˆOOH	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÂˆ	‰ˆ›İšY\”ØÚ[XU™\œÚ[ÛˆOOH	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒ‰ÊHÂˆ›İÈ™]È\œ›ÜŠ	Ñ]X˜\ÙH™]\›™Y[ˆ[œİ\ÜY›İšY\ˆ\ØYÙKY]šY[˜ÙHØÚ[XH™\œÚ[Û‹‰ÊNÂˆBˆ™]\›ˆ
+ÂˆØÚ[XWİ™\œÚ[Ûˆ›İšY\”ØÚ[XU™\œÚ[ÛˆOOH	Üİ\›YÚœ[›™\—İ\ØYÙWÜ›İšY\—Ù]šY[˜ÙKŒIÂˆÈ	Üİ\›YÚœ[›™\—İ\ØYÙWÙ]šY[˜ÙKŒIÂˆˆ	Üİ\›YÚœ[›™\—İ\ØYÙWÙ]šY[˜ÙKŒ‰Ëˆ\ØYÙWÙ]šY[˜ÙWÚYˆİš[™Ê›İË\ØYÙWÙ]šY[˜ÙWÚY
+Kˆ\ØYÙWÜ™\]Y\İÚYˆİš[™Ê›İË\ØYÙWÜ™\]Y\İÚY
+Kˆ\ØYÙWÜÙ\]Y[˜ÙNˆ[X™\Š›İË\ØYÙWÜÙ\]Y[˜ÙJKˆ›İšY\—Ù]™[ÚYˆİš[™Ê›İËœ›İšY\—Ù]™[ÚY
+Kˆ™\Ù\˜][Û—ÚYˆİš[™Ê›İËœ™\Ù\˜][Û—ÚY
+KˆÛZ[WÚYˆİš[™Ê›İË˜ÛZ[WÚY
+Kˆİ]ÛÛYWÚYˆİš[™Ê›İË›İ]ÛÛYWÚY
+KˆÜ\˜][Û—ÚYˆİš[™Ê›İË›Ü\˜][Û—ÚY
+KˆY™™XİÚYˆİš[™Ê›İË™Y™™XİÚY
+Kˆš[™[™×ÙYÙ\İÜÚLMˆİš[™Ê›İË˜š[™[™×ÙYÙ\İÜÚLMŠKˆ›İšY\—ÚYˆİš[™Ê›İËœ›İšY\—ÚY
+Kˆ›İšY\—ØXØÛİ[Ü™Yˆİš[™Ê›İËœ›İšY\—ØXØÛİ[Ü™YŠKˆ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYˆİš[™Ê›İËœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚY
+KˆY]\—ÚYˆİš[™Ê›İË›Y]\—ÚY
+Kˆ]šY[˜ÙWÜ™Yˆİš[™Ê›İË™]šY[˜ÙWÜ™YŠKˆ]šY[˜ÙWÜÚLMˆİš[™Ê›İË™]šY[˜ÙWÜÚLMŠKˆ\ØYÙWÜİ\YØ]ˆÜ[[œİ[
+›İË\ØYÙWÜİ\YØ]
+Kˆ\ØYÙWÙ[™YØ]ˆÜ[[œİ[
+›İË\ØYÙWÙ[™YØ]
+Kˆİ][Y[Ùš[˜[^™YØ]ˆ›İËœİ][Y[Ùš[˜[^™YØ]OOH[È[ˆÜ[[œİ[
+›İËœİ][Y[Ùš[˜[^™YØ]
+Kˆ]šY[˜ÙWÛØœÙ\™YØ]ˆÜ[[œİ[
+›İË™]šY[˜ÙWÛØœÙ\™YØ]
+KˆXØÙ\YØ]ˆÜ[[œİ[
+›İË˜XØÙ\YØ]
+Kˆİ][Y[Üİ]\Îˆ›İËœİ][Y[Üİ]\È\È	Ü›İš\Ú[Û˜[	È	Ùš[˜[	Ëˆİ\œ™[˜ŞNˆ	ÕTÑ	Ëˆİ[][]]™WØÛÜİİ\ÙˆØ[›ÛšXØ[›İšY\•\Ù
+›İË˜İ[][]]™WØÛÜİİ\Ù›İšY\”ØÚ[XU™\œÚ[ÛŠKˆ]]Üš^™YØÛÜİİ\ÙˆØ[›ÛšXØ[\Ù
+›İË˜]]Üš^™YØÛÜİİ\Ù
+KˆYÙ]Øœ™XXÚÛØœÙ\™Yˆ›İË˜YÙ]Øœ™XXÚÛØœÙ\™YOOHYKˆXİX[İ\ØYÙWÜ™XÛÛ˜Ú[Yˆ˜[ÙKˆYÙ]ØÛÛ[Z]Y[Ü™[X\ÙYˆ˜[ÙKˆ™[X\ÙYØÛÜİİ\Ùˆ	ÌŒ	Ëˆ˜[œÜÜÜİ]Nˆ	Ø]\İY[›İY\ŞYY	Ëˆ\Ü]ÚÜİ]Nˆ	Û›İY\Ü]ÚY	ËˆÛÜšÛØYÙY™™XİÛØœÙ\™Yˆ˜[ÙKˆJNÂˆNÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆœ›ÚÙ\•˜[œØXİ[Û“Ü[ˆHYNÂˆ]ØZ]ÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XË×İ[\	ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JH™]\›ˆ]ØZ][J	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆ]H]ØZ]Ø[ÛØÚÊÛY[
+NÂˆÛÛœİ›İÓ\ÈH]Kœ\œÙJ]
+NÂ‚ˆÛÛœİœ›ÚÙ\]\İ][ÛˆH]ØZ]\Ë˜œ›ÚÙ\”Ù\ÜÚ[Û]\İÜŠÛY[
+NÂˆYˆ
+Xœ›ÚÙ\]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][Jœ›ÚÙ\ˆ]X˜\ÙHÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	Øœ›ÚÙ\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ\ØYÙP]\İ][ÛˆH]ØZ]\Ëœ[›™\•\ØYÙQ]šY[˜ÙP]\İÜŠÛY[
+NÂˆYˆ
+]\ØYÙP]\İ][Û‹˜[Y
+HÂˆ™]\›ˆ]ØZ][J[›™\ˆ\ØYÙH]šY[˜ÙH\È[˜]˜Z[X›Nˆ	İ\ØYÙP]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_X
+NÂˆBˆÛÛœİ\œÙY]šY[˜ÙHH[›™\•\ØYÙQ]šY[˜ÙTØÚ[XKœØY™T\œÙJ\ØYÙP]\İ][Û‹™]šY[˜ÙJNÂˆYˆ
+\\œÙY]šY[˜ÙKœİXØÙ\ÜÊH™]\›ˆ]ØZ][J	Ô[›™\ˆ\ØYÙH]šY[˜ÙH\ÈX[›Ü›YY‰ÊNÂˆÛÛœİ]šY[˜ÙHH\œÙY]šY[˜ÙK™]NÂˆÛÛœİ]šY[˜ÙSØœÙ\™Y\ÈH]Kœ\œÙJ]šY[˜ÙK›ØœÙ\™YØ]
+NÂˆYˆ
+]šY[˜ÙSØœÙ\™Y\Èˆ›İÓ\È›İÓ\ÈH]šY[˜ÙSØœÙ\™Y\Èˆ\Ë›X^[›™\‘]šY[˜ÙPYÙS\Âˆ]Kœ\œÙJ]šY[˜ÙK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\ÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆ\ØYÙH]šY[˜ÙH\Èİ[K]\™KY]YÜˆXØÙ\ÜËY^\™Y‰ÊNÂˆB‚ˆÛÛœİ\ØYÙQYÙ\İHÜ™X]R\Ú
+	ÜÚLM‰ÊK\]J™\]Y\İ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[‹	İ]	ÊK™YÙ\İ
+	Ú^	ÊNÂˆÛÛœİ™^\ØYÙQYÙ\İHÜ™X]R\Ú
+	ÜÚLM‰ÊK\]J™\]Y\İ›™^İ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[‹	İ]	ÊK™YÙ\İ
+	Ú^	ÊNÂˆÛÛœİ›İ[™H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+‹ˆ
+™\Ù\™YØÛÜİİ\ÙTÈ“ÕTÕSÕ”“ÓH
+š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÊHTÈÛÜİÛX]Ú\×Øš[™[™Âˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘[›™\—ØÛZ[WÚYI]ZYS‘[›™\—Ûİ]ÛÛYWÚYIÎ]ZY“ÔˆTUXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY™\]Y\İ˜ÛZ[WÚY™\]Y\İ›İ]ÛÛYWÚYKˆ
+NÂˆÛÛœİ›İÈH›İ[™œ›İÜÖÌNÂˆYˆ
+\›İÊH™]\›ˆ]ØZ][J	ÔÙ]Y[›™\ˆİ]ÛÛYHÙ\È›İ^\İ‰ÊNÂˆYˆ
+›İË›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚY›İË™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ›İË˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆ\ØYÙH™\]Y\İÙ\È›İX]ÚHÙ]YÜ\˜][Û‹‰ÊNÂˆBˆYˆ
+VÉÜ[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	×Kš[˜ÛY\Êİš[™Ê›İËœİ]JJJHÂˆ™]\›ˆ]ØZ][J[›™\ˆ\ØYÙH]šY[˜ÙHØ[››İ™H™XÛÜ™Yœ›ÛHİ]H	Ôİš[™Ê›İËœİ]J_K˜
+NÂˆBˆYˆ
+›İË˜œ›ÚÙ\—Ù]X˜\ÙWÜ›ÛHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛBˆ›İË˜œ›ÚÙ\—Ù]X˜\ÙWÛ˜[YHOOHœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YBˆ›İË˜œ›ÚÙ\—Ü›ÛWØÛÛ˜XİÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‚ˆœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹˜ÛÛ˜XİÙYÙ\İÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLMŠHÂˆ™]\›ˆ]ØZ][J	Ğ]][XØ]Yœ›ÚÙ\ˆ]X˜\ÙHÙ\ÜÚ[ÛˆÙ\È›İX]ÚHÙ]YÜ\˜][Û‹‰ÊNÂˆBˆÛÛœİš[˜Ú\[H]ØZ]ÛY[œ]Y\JˆÑSPÕ]X˜\ÙWÜ›ÛK]X˜\ÙWÛ˜[YKœ›ÚÙ\—Ù^Xİ][Û—ÚY[]Kœ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹ˆ]]—ÚÚ[™›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‹ØœÙ\™YØ]XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]İ]K]šY[˜ÙBˆ”“ÓHİØ\›WØ]]Üš]WØœ›ÚÙ\—Üš[˜Ú\[ÂˆÒT‘H]X˜\ÙWÜ›ÛOIHS‘]X˜\ÙWÛ˜[YOI˜ˆØœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛKœ›ÚÙ\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YWKˆ
+NÂˆÛÛœİš[˜Ú\[›İÈHš[˜Ú\[œ›İÜÖÌNÂˆÛÛœİš[˜Ú\[]šY[˜ÙHHœ›ÚÙ\”š[˜Ú\[]šY[˜ÙTØÚ[XKœØY™T\œÙJš[˜Ú\[›İÏË™]šY[˜ÙJNÂˆÛÛœİš[˜Ú\[İ\œ™[Hš[˜Ú\[œ›İÜË›[™İOOHH	‰ˆš[˜Ú\[]šY[˜ÙKœİXØÙ\ÜÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÜ›ÛHOOHš[˜Ú\[›İË™]X˜\ÙWÜ›ÛBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K™]X˜\ÙWÛ˜[YHOOHš[˜Ú\[›İË™]X˜\ÙWÛ˜[YBˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOHš[˜Ú\[›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOHš[˜Ú\[›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜]]—ÚÚ[™OOHš[˜Ú\[›İË˜]]—ÚÚ[™ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOHš[˜Ú\[›İËœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLM‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOHš[˜Ú\[›İËœİ]Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË›ØœÙ\™YØ]
+Bˆ	‰ˆÜ[[œİ[
+š[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HOOHÜ[[œİ[
+š[˜Ú\[›İË˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœİ]HOOH	Ü™XYIÂˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]HOOH›İË˜œ›ÚÙ\—Ù^Xİ][Û—ÚY[]Bˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]K˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH›İË˜œ›ÚÙ\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆš[˜Ú\[]šY[˜ÙK™]Kœ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆOOH”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‚ˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH›İÓ\Âˆ	‰ˆ›İÓ\ÈH]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K›ØœÙ\™YØ]
+HH\Ë›X^œ›ÚÙ\‘]šY[˜ÙPYÙS\Âˆ	‰ˆ]Kœ\œÙJš[˜Ú\[]šY[˜ÙK™]K˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+Hˆ›İÓ\ÎÂˆYˆ
+\š[˜Ú\[İ\œ™[
+H™]\›ˆ]ØZ][J	Ğœ›ÚÙ\ˆš[˜Ú\[\È[˜]˜Z[X›Kİ[K\ØX›YÜˆšYY‰ÊNÂ‚ˆÛÛœİš[™[™ÈHÜ\˜][Ûš[™[™ÔØÚ[XKœØY™T\œÙJ›İË˜š[™[™ÊNÂˆYˆ
+Xš[™[™ËœİXØÙ\ÜÈÚLM‘YÙ\İ
+š[™[™Ë™]JHOOH›İË˜š[™[™×ÙYÙ\İÜÚLM‚ˆ›İË˜ÛÜİÛX]Ú\×Øš[™[™ÈOOHYH›İË˜ÛÛ[Z]YØÛÜİİ\ÙOOH›İËœ™\Ù\™YØÛÜİİ\Ù
+HÂˆ™]\›ˆ]ØZ][J	ÔİÜ™YÜ\˜][ÛˆÜˆÛÛ[Z]YÛÜİ\È[˜[YÜˆšYY‰ÊNÂˆBˆYˆ
+\[Ùˆ›İË\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[—ÜÚLMˆOOH	Üİš[™ÉÂˆ\[Ùˆ›İËœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYOOH	Üİš[™ÉÊHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆÛZ[H™Y]\È\ØYÙKY]šY[˜ÙH]]Üš]K‰ÊNÂˆBˆÛÛœİš[™[™ÜÓX]ÚH]šY[˜ÙKœ™\Ù\˜][Û—ÚYOOH™\]Y\İœ™\Ù\˜][Û—ÚYˆ	‰ˆ]šY[˜ÙK˜ÛZ[WÚYOOH™\]Y\İ˜ÛZ[WÚYˆ	‰ˆ]šY[˜ÙK›İ]ÛÛYWÚYOOH™\]Y\İ›İ]ÛÛYWÚYˆ	‰ˆ]šY[˜ÙK›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚYˆ	‰ˆ]šY[˜ÙK™Y™™XİÚYOOH™\]Y\İ™Y™™XİÚYˆ	‰ˆ]šY[˜ÙK˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‚ˆ	‰ˆ]šY[˜ÙKœ[›™\—ÚYOOH›İËœ[›™\—ÚYˆ	‰ˆ]šY[˜ÙKœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™YˆOOH›İËœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‚ˆ	‰ˆ]šY[˜ÙKœ[›™\—Ú[œİ[˜ÙWÚYOOH›İËœ[›™\—Ú[œİ[˜ÙWÚYˆ	‰ˆ]šY[˜ÙKœ[[YWÚYOOH›İËœ[›™\—Ü[[YWÚYˆ	‰ˆ]šY[˜ÙKšÜİÚYOOH›İËœ[›™\—ÚÜİÚYˆ	‰ˆ]šY[˜ÙK˜Ú[›™[Øš[™[™×ÜÚLMˆOOH›İËœ[›™\—ØÚ[›™[Øš[™[™×ÜÚLM‚ˆ	‰ˆ]šY[˜ÙK›][˜ÚØ][\ÚYOOH›İËœ[›™\—Û][˜ÚØ][\ÚYˆ	‰ˆ]šY[˜ÙK™™[˜Ú[™×ÙÙ[™\˜][ÛˆOOH[X™\Š›İËœ[›™\—Ù™[˜Ú[™×ÙÙ[™\˜][ÛŠBˆ	‰ˆ]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆOOH›İËœ[›™\—Ü›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‚ˆ	‰ˆ]šY[˜ÙKœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYOOH›İËœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYÂˆYˆ
+Xš[™[™ÜÓX]Ú
+H™]\›ˆ]ØZ][J	Ô[›™\ˆ\ØYÙH]šY[˜ÙH\È›İ[™È[›İ\ˆ^Xİ][ÛˆÙ[™\˜][Û‹‰ÊNÂˆÛÛœİ\ØYÙTİ\Y\ÈH]Kœ\œÙJ]šY[˜ÙK\ØYÙWÜİ\YØ]
+NÂˆÛÛœİ\ØYÙQ[™Y\ÈH]Kœ\œÙJ]šY[˜ÙK\ØYÙWÙ[™YØ]
+NÂˆYˆ
+\ØYÙTİ\Y\È]Kœ\œÙJÜ[[œİ[
+›İËœ[›™\—ØÛZ[WØXØÙ\YØ]
+JBˆ\ØYÙQ[™Y\Èˆ]Kœ\œÙJÜ[[œİ[
+›İËœ[›™\—Ûİ]ÛÛYWØ]
+JJHÂˆ™]\›ˆ]ØZ][J	Ô[›™\ˆ\ØYÙH[\˜[˜[Èİ]ÚYHH]][XØ]Y^Xİ][Ûˆ[\˜[‰ÊNÂˆB‚ˆÛÛœİY™XŞXÛQYÙ\İÈHÜ›İË˜ÛÛœİ[YWİÚÙ[—ÜÚLM‹›İË˜Ø[˜Ù[İÚÙ[—ÜÚLM‹›İË›X\ÙWØÛZ[WİÚÙ[—ÜÚLM‹ˆ›İËœ™Y[\[Û—İÚÙ[—ÜÚLM‹›İË˜ÛÛ›ÛİÚÙ[—ÜÚLM‹›İËšX\™X]İÚÙ[—ÜÚLM‹ˆ›İËœİ\ÛØœÙ\˜][Û—İÚÙ[—ÜÚLM‹›İË›İ]ÛÛYWİÚÙ[—ÜÚLM‹\ØYÙQYÙ\İˆ›İËœ[›™\—ÚX\™X]Ü™\Ù[YİÚÙ[—ÜÚLM‹›İËœ[›™\—Üİ\Ü™\Ù[YİÚÙ[—ÜÚLM‹ˆ›İËœ[›™\—Ûİ]ÛÛYWÜ™\Ù[YİÚÙ[—ÜÚLM—K™š[\Š
+YÙ\İ
+NˆYÙ\İ\Èİš[™ÈOˆ\[ÙˆYÙ\İOOH	Üİš[™ÉÊNÂˆYˆ
+Y™XŞXÛQYÙ\İËš[˜ÛY\Ê™^\ØYÙQYÙ\İ
+JHÂˆ™]\›ˆ]ØZ][J	Ó™^\ØYÙK\™XÛÛ˜Ú[X][ÛˆÜ™Y[X[[X\Ù\È[ˆ^\İ[™ÈY™XŞXÛHÜ™Y[X[‰ÊNÂˆBˆYˆ
+X]ØZ]\Ëœ™XYYÙ]Ú[™İÜÊÛY[™\]Y\İœ™\Ù\˜][Û—ÚYš[™[™Ë™]K˜YÙ]ÜÛXŞWÚYš[™[™Ë™]Kœ™\]Y\İYØÛÜİİ\Ù
+JHÂˆ™]\›ˆ]ØZ][J	ĞÛÛ[Z]YYÙÜ™YØ]HYÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆÛÛœİYÙ]H]ØZ]ÛY[œ]Y\JˆÑSPÕ
+ÛÛ[Z]Yİ\ÙTÈ“ÕTÕSÕ”“ÓH
+ÑSPÕÓĞSTĞÑJÕSJ™\Ù\™YØÛÜİİ\Ù
+K
+Bˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÒT‘HYÙ]Ü™XÙZ\ÚYIBˆS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	Ë	ÜİÜ\™\]Y\İY	Ë	Ü[›™\‹[™]™\‹\İ\Y[ØœÙ\™Y	Ë	Ü[›™\‹]\›Z[˜[[ØœÙ\™Y	ÊJJHTÈ™XÛÛ˜Ú[\Âˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÈÒT‘H™XÙZ\ÚYIH“ÔˆTUXˆÜ›İË˜YÙ]Ü™XÙZ\ÚYKˆ
+NÂˆYˆ
+YÙ]œ›İÜË›[™İOOHHYÙ]œ›İÜÖÌKœ™XÛÛ˜Ú[\ÈOOHYJHÂˆ™]\›ˆ]ØZ][J	ĞÛÛ[Z]Y™XÙZ\YÙ]]]Üš]H\ÈZ\ÜÚ[™ÈÜˆ[˜ÛÛœÚ\İ[‰ÊNÂˆBˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆœ›ÚÙ\•˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆÛY[œ™[X\ÙOËŠ
+NÂˆœ›ÚÙ\ÛY[™[X\ÙYHYNÂ‚ˆ\ØYÙPÛY[H]ØZ]\Ë\ØYÙQ]šY[˜ÙTÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]ØZ]\ØYÙPÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆ\ØYÙU˜[œØXİ[Û“Ü[ˆHYNÂˆ]ØZ]\ØYÙPÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XÉÊNÂˆÛÛœİ™\šYšY\]\İ][ÛˆH]ØZ]\Ë\ØYÙQ]šY[˜ÙTÙ\ÜÚ[Û]\İÜŠ\ØYÙPÛY[
+NÂˆYˆ
+]™\šYšY\]\İ][Û‹˜[Y
+HÂˆ]ØZ]\ØYÙPÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ\ØYÙU˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ\ØYÙPÛY[œ™[X\ÙOËŠ
+NÂˆ\ØYÙPÛY[H[™Yš[™YÂˆÛÛœİ›ØÚÙ\ˆH\ØYÙKY]šY[˜ÙH]X˜\ÙHÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	İ™\šYšY\]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_XÂˆ]ØZ]\Ëœ™XÛÜ™[›™\•\ØYÙQ]šY[˜ÙT™Y\Ø[
+™\]Y\İ›ØÚÙ\ŠNÂˆ™]\›ˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+›ØÚÙ\ŠNÂˆBˆÛÛœİ\ØYÙQ]šY[˜ÙRYH˜[™ÛUURQ
+
+NÂˆÛÛœİ\[™YH]ØZ]\ØYÙPÛY[œ]Y\JˆÑSPÕX›XËœİ\›YÚØ\[™Ü[›™\—İ\ØYÙWÙ]šY[˜ÙJ	NšœÛÛ˜ŠHTÈ™\İ[ˆÒ”ÓÓ‹œİš[™ÚYJÂˆ\ØYÙWÙ]šY[˜ÙWÚYˆ\ØYÙQ]šY[˜ÙRY\ØYÙWÜ™\]Y\İÚYˆ™\]Y\İ\ØYÙWÜ™\]Y\İÚYˆ]šY[˜ÙWÜØÚ[XWİ™\œÚ[Ûˆ]šY[˜ÙKœØÚ[XWİ™\œÚ[Û‹ˆ\ØYÙWÜÙ\]Y[˜ÙNˆ™\]Y\İ\ØYÙWÜÙ\]Y[˜ÙK›İšY\—Ù]™[ÚYˆ]šY[˜ÙKœ›İšY\—Ù]™[ÚYˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYİ]ÛÛYWÚYˆ™\]Y\İ›İ]ÛÛYWÚYˆÜ\˜][Û—ÚYˆ™\]Y\İ›Ü\˜][Û—ÚYY™™XİÚYˆ™\]Y\İ™Y™™XİÚYˆš[™[™×ÙYÙ\İÜÚLMˆ™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ˆ›ÛWØÛÛ˜XİÙYÙ\İÜÚLMˆ”“ÒÑT—ÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‹ˆ™\šYšY\—Ù]X˜\ÙWÜ›ÛNˆ™\šYšY\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛKˆ™\šYšY\—Ù]X˜\ÙWÛ˜[YNˆ™\šYšY\]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YKˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆ™\šYšY\]\İ][Û‹œÙ\ÜÚ[Û‹˜ÛÛ˜XİÙYÙ\İÜÚLM‹ˆ[›™\—ÚYˆ]šY[˜ÙKœ[›™\—ÚY[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Yˆ]šY[˜ÙKœ[›™\—ÚY[]WÙ]šY[˜ÙWÜ™Y‹ˆ[›™\—Ú[œİ[˜ÙWÚYˆ]šY[˜ÙKœ[›™\—Ú[œİ[˜ÙWÚY[[YWÚYˆ]šY[˜ÙKœ[[YWÚYˆÜİÚYˆ]šY[˜ÙKšÜİÚYÚ[›™[Øš[™[™×ÜÚLMˆ]šY[˜ÙK˜Ú[›™[Øš[™[™×ÜÚLM‹ˆ][˜ÚØ][\ÚYˆ]šY[˜ÙK›][˜ÚØ][\ÚY™[˜Ú[™×ÙÙ[™\˜][Ûˆ]šY[˜ÙK™™[˜Ú[™×ÙÙ[™\˜][Û‹ˆ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLMˆ]šY[˜ÙKœ›ØÙ\Ü×Ú[œİ[˜ÙWÜÚLM‹ˆ›İšY\—ÚYˆ]šY[˜ÙKœ›İšY\—ÚY›İšY\—ØXØÛİ[Ü™Yˆ]šY[˜ÙKœ›İšY\—ØXØÛİ[Ü™Y‹ˆ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYˆ]šY[˜ÙKœ›İšY\—İ\ØYÙWØÛÜœ™[][Û—ÚYY]\—ÚYˆ]šY[˜ÙK›Y]\—ÚYˆ]šY[˜ÙWÜ™Yˆ]šY[˜ÙK™]šY[˜ÙWÜ™Y‹]šY[˜ÙWÜÚLMˆ]šY[˜ÙK™]šY[˜ÙWÜÚLM‹ˆ\ØYÙWÜİ\YØ]ˆ]šY[˜ÙK\ØYÙWÜİ\YØ]\ØYÙWÙ[™YØ]ˆ]šY[˜ÙK\ØYÙWÙ[™YØ]ˆİ][Y[Üİ]\Îˆ]šY[˜ÙKœİ][Y[Üİ]\Ëİ][Y[Ùš[˜[^™YØ]ˆ]šY[˜ÙKœİ][Y[Ùš[˜[^™YØ]ˆ]šY[˜ÙWÛØœÙ\™YØ]ˆ]šY[˜ÙK›ØœÙ\™YØ]İ[][]]™WØÛÜİİ\Ùˆ]šY[˜ÙK˜İ[][]]™WØÛÜİİ\ÙˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ]šY[˜ÙK˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[ˆ™\]Y\İ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[‹ˆ™^İ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[ˆ™\]Y\İ›™^İ\ØYÙWÜ™XÛÛ˜Ú[X][Û—İÚÙ[‹ˆ\ÜİY\ˆ]šY[˜ÙKš\ÜİY\‹Ù^WÚYˆ]šY[˜ÙKšÙ^WÚY]]—ÚÚ[™ˆ]šY[˜ÙK˜]]—ÚÚ[™ˆJWKˆ
+NÂˆÛÛœİ\[™™\İ[H\[™Yœ›İÜÖÌOËœ™\İ[\ÈÂˆÚÏÎˆ›ÛÛX[È›ØÚÙ\Îˆİš[™ÎÈ]Y]YÎˆ›ÛÛX[È›İÏÎˆ™XÛÜ™İš[™Ë[šÛ›İÛÂˆH[™Yš[™YÂˆYˆ
+\[™™\İ[Ë›ÚÈOOHYHX\[™™\İ[œ›İÊHÂˆËÈ™\Ù\™HH›İ][™IÜÈØ[š]^™Y[šX[[ˆHX[˜YÙY™\šYšY\ˆ]ˆÜİÜ™TÔSˆËÈØ[››İ›Ü˜ÙHHØ[\‹XÛÛ›ÛY˜[œØXİ[ÛˆÈÛÛ[Z]ÛÈ\˜š]˜\H\™XİÔS\ÂˆËÈİ]ÚYH\È]Y]İX\˜[YKˆ›È]]Üš]H]]][ÛˆØØİ\œÈ™Y›Ü™HH˜[ÙH™\İ[‚ˆ]ØZ]\ØYÙPÛY[œ]Y\J\[™™\İ[Ë˜]Y]YOOHYHÈ	ĞÓÓSRU	Èˆ	Ô“ÓPÒÉÊNÂˆ\ØYÙU˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ\ØYÙPÛY[œ™[X\ÙOËŠ
+NÂˆ\ØYÙPÛY[H[™Yš[™YÂˆÛÛœİ›ØÚÙ\ˆH\[™™\İ[Ë˜›ØÚÙ\ˆÏÈ	Ô[›™\ˆ\ØYÙH]šY[˜ÙHÛİ[›İ™H\[™Y‰ÎÂˆYˆ
+\[™™\İ[Ë˜]Y]YOOHYJHÂˆ]ØZ]\Ëœ™XÛÜ™[›™\•\ØYÙQ]šY[˜ÙT™Y\Ø[
+™\]Y\İ›ØÚÙ\ŠNÂˆBˆ™]\›ˆ[›™\•\ØYÙQ]šY[˜ÙQ[šYY
+›ØÚÙ\ŠNÂˆBˆÛÛœİ™XÙZ\H™XÙZ\œ›ÛJ\[™™\İ[œ›İÊNÂˆ]ØZ]\ØYÙPÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ\ØYÙU˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ™]\›ˆÈ™XÛÜ™YˆYK™XÙZ\›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆYˆ
+\ØYÙPÛY[
+HÂˆYˆ
+\ØYÙU˜[œØXİ[Û“Ü[ŠH]ØZ]\ØYÙPÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ\ØYÙPÛY[œ™[X\ÙOËŠ
+NÂˆ\ØYÙPÛY[H[™Yš[™YÂˆBˆYˆ
+œ›ÚÙ\•˜[œØXİ[Û“Ü[ŠH]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆYˆ
+œ›ÚÙ\ÛY[™[X\ÙY
+HÂˆ]ØZ]\Ëœ™XÛÜ™[›™\•\ØYÙQ]šY[˜ÙT™Y\Ø[
+ˆ™\]Y\İˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆ[›™\ˆ\ØYÙKY]šY[˜ÙH™\šYšY\ˆ˜Z[\™IËˆ
+NÂˆH[ÙHÂˆ]ØZ]\Ëœ™XÛÜ™[YÜš]T™Y\Ø[
+ÛY[™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ÂˆXİ[Ûˆ	Ü™XÛÜ™\[›™\‹]\ØYÙKY]šY[˜ÙIË™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ\œ›Üˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆ[›™\ˆ\ØYÙKY]šY[˜ÙH˜Z[\™IËˆJNÂˆBˆ›İÈ\œ›ÜÂˆHš[˜[HÂˆ\ØYÙPÛY[Ëœ™[X\ÙOËŠ
+NÂˆYˆ
+Xœ›ÚÙ\ÛY[™[X\ÙY
+HÛY[œ™[X\ÙOËŠ
+NÂˆBˆB‚ˆ\Ş[˜È™XÛÜ™[›™\”™[[İTİÜXÚÛ›İÛYÙ[Y[
+ˆ[œ]ˆ™[[İTİÜ™\]Y\İˆ
+Nˆ›ÛZ\ÙO™[[İTİÜXÚÛ›İÛYÙ[Y[\œÚ\İ[˜ÙT™\İ[ˆÂˆÛÛœİ\œÙYH™[[İTİÜ™\]Y\İØÚ[XKœØY™T\œÙJ[œ]
+NÂˆYˆ
+\\œÙYœİXØÙ\ÜÊHÂˆ™]\›ˆÈ™XÛÜ™Yˆ˜[ÙK™XÙZ\ˆ[›ØÚÙ\œÎˆÉÔ™[[İK\İÜ™\]Y\İ\È[˜[Y‰×HNÂˆBˆYˆ
+]\Ëœ™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛ]\Ëœ™[[İTİÜXÚÛ›İÛYÙ[Y[]\İÜŠHÂˆ™]\›ˆÂˆ™XÛÜ™Yˆ˜[ÙKˆ™XÙZ\ˆ[ˆ›ØÚÙ\œÎˆÉÑ\˜X›H[˜İ[Û‹[Û›H™[[İK\İÜXÚÛ›İÛYÙ[Y[]]Üš]H\È›İÛÛ™šYİ\™Y‰×KˆNÂˆBˆÛÛœİ™\]Y\İˆ™[[İTİÜ™\]Y\İHÂˆ‹‹œ\œÙY™]Kˆ™\]Y\İYØ]ˆ™]È]J\œÙY™]Kœ™\]Y\İYØ]
+KÒTÓÔİš[™Ê
+KˆXÚÛ›İÛYÙ[Y[ÙXY[™Nˆ™]È]J\œÙY™]K˜XÚÛ›İÛYÙ[Y[ÙXY[™JKÒTÓÔİš[™Ê
+KˆNÂˆ]]\İ][Ûˆ™[[İTİÜXÚÛ›İÛYÙ[Y[]\İ][Ûˆ[™Yš[™YÂˆÛÛœİÛÛ™›Ü›X[˜ÙHH]ØZ]\ÜÙ\ÜÔ™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛ™›Ü›X[˜ÙJ™\]Y\İÂˆ]\İXÚÛ›İÛYÙ[Y[ˆ\Ş[˜È
+]Z[ÊHOˆÂˆ]\İ][ÛˆH]ØZ]\Ëœ™[[İTİÜXÚÛ›İÛYÙ[Y[]\İÜˆJ]Z[ÊNÂˆ™]\›ˆ]\İ][ÛÂˆKˆJNÂˆYˆ
+XÛÛ™›Ü›X[˜ÙK˜[YÙš^\™HXÛÛ™›Ü›X[˜ÙK˜XÚÛ›İÛYÙ[Y[Ø[™WÜÚLM‚ˆX]\İ][ÛË˜[Y
+HÂˆ™]\›ˆÂˆ™XÛÜ™Yˆ˜[ÙKˆ™XÙZ\ˆ[ˆ›ØÚÙ\œÎˆÛÛ™›Ü›X[˜ÙK˜›ØÚÙ\œË›[™İˆÈÛÛ™›Ü›X[˜ÙK˜›ØÚÙ\œÂˆˆÉÔ™[[İK\İÜİ\\š\ÛÜˆXÚÛ›İÛYÙ[Y[Y›İØ]\ÙHÛÛ™›Ü›X[˜ÙK‰×KˆNÂˆBˆÛÛœİXÚÛ›İÛYÙ[Y[ˆ™[[İTİÜXÚÛ›İÛYÙ[Y[HÂˆ‹‹˜]\İ][Û‹˜XÚÛ›İÛYÙ[Y[ˆ™\^WÜİ]Nˆ	Ùœ™\Ú	ËˆXÚÛ›İÛYÙYØ]ˆ™]È]J]\İ][Û‹˜XÚÛ›İÛYÙ[Y[˜XÚÛ›İÛYÙYØ]
+KÒTÓÔİš[™Ê
+KˆØœÙ\™YØ]ˆ™]È]J]\İ][Û‹˜XÚÛ›İÛYÙ[Y[›ØœÙ\™YØ]
+KÒTÓÔİš[™Ê
+KˆXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ™]È]Jˆ]\İ][Û‹˜XÚÛ›İÛYÙ[Y[˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]ˆ
+KÒTÓÔİš[™Ê
+KˆNÂˆÛÛœİÛY[H]ØZ]\Ëœ™[[İTİÜXÚÛ›İÛYÙ[Y[ÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆ˜[œØXİ[Û“Ü[ˆHYNÂˆ]ØZ]ÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XÉÊNÂˆÛÛœİÙ\ÜÚ[Û]\İ][ÛˆH]ØZ]\Ëœ™[[İTİÜÙ\ÜÚ[Û]\İÜŠÛY[
+NÂˆYˆ
+\Ù\ÜÚ[Û]\İ][Û‹˜[Y
+HÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ™]\›ˆÂˆ™XÛÜ™Yˆ˜[ÙKˆ™XÙZ\ˆ[ˆ›ØÚÙ\œÎˆØ™[[İK\İÜ]X˜\ÙHÙ\ÜÚ[Ûˆ\È›İ]]Üš^™Yˆ	ÜÙ\ÜÚ[Û]\İ][Û‹˜›ØÚÙ\œËš›Ú[Š	È	Ê_XKˆNÂˆBˆÛÛœİ\[™YH]ØZ]ÛY[œ]Y\Jˆ	ÔÑSPÕX›XËœİ\›YÚØ\[™Ü™[[İWÜİÜØXÚÛ›İÛYÙ[Y[
+	NšœÛÛ˜ŠHTÈ™\İ[	ËˆÒ”ÓÓ‹œİš[™ÚYJÂˆ™\]Y\İˆXÚÛ›İÛYÙ[Y[ˆXÚÛ›İÛYÙ[Y[Ø[™WÜÚLMˆÛÛ™›Ü›X[˜ÙK˜XÚÛ›İÛYÙ[Y[Ø[™WÜÚLM‹ˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆ‘SSÕWÔÕÔÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‹ˆJWKˆ
+NÂˆÛÛœİ™\İ[H\[™Yœ›İÜÖÌOËœ™\İ[\ÈÂˆÚÏÎˆ›ÛÛX[Âˆ›ØÚÙ\Îˆİš[™ÎÂˆ]Y]YÎˆ›ÛÛX[ÂˆXØÙ\YØ]Îˆ[šÛ›İÛÂˆH[™Yš[™YÂˆYˆ
+™\İ[Ë›ÚÈOOHYH™\İ[˜XØÙ\YØ]OOH[™Yš[™Y
+HÂˆ]ØZ]ÛY[œ]Y\J™\İ[Ë˜]Y]YOOHYHÈ	ĞÓÓSRU	Èˆ	Ô“ÓPÒÉÊNÂˆ˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ™]\›ˆÂˆ™XÛÜ™Yˆ˜[ÙKˆ™XÙZ\ˆ[ˆ›ØÚÙ\œÎˆÜ™\İ[Ë˜›ØÚÙ\ˆÏÈ	Ô™[[İK\İÜXÚÛ›İÛYÙ[Y[Ûİ[›İ™H\œÚ\İY‰×KˆNÂˆBˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ˜[œØXİ[Û“Ü[ˆH˜[ÙNÂˆ™]\›ˆÂˆ™XÛÜ™YˆYKˆ™XÙZ\ˆÂˆØÚ[XWİ™\œÚ[Ûˆ	Üİ\›YÚœ™[[İWÜİÜØXÚÛ›İÛYÙ[Y[Ü™XÙZ\ŒIËˆXÚÛ›İÛYÙ[Y[ÚYˆXÚÛ›İÛYÙ[Y[˜XÚÛ›İÛYÙ[Y[ÚYˆİÜÜ™\]Y\İÚYˆ™\]Y\İœİÜÜ™\]Y\İÚYˆİÜÜ™\]Y\İØ]Y]ÜÙ\Nˆ™\]Y\İœİÜÜ™\]Y\İØ]Y]ÜÙ\Kˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆÜ\˜][Û—ÚYˆ™\]Y\İ›Ü\˜][Û—ÚYˆš[™[™×ÙYÙ\İÜÚLMˆ™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ˆİ\\š\ÛÜ—ÚYˆXÚÛ›İÛYÙ[Y[œİ\\š\ÛÜ—ÚYˆİ\\š\ÛÜ—Ú[œİ[˜ÙWÚYˆXÚÛ›İÛYÙ[Y[œİ\\š\ÛÜ—Ú[œİ[˜ÙWÚYˆİ\\š\ÛÜ—Ù\ØÚˆXÚÛ›İÛYÙ[Y[œİ\\š\ÛÜ—Ù\ØÚˆØœÙ\™YÜİÜÙ™[˜ÙWÙÙ[™\˜][ÛˆXÚÛ›İÛYÙ[Y[›ØœÙ\™YÜİÜÙ™[˜ÙWÙÙ[™\˜][Û‹ˆXÚÛ›İÛYÙ[Y[Ø[™WÜÚLMˆÛÛ™›Ü›X[˜ÙK˜XÚÛ›İÛYÙ[Y[Ø[™WÜÚLM‹ˆXØÙ\YØ]ˆÜ[[œİ[
+™\İ[˜XØÙ\YØ]
+Kˆ™\šYšY\—Ù]X˜\ÙWÜ›ÛNˆÙ\ÜÚ[Û]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÜ›ÛKˆ™\šYšY\—Ù]X˜\ÙWÛ˜[YNˆÙ\ÜÚ[Û]\İ][Û‹œÙ\ÜÚ[Û‹™]X˜\ÙWÛ˜[YKˆ™\šYšY\—Ü›ÛWØÛÛ˜XİÜÚLMˆ‘SSÕWÔÕÔÑUPTÑWÔ“ÓWĞÓÓ•PÕÔÒLM‹ˆ˜[œÜÜÜİ]Nˆ	Ø]\İY[›İY\ŞYY	Ëˆ\Ü]ÚÜİ]Nˆ	Û›İY\Ü]ÚY	Ëˆ™[[İWÜİÜÜ™\]Y\İØXÚÛ›İÛYÙYˆYKˆ™[[İWÜİÜØÛÛ™š\›YYˆ˜[ÙKˆ™[[İWÜİÜÙY™™XİÛØœÙ\™Yˆ˜[ÙKˆ›ØÙ\Ü×İ\›Z[˜[ÛØœÙ\™Yˆ˜[ÙKˆ\ØÙ[™[×Ü]ZY\ØÙYˆ˜[ÙKˆÜİØØ\XÚ]WÜ™[X\ÙYˆ˜[ÙKˆ™[X\ÙYÚÜİÜÛİÎˆˆYÙ]ØÛÛ[Z]Y[Ü™[X\ÙYˆ˜[ÙKˆ™[X\ÙYØÛÜİİ\Ùˆ	ÌŒ	Ëˆİ]Nˆ	ÜİÜ\™\]Y\İY	ËˆKˆ›ØÚÙ\œÎˆ×KˆNÂˆHØ]Ú
+\œ›ÜŠHÂˆYˆ
+˜[œØXİ[Û“Ü[ŠHÂˆHÈ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÈHØ]ÚÈÊˆš[X\H˜Z[\™H™[XZ[œÈ]]Üš]]]™H
+‹ÈBˆBˆ™]\›ˆÂˆ™XÛÜ™Yˆ˜[ÙKˆ™XÙZ\ˆ[ˆ›ØÚÙ\œÎˆÉÔ™[[İK\İÜXÚÛ›İÛYÙ[Y[]X˜\ÙH]]Üš]H˜Z[Y‰×KˆNÂˆHš[˜[HÂˆÛY[œ™[X\ÙOËŠ
+NÂˆBˆB‚ˆ\Ş[˜È™XÛÛ˜Ú[T[›™\’X\™X]^\J[œ]ˆ[›™\’X\™X]^\R[œ]
+Nˆ›ÛZ\ÙO[›™\’X\™X]^\T™\İ[ˆÂˆÛÛœİ\œÙYH[›™\’X\™X]^\R[œ]ØÚ[XKœØY™T\œÙJ[œ]
+NÂˆYˆ
+\\œÙYœİXØÙ\ÜÊHÂˆ™]\›ˆÈ™XÛÛ˜Ú[Yˆ˜[ÙK™\Ù\˜][Û—ÚYˆİš[™Ê[œ]Ëœ™\Ù\˜][Û—ÚYÏÈ	Ú[˜[Y\™\Ù\˜][Û‰ÊKİ]Nˆ[^\™Yˆ˜[ÙK›ØÚÙ\œÎˆÉÔ[›™\ˆX\™X]^\H™\]Y\İ\È[˜[Y‰×HNÂˆBˆÛÛœİ™\]Y\İH\œÙY™]NÂˆÛÛœİÛY[H]ØZ]\ËœÛÛ˜ÛÛ›™Xİ
+
+NÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆ]ØZ]ÛY[œ]Y\J	ÔÑUĞĞSÙX\˜ÚÜ]H×ØØ][ÙËX›XË×İ[\	ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JH›İÈ™]È\œ›ÜŠ	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆÛÛœİ]H]ØZ]Ø[ÛØÚÊÛY[
+NÂˆÛÛœİ›İÓ\ÈH]Kœ\œÙJ]
+NÂˆÛÛœİ›İ[™H]ØZ]ÛY[œ]Y\JˆÑSPÕ™\Ù\˜][Û—ÚYÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹İ]K[›™\—ØÛZ[WÙ^\™\×Ø]ˆ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ][›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]™\Ù\˜][Û—Ù^\™\×Ø]ˆX\ÙWÙ^\™\×Ø]İ\Ø]]Üš^™YØ]š[™[™Âˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘[›™\—ØÛZ[WÚYI]ZY“ÔˆTUXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY™\]Y\İ˜ÛZ[WÚYKˆ
+NÂˆÛÛœİ›İÈH›İ[™œ›İÜÖÌNÂˆYˆ
+\›İÈ›İË›Ü\˜][Û—ÚYOOH™\]Y\İ›Ü\˜][Û—ÚYˆ›İË˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈ™XÛÛ˜Ú[Yˆ˜[ÙK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ[^\™Yˆ˜[ÙK›ØÚÙ\œÎˆÉÔ[›™\ˆÛZ[HÙ\È›İ^\İÜˆÙ\È›İX]ÚH^\H™\]Y\İ‰×HNÂˆBˆYˆ
+›İËœİ]HOOH	ÜİÜ\™\]Y\İY	ÊHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈ™XÛÛ˜Ú[YˆYK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ	ÜİÜ\™\]Y\İY	Ë^\™YˆYK›ØÚÙ\œÎˆ×HNÂˆBˆYˆ
+›İËœİ]HOOH	Ü[›™\‹XÛZ[YY[›İ\İ\Y	È	‰ˆ›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	ÊHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈ™XÛÛ˜Ú[Yˆ˜[ÙK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ[^\™Yˆ˜[ÙK›ØÚÙ\œÎˆØ[›™\ˆX\™X]^\HØ[››İ™H™XÛÛ˜Ú[Yœ›ÛHİ]H	Ôİš[™Ê›İËœİ]J_K˜HNÂˆBˆÛÛœİš[™[™ÈHÜ\˜][Ûš[™[™ÔØÚ[XKœØY™T\œÙJ›İË˜š[™[™ÊNÂˆÛÛœİ^\S\ÈH]Kœ\œÙJİš[™Ê›İËœ[›™\—ØÛZ[WÙ^\™\×Ø]
+JNÂˆÛÛœİ]]Üš]PØ\\ÈHš[™[™ËœİXØÙ\ÜÈÈX]›Z[Šˆ]Kœ\œÙJİš[™Ê›İËœ[›™\—ØXØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+JKˆ]Kœ\œÙJİš[™Ê›İËœ[›™\—Ù]šY[˜ÙWÛØœÙ\™YØ]
+JH
+È\Ë›X^[›™\‘]šY[˜ÙPYÙS\Ëˆ]Kœ\œÙJİš[™Ê›İËœ™\Ù\˜][Û—Ù^\™\×Ø]
+JKˆ]Kœ\œÙJİš[™Ê›İË›X\ÙWÙ^\™\×Ø]
+JKˆ]Kœ\œÙJİš[™Ê›İËœİ\Ø]]Üš^™YØ]
+JH
+Èš[™[™Ë™]K[Y[İ]Û\Ëˆ
+Hˆ[X™\‹“˜SÂˆÛÛœİ[˜[YÜ‘^\™YHXš[™[™ËœİXØÙ\ÜÂˆÚLM‘YÙ\İ
+š[™[™Ë™]JHOOH›İË˜š[™[™×ÙYÙ\İÜÚLM‚ˆS[X™\‹š\Ñš[š]J]]Üš]PØ\\ÊBˆ^\S\ÈOOH]]Üš]PØ\\Âˆ^\S\ÈH›İÓ\ÎÂˆYˆ
+Z[˜[YÜ‘^\™Y
+HÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈ™XÛÛ˜Ú[YˆYK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ›İËœİ]K^\™Yˆ˜[ÙK›ØÚÙ\œÎˆ×HNÂˆBˆÛÛœİİÜYH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	ÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]HSˆ
+	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊH‘UT“’S‘È™\Ù\˜][Û—ÚYˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYKˆ
+NÂˆYˆ
+İÜYœ›İÜË›[™İOOHJH›İÈ™]È\œ›ÜŠ	Ô[›™\ˆX\™X]^\H™XÛÛ˜Ú[X][ÛˆÜİ]È]]Üš]H˜XÙK‰ÊNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	ÜİÜ\™\]Y\İY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYÛZ[WÚYˆ™\]Y\İ˜ÛZ[WÚYˆ™X\ÛÛˆ	Ü[›™\ˆX\™X]]]Üš]H^\™YÜˆšYY	Ëˆ^Xİ][Û—Üİ]Nˆ›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	ÈÈ	Üİ\Y[Ü‹][šÛ›İÛ‰Èˆ	İ[šÛ›İÛ‰Ë™[X\ÙYØÛÜİİ\ÙˆˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈ™XÛÛ˜Ú[YˆYK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ	ÜİÜ\™\]Y\İY	Ë^\™YˆYK›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ]ØZ]\Ëœ™XÛÜ™[YÜš]T™Y\Ø[
+ÛY[™\]Y\İ›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ÂˆXİ[Ûˆ	Ü™XÛÛ˜Ú[K\[›™\‹ZX\™X]Y^\IË™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ\œ›Üˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆ[›™\‹ZX\™X]^\H™XÛÛ˜Ú[X][Ûˆ˜Z[\™IËˆJNÂˆ›İÈ\œ›ÜÂˆHš[˜[HÈÛY[œ™[X\ÙOËŠ
+NÈBˆB‚ˆ\Ş[˜ÈØ[˜Ù[
+[œ]ˆØ[˜Ù[][Û’[œ]
+Nˆ›ÛZ\ÙOØ[˜Ù[][Û”™\İ[ˆÂˆÛÛœİ\œÙYHØ[˜Ù[][Û’[œ]ØÚ[XKœØY™T\œÙJ[œ]
+NÂˆYˆ
+\\œÙYœİXØÙ\ÜÊH™]\›ˆØ[˜Ù[][Û‘[šYY
+İš[™Ê[œ]Ëœ™\Ù\˜][Û—ÚYÏÈ	Ú[˜[Y\™\Ù\˜][Û‰ÊK	ĞØ[˜Ù[][Ûˆ™\]Y\İ\È[˜[Y‰ÊNÂˆÛÛœİ™\]Y\İH\œÙY™]NÂˆÛÛœİÛY[H]ØZ]\ËœÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]Y™™XİYÜ\˜][ÛˆH	Ú[˜[Y[Ü\˜][Û‰ÎÂˆ]Y™™XİYYÙ\İH	Ì	Ëœ™\X]
+
+NÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JH›İÈ™]È\œ›ÜŠ	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆÛÛœİ]H]ØZ]Ø[ÛØÚÊÛY[
+NÂˆÛÛœİ›İ[™H]ØZ]ÛY[œ]Y\JˆÑSPÕ™\Ù\˜][Û—ÚYÜ\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹š[™[™ËYÙ]Ü™XÙZ\ÚYÜİÚY™\Ù\™YØÛÜİİ\Ùİ]Kˆ
+™\Ù\™YØÛÜİİ\ÙTÈ“ÕTÕSÕ”“ÓH
+š[™[™ËO‰Ü™\]Y\İYØÛÜİİ\Ù	ÊN›[Y\šXÊHTÈÛÜİÛX]Ú\×Øš[™[™Âˆ”“ÓHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘Ø[˜Ù[İÚÙ[—ÜÚLMIˆ“ÔˆTUXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYÜ™X]R\Ú
+	ÜÚLM‰ÊK\]J™\]Y\İ˜Ø[˜Ù[İÚÙ[‹	İ]	ÊK™YÙ\İ
+	Ú^	ÊWKˆ
+NÂˆÛÛœİ›İÈH›İ[™œ›İÜÖÌNÂˆYˆ
+\›İÊHÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ù[šYY	Ë	Ú[˜[Y[Ü\˜][Û‰Ë	K	[Y\İ[\‹	ÎšœÛÛ˜ŠXˆÉÌ	Ëœ™\X]
+
+K]”ÓÓ‹œİš[™ÚYJÈ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚY›ØÚÙ\œÎˆÉÔ™\Ù\˜][ÛˆÙ\È›İ^\İ‰×HJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆØ[˜Ù[][Û‘[šYY
+™\]Y\İœ™\Ù\˜][Û—ÚY	Ô™\Ù\˜][ÛˆÙ\È›İ^\İ‰ÊNÂˆBˆY™™XİYÜ\˜][ÛˆHİš[™Ê›İË›Ü\˜][Û—ÚY
+NÂˆY™™XİYYÙ\İHİš[™Ê›İË˜š[™[™×ÙYÙ\İÜÚLMŠNÂˆYˆ
+›İËœİ]HOOH	ØØ[˜Ù[Y	ÊHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈØ[˜Ù[YˆYK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ	ØØ[˜Ù[Y	Ë[™XYWİ\›Z[˜[ˆYK™[X\ÙYØÛÜİİ\Ùˆ›ØÚÙ\œÎˆ×HNÂˆBˆYˆ
+›İËœİ]HOOH	Ù^\™Y	ÊHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆØ[˜Ù[][Û‘[šYY
+™\]Y\İœ™\Ù\˜][Û—ÚY	Ô™\Ù\˜][Ûˆ\È[™XYH^\™Y‰Ë	Ù^\™Y	ËYJNÂˆBˆYˆ
+›İËœİ]HOOH	ÜİÜ\™\]Y\İY	ÊHÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆØ[˜Ù[][Û‘[šYY
+ˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ	ÔİÜØ\È[™XYH™\]Y\İYÈ]][XØ]Y\›Z[˜[]šY[˜ÙH\È™\]Z\™Y™Y›Ü™H™\Ûİ\˜ÙH™[X\ÙK‰Ëˆ	ÜİÜ\™\]Y\İY	ËˆYKˆ
+NÂˆBˆYˆ
+›İËœİ]HOOH	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	È›İËœİ]HOOH	Ü[›™\‹XÛZ[YY[›İ\İ\Y	È›İËœİ]HOOH	Ü[›™\‹\İ\[ØœÙ\™Y	ÊHÂˆÛÛœİİÜYH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIÜİÜ\™\]Y\İY	ÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]HSˆ
+	Üİ\X]]Üš^™Y[›İ[ØœÙ\™Y	Ë	Ü[›™\‹XÛZ[YY[›İ\İ\Y	Ë	Ü[›™\‹\İ\[ØœÙ\™Y	ÊH‘UT“’S‘È™\Ù\˜][Û—ÚYˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYKˆ
+NÂˆYˆ
+İÜYœ›İÜË›[™İOOHJH›İÈ™]È\œ›ÜŠ	ÔİÜ™\]Y\İÜİ]È]]Üš]H˜XÙK‰ÊNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	ÜİÜ\™\]Y\İY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ›İË›Ü\˜][Û—ÚY›İË˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÂˆ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚY™X\ÛÛˆ™\]Y\İœ™X\ÛÛ‹ˆ^Xİ][Û—Üİ]Nˆ	İ[šÛ›İÛ‰Ë™[X\ÙYØÛÜİİ\ÙˆˆJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆØ[˜Ù[][Û‘[šYY
+ˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ	Ôİ\]]Üš]HØ\È[™XYH™YY[YYÈ]][XØ]Y\›Z[˜[]šY[˜ÙH\È™\]Z\™Y™Y›Ü™H™\Ûİ\˜ÙH™[X\ÙK‰Ëˆ	ÜİÜ\™\]Y\İY	Ëˆ
+NÂˆBˆYˆ
+›İËœİ]HOOH	Ü™\Ù\™Y[›İ\İ\Y	È	‰ˆ›İËœİ]HOOH	ØÛÛœİ[YY[›İ\İ\Y	È	‰ˆ›İËœİ]HOOH	ÛX\ÙY[›İ\İ\Y	ÊHÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ù[šYY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ›İË›Ü\˜][Û—ÚY›İË˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÈ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚY›ØÚÙ\œÎˆÉÔ™\Ù\˜][Ûˆİ]H\È[˜[Y‰×HJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆØ[˜Ù[][Û‘[šYY
+™\]Y\İœ™\Ù\˜][Û—ÚY	Ô™\Ù\˜][Ûˆİ]H\È[˜[Y‰ÊNÂˆBˆÛÛœİ˜[œÚ][Û™YH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÈÑUİ]OIØØ[˜Ù[Y	ÂˆÒT‘H™\Ù\˜][Û—ÚYIN]ZYS‘İ]HSˆ
+	Ü™\Ù\™Y[›İ\İ\Y	Ë	ØÛÛœİ[YY[›İ\İ\Y	Ë	ÛX\ÙY[›İ\İ\Y	ÊH‘UT“’S‘È™\Ù\˜][Û—ÚYˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYKˆ
+NÂˆYˆ
+˜[œÚ][Û™Yœ›İÜË›[™İOOHJH›İÈ™]È\œ›ÜŠ	ĞØ[˜Ù[][ÛˆÜİ]È]]Üš]H˜XÙK‰ÊNÂˆÛÛœİ™[X\ÙYH]ØZ]\Ëœ™[X\ÙT™\Ûİ\˜Ù\ÊÛY[›İÊNÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü™\Ù\˜][Û‹XØ[˜Ù[Y	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ›İË›Ü\˜][Û—ÚY›İË˜š[™[™×ÙYÙ\İÜÚLM‹]”ÓÓ‹œİš[™ÚYJÈ™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚY™X\ÛÛˆ™\]Y\İœ™X\ÛÛ‹™[X\ÙYØÛÜİİ\Ùˆ™[X\ÙYJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈØ[˜Ù[YˆYK™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYİ]Nˆ	ØØ[˜Ù[Y	Ë[™XYWİ\›Z[˜[ˆ˜[ÙK™[X\ÙYØÛÜİİ\Ùˆ™[X\ÙY›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ]ØZ]\Ëœ™XÛÜ™[YÜš]T™Y\Ø[
+ÛY[Y™™XİYÜ\˜][Û‹Y™™XİYYÙ\İÂˆXİ[Ûˆ	ØØ[˜Ù[	Ë™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆ\œ›Üˆ\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ	İ[šÛ›İÛˆØ[˜Ù[][Ûˆ˜Z[\™IËˆJNÂˆ›İÈ\œ›ÜÂˆHš[˜[HÈÛY[œ™[X\ÙOËŠ
+NÈBˆB‚ˆ\Ş[˜È™\Ù\™J™\]Y\İˆ]ÛZXĞYZ\ÜÚ[Û”™\]Y\İ
+Nˆ›ÛZ\ÙOYZ\ÜÚ[Û”™\İ[ˆÂˆYˆ
+S[X™\‹š\Ò[YÙ\Š™\]Y\İ›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÊH™\]Y\İ›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÈWÌ™\]Y\İ›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\ÈˆŒ
+ˆŒÌ
+HÂˆ›İÈ™]È\œ›ÜŠ	ÒÜİ]šY[˜ÙHYÙHÙZ[[™È]\İ™H™]ÙY[ˆHÙXÛÛ™[™Hİ\‹‰ÊNÂˆBˆÛÛœİÛY[H]ØZ]\ËœÛÛ˜ÛÛ›™Xİ
+
+NÂˆ]]Y]]H™\]Y\İ››İÎÂˆÛÛœİ[HH\Ş[˜È
+›ØÚÙ\ˆİš[™ÊHOˆÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ù[šYY	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹]Y]]”ÓÓ‹œİš[™ÚYJÈ›ØÚÙ\œÎˆØ›ØÚÙ\—HJWKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆ[šX[
+›ØÚÙ\ŠNÂˆNÂˆHÂˆ]ØZ]ÛY[œ]Y\J	Ğ‘QÒS‰ÊNÂˆYˆ
+X]ØZ]ØÚĞ]]Üš]JÛY[
+JHÂˆ™]\›ˆ]ØZ][J	Ğ]]Üš]HÙ\šX[^˜][ÛˆÛÛ›Û›İÈ\ÈZ\ÜÚ[™ÈÜˆ[XšYİ[İ\Ë‰ÊNÂˆBˆÛÛœİ˜[œØXİ[Û“›İÈH]ØZ]Ø[ÛØÚÊÛY[
+NÂˆ]Y]]H˜[œØXİ[Û“›İÎÂˆÛÛœİ˜[œØXİ[Û“›İÓ\ÈH]Kœ\œÙJ˜[œØXİ[Û“›İÊNÂˆÛÛœİ™YœÈHÂˆ™XÙZ\‰Ü™\]Y\İ˜\›İ˜[œ™XÙZ\ÚYX™XÙZ\‰Ü™\]Y\İ˜YÙ]œ™XÙZ\ÚYXˆÙ^N‰Ü™\]Y\İ˜\›İ˜[š\ÜİY\ŸN‰Ü™\]Y\İ˜\›İ˜[šÙ^WÚYXÙ^N‰Ü™\]Y\İ˜YÙ]š\ÜİY\ŸN‰Ü™\]Y\İ˜YÙ]šÙ^WÚYXˆ\ÜİY\‰Ü™\]Y\İ˜\›İ˜[š\ÜİY\ŸX\ÜİY\‰Ü™\]Y\İ˜YÙ]š\ÜİY\ŸXˆÜ\˜][Û‰Ü™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚYXY™™Xİ‰Ü™\]Y\İ˜š[™[™Ë™Y™™XİÚYXˆNÂˆÛÛœİ™]›ÚÙYH]ØZ]ÛY[œ]Y\J	ÔÑSPÕ™Yˆ”“ÓHİØ\›WØ]]Üš]WÜ™]›ØØ][ÛœÈÒT‘H™YˆHS–J	N^×JHSRUIËÜ™Yœ×JNÂˆYˆ
+™]›ÚÙYœ›İÜË›[™İ
+H™]\›ˆ]ØZ][J	Ğ[ˆ]]Üš]H™XÙZ\\ÜİY\ˆÜˆÚYÛš[™ÈÙ^H\È™]›ÚÙY‰ÊNÂˆYˆ
+]Kœ\œÙJ™\]Y\İ˜\›İ˜[™^\™\×Ø]
+HH˜[œØXİ[Û“›İÓ\È]Kœ\œÙJ™\]Y\İ˜YÙ]™^\™\×Ø]
+HH˜[œØXİ[Û“›İÓ\ÊHÂˆ™]\›ˆ]ØZ][J	Ğ[ˆ]]Üš]H™XÙZ\^\™Y™Y›Ü™HH™\Ù\˜][Ûˆ˜[œØXİ[Û‹‰ÊNÂˆBˆYˆ
+]Kœ\œÙJ™\]Y\İœ™\Ù\˜][Û—Ù^\™\×Ø]
+HH˜[œØXİ[Û“›İÓ\ÊH™]\›ˆ]ØZ][J	Ô™\Ù\˜][Ûˆ^\H[\ÙY™Y›Ü™H]Ûİ[™H\ÜİYY‰ÊNÂ‚ˆÛÛœİ™\\™Y›İÈH]ØZ]ÛY[œ]Y\Jˆ	ÔÑSPÕš[™[™×ÙYÙ\İÜÚLM‹İ]H”“ÓHİØ\›WØ]]Üš]WÜ™\\™YÛÜ\˜][ÛœÈÒT‘HÜ\˜][Û—ÚYIH“ÔˆTUIËˆÜ™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚYKˆ
+NÂˆYˆ
+\™\\™Y›İËœ›İÜÖÌJH™]\›ˆ]ØZ][J	ÔÙ\™\‹[İÛ™Y™\\™YÜ\˜][Ûˆ\ÈZ\ÜÚ[™Ë‰ÊNÂˆYˆ
+™\\™Y›İËœ›İÜÖÌKœİ]HOOH	Ü™XYIÊH™]\›ˆ]ØZ][J	ÔÙ\™\‹[İÛ™Y™\\™YÜ\˜][Ûˆ\ÈØ[˜Ù[Y‰ÊNÂˆYˆ
+™\\™Y›İËœ›İÜÖÌK˜š[™[™×ÙYÙ\İÜÚLMˆOOH™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLMŠHÂˆ™]\›ˆ]ØZ][J	Ô™\\™YÜ\˜][ÛˆYÙ\İÙ\È›İX]ÚHÚYÛ™YÜ\˜][Ûˆš[™[™Ë‰ÊNÂˆB‚ˆÛÛœİÜİ›İÈH]ØZ]ÛY[œ]Y\Jˆ	ÔÑSPÕ]šY[˜ÙKØ\XÚ]WÜÛİË™\Ù\™YÜÛİË]]Üš^™YÜÛİÈ”“ÓHİØ\›WØ]]Üš]WÚÜİÈÒT‘HÜİÚYIH“ÔˆTUIËˆÜ™\]Y\İ˜š[™[™ËšÜİÚYKˆ
+NÂˆÛÛœİÜİHÜİ]šY[˜ÙJÜİ›İËœ›İÜÖÌJNÂˆYˆ
+ZÜİ
+H™]\›ˆ]ØZ][J	Õ\İYÜİ]šY[˜ÙH\ÈZ\ÜÚ[™Ë‰ÊNÂˆYˆ
+ÜİšÜİÚYOOH™\]Y\İ˜š[™[™ËšÜİÚY
+H™]\›ˆ]ØZ][J	Õ\İYÜİ]šY[˜ÙHY[]HÙ\È›İX]ÚH™\]Y\İYÜİ‰ÊNÂˆÛÛœİ›İÓ\ÈH˜[œØXİ[Û“›İÓ\ÎÂˆYˆ
+Üİœİ]\ÈOOH	Ü™XYIÊH™]\›ˆ]ØZ][J	Õ\İYÜİ\È›İ™XYK‰ÊNÂˆYˆ
+›İÓ\ÈH]Kœ\œÙJÜİ›ØœÙ\™YØ]
+Hˆ™\]Y\İ›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\È]Kœ\œÙJÜİ›ØœÙ\™YØ]
+Hˆ›İÓ\È
+ÈŒÌ
+H™]\›ˆ]ØZ][J	Õ\İYÜİ]šY[˜ÙH\Èİ[HÜˆœ›ÛHH]\™K‰ÊNÂˆYˆ
+ZÜİœÙXÜ™]Ü™XY[™\ÜÊH™]\›ˆ]ØZ][J	Õ\İYÜİÙXÜ™]È\™H›İ™XYK‰ÊNÂˆYˆ
+]Kœ\œÙJÜİ˜XØÙ\Ü×Ü™]šY]×Ù^\™\×Ø]
+HH›İÓ\ÊH™]\›ˆ]ØZ][J	Õ\İYÜİXØÙ\ÜÈ™]šY]È\È^\™Y‰ÊNÂˆÛÛœİØ\XÚ]TÛİÈH[X™\ŠÜİ›İËœ›İÜÖÌOË˜Ø\XÚ]WÜÛİÊNÂˆÛÛœİ™\Ù\™YÛİÈH[X™\ŠÜİ›İËœ›İÜÖÌOËœ™\Ù\™YÜÛİÊNÂˆÛÛœİ]]Üš^™YÛİÈH[X™\ŠÜİ›İËœ›İÜÖÌOË˜]]Üš^™YÜÛİÊNÂˆYˆ
+S[X™\‹š\ÔØY™R[YÙ\ŠØ\XÚ]TÛİÊHS[X™\‹š\ÔØY™R[YÙ\Š™\Ù\™YÛİÊBˆS[X™\‹š\ÔØY™R[YÙ\Š]]Üš^™YÛİÊHØ\XÚ]TÛİÈ™\Ù\™YÛİÈ]]Üš^™YÛİÈ
+HÂˆ™]\›ˆ]ØZ][J	Õ\İYÜİØ\XÚ]HYÙ\ˆ\È[˜[Y‰ÊNÂˆBˆYˆ
+Üİ˜Ø\XÚ]WÜÛİÈOOHØ\XÚ]TÛİÊH™]\›ˆ]ØZ][J	Õ\İYÜİØ\XÚ]H]šY[˜ÙH[™YÙ\ˆY™™\‹‰ÊNÂˆYˆ
+Ø\XÚ]TÛİÈH™\Ù\™YÛİÈH]]Üš^™YÛİÈJH™]\›ˆ]ØZ][J	Õ\İYÜİ\È›È]˜Z[X›HØ\XÚ]K‰ÊNÂˆÛÛœİÜİØ\ÈH™]ÈÙ]
+Üİ˜[İÙYØØ\Xš[]Y\ÊNÂˆYˆ
+™\]Y\İ˜š[™[™Ë˜Ø\Xš[]Y\ËœÛÛYJ
+][JHOˆZÜİØ\Ëš\Ê][JJJH™]\›ˆ]ØZ][J	Õ\İYÜİÙ\È›İ[İÈ]™\H™\]Y\İYØ\Xš[]K‰ÊNÂ‚ˆÛÛœİYÙ]›İÈH]ØZ]ÛY[œ]Y\JˆÑSPÕ\™Û[Z]İ\Ù™\Ù\™Yİ\ÙÛÛ[Z]Yİ\Ùˆ
+™\Ù\™Yİ\Ù
+ØÛÛ[Z]Yİ\Ù
+É›[Y\šXÈH\™Û[Z]İ\Ù
+HTÈØ[—Ü™\Ù\™Bˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]ÈÒT‘H™XÙZ\ÚYIH“ÔˆTUXˆÜ™\]Y\İ˜YÙ]œ™XÙZ\ÚY™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\ÙKˆ
+NÂˆYˆ
+XYÙ]›İËœ›İÜÖÌJH™]\›ˆ]ØZ][J	Ñ\˜X›HYÙ]™YÚ\İH[H\ÈZ\ÜÚ[™Ë‰ÊNÂˆÛÛœİ™YÚ\İ\™Y[Z]H[X™\ŠYÙ]›İËœ›İÜÖÌKš\™Û[Z]İ\Ù
+NÂˆÛÛœİ™\Ù\™YH[X™\ŠYÙ]›İËœ›İÜÖÌKœ™\Ù\™Yİ\Ù
+NÂˆYˆ
+™YÚ\İ\™Y[Z]OOH™\]Y\İ˜YÙ]š\™Û[Z]İ\Ù
+H™]\›ˆ]ØZ][J	ÔÚYÛ™Y[™\˜X›HYÙ]ÙZ[[™ÜÈY™™\‹‰ÊNÂˆYˆ
+S[X™\‹š\Ñš[š]J™\Ù\™Y
+HYÙ]›İËœ›İÜÖÌK˜Ø[—Ü™\Ù\™HOOHYJH™]\›ˆ]ØZ][J	Ñ\˜X›HYÙ]\È^]\İY‰ÊNÂ‚ˆÛÛœİYÙÜ™YØ]T›İÜÈH]ØZ]ÛY[œ]Y\JˆÑSPÕÚ[™İ×ÚYÛXŞWÚYÚ[™İ\×Ø][™×Ø]İ\œ™[˜ŞK\™Û[Z]İ\Ù™\Ù\™Yİ\ÙÛÛ[Z]Yİ\Ùˆ
+™\Ù\™Yİ\Ù
+ØÛÛ[Z]Yİ\Ù
+ÉÎ›[Y\šXÈH\™Û[Z]İ\Ù
+HTÈØ[—Ü™\Ù\™Bˆ”“ÓHİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÂˆÒT‘HÛXŞWÚYIHS‘İ\×Ø]H	[Y\İ[\ˆS‘[™×Ø]ˆ	[Y\İ[\‚ˆÔ‘Tˆ–HÚ[™“ÔˆTUXˆÜ™\]Y\İ˜š[™[™Ë˜YÙ]ÜÛXŞWÚY˜[œØXİ[Û“›İË™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\ÙKˆ
+NÂˆÛÛœİÚ[™ÈH™]ÈÙ]
+YÙÜ™YØ]T›İÜËœ›İÜË›X\
+
+›İÊHOˆ›İËšÚ[™
+JNÂˆYˆ
+YÙÜ™YØ]T›İÜËœ›İÜË›[™İOOHˆÚ[™ËœÚ^™HOOHˆZÚ[™Ëš\Ê	ÜÛXŞIÊHZÚ[™Ëš\Ê	ÙZ[IÊJHÂˆ™]\›ˆ]ØZ][J	Ñ^XİHÛ™HXİ]™HÛXŞH[™Z[HYÙÜ™YØ]HYÙ]Ú[™İÈ\™H™\]Z\™Y‰ÊNÂˆBˆYˆ
+YÙÜ™YØ]T›İÜËœ›İÜËœÛÛYJ
+›İÊHOˆ›İË˜İ\œ™[˜ŞHOOH	ÕTÑ	ÊJH™]\›ˆ]ØZ][J	ĞYÙÜ™YØ]HYÙ]İ\œ™[˜ŞH]\İ™HTÑ‰ÊNÂˆYˆ
+YÙÜ™YØ]T›İÜËœ›İÜËœÛÛYJ
+›İÊHOˆ]Kœ\œÙJ™\]Y\İœ™\Ù\˜][Û—Ù^\™\×Ø]
+Hˆ]Kœ\œÙJİš[™Ê›İË™[™×Ø]
+JJJHÂˆ™]\›ˆ]ØZ][J	Ô™\Ù\˜][Ûˆ^\HÜ›ÜÜÙ\È[ˆYÙÜ™YØ]HYÙ]Ú[™İÈ›İ[™\K‰ÊNÂˆBˆYˆ
+YÙÜ™YØ]T›İÜËœ›İÜËœÛÛYJ
+›İÊHOˆ›İË˜Ø[—Ü™\Ù\™HOOHYJJH™]\›ˆ]ØZ][J	ĞYÙÜ™YØ]HYÙ]Ú[™İÈ\È^]\İY‰ÊNÂˆÛÛœİÙ[XİYÚ[™İÜÎˆYÙ]Ú[™İÑ]šY[˜ÙV×HHYÙÜ™YØ]T›İÜËœ›İÜË›X\
+
+›İÊHOˆ
+ÂˆÚ[™İ×ÚYˆİš[™Ê›İËÚ[™İ×ÚY
+KÚ[™ˆ›İËšÚ[™\È	ÜÛXŞIÈ	ÙZ[IËˆİ\×Ø]ˆÜ[[œİ[
+›İËœİ\×Ø]
+K[™×Ø]ˆÜ[[œİ[
+›İË™[™×Ø]
+Kİ\œ™[˜ŞNˆ	ÕTÑ	ËˆJJNÂ‚ˆÛÛœİ[œÙ\YH]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WÜ™\Ù\˜][ÛœÂˆ
+™\Ù\˜][Û—ÚYÜ\˜][Û—ÚYY™™XİÚYš[™[™×ÙYÙ\İÜÚLM‹š[™[™Ëš[™[™×Ù]X˜\ÙWÜÚLM‹™]›ØØ][Û—Ü™YœËˆÛÛœİ[YWİÚÙ[—ÜÚLM‹Ø[˜Ù[İÚÙ[—ÜÚLM‹\›İ˜[Ü™XÙZ\ÚYYÙ]Ü™XÙZ\ÚYÜİÚY™\Ù\™YØÛÜİİ\Ù™\Ù\™YØ]ˆ™\Ù\˜][Û—Ù^\™\×Ø]X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\Ëİ]JBˆSQTÈ
+	N]ZY	‹	Ë		NšœÛÛ˜‹ˆ[˜ÛÙJÚLMŠÛÛ™\İÊ	NšœÛÛ˜^	ÕU	ÊJK	Ú^	ÊKˆ	šœÛÛ˜‹	Ë		K	L	LK	L‹	LÎ[Y\İ[\‹	M[Y\İ[\‹	MK	Ü™\Ù\™Y[›İ\İ\Y	ÊBˆÓˆÓÓ‘“PÕÈ“ÕS‘È‘UT“’S‘È
+˜ˆÜ™\]Y\İœ™\Ù\˜][Û—ÚY™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™Ë™Y™™XİÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹ˆ”ÓÓ‹œİš[™ÚYJ™\]Y\İ˜š[™[™ÊK”ÓÓ‹œİš[™ÚYJ™YœÊK™\]Y\İ˜ÛÛœİ[YWİÚÙ[—ÜÚLM‹™\]Y\İ˜Ø[˜Ù[İÚÙ[—ÜÚLM‹ˆ™\]Y\İ˜\›İ˜[œ™XÙZ\ÚY™\]Y\İ˜YÙ]œ™XÙZ\ÚY™\]Y\İ˜š[™[™ËšÜİÚYˆ™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\Ù˜[œØXİ[Û“›İË™\]Y\İœ™\Ù\˜][Û—Ù^\™\×Ø]ˆ™\]Y\İ›X^ÚÜİÙ]šY[˜ÙWØYÙWÛ\×Kˆ
+NÂˆYˆ
+Z[œÙ\Yœ›İÜÖÌJH™]\›ˆ]ØZ][J	ÓÜ\˜][ÛˆÜˆ^\›˜[Y™™XİØ\È[™XYH™\Ù\™Y‰ÊNÂˆ›Üˆ
+ÛÛœİÚ[™İÈÙˆÙ[XİYÚ[™İÜÊHÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØYÙ]ÚÛÈ
+™\Ù\˜][Û—ÚYÚ[™İ×ÚY™\Ù\™YØÛÜİİ\Ù
+BˆSQTÈ
+	N]ZY	‹	ÊXˆÜ™\]Y\İœ™\Ù\˜][Û—ÚYÚ[™İËÚ[™İ×ÚY™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\ÙKˆ
+NÂˆÛÛœİYÙÜ™YØ]U\]HH]ØZ]ÛY[œ]Y\JˆTUHİØ\›WØ]]Üš]WØYÙ]İÚ[™İÜÈÑU™\Ù\™Yİ\Ù\™\Ù\™Yİ\Ù
+É‚ˆÒT‘HÚ[™İ×ÚYIHS‘™\Ù\™Yİ\Ù
+ØÛÛ[Z]Yİ\Ù
+ÉˆH\™Û[Z]İ\Ù‘UT“’S‘È™\Ù\™Yİ\ÙˆİÚ[™İËÚ[™İ×ÚY™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\ÙKˆ
+NÂˆYˆ
+YÙÜ™YØ]U\]Kœ›İÜË›[™İOOHJH›İÈ™]È\œ›ÜŠ	ĞYÙÜ™YØ]HYÙ]™\Ù\˜][ÛˆÜİ]È]]Üš]H˜XÙK‰ÊNÂˆBˆ]ØZ]ÛY[œ]Y\J	ÕTUHİØ\›WØ]]Üš]WØYÙ]ÈÑU™\Ù\™Yİ\Ù\™\Ù\™Yİ\Ù
+ÉˆÒT‘H™XÙZ\ÚYIIËÜ™\]Y\İ˜YÙ]œ™XÙZ\ÚY™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\ÙJNÂˆ]ØZ]ÛY[œ]Y\J	ÕTUHİØ\›WØ]]Üš]WÚÜİÈÑU™\Ù\™YÜÛİÏ\™\Ù\™YÜÛİÊÌHÒT‘HÜİÚYIIËÚÜİšÜİÚYJNÂˆÛÛœİ™\Ù\˜][ÛˆYZ\ÜÚ[Û”™\Ù\˜][ÛˆHÂˆØÚ[XWİ™\œÚ[Ûˆ	Üİ\›YÚ›Ü\˜][Û—ØYZ\ÜÚ[Û‹ŒIË™\Ù\˜][Û—ÚYˆ™\]Y\İœ™\Ù\˜][Û—ÚYˆÜ\˜][Û—ÚYˆ™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚYY™™XİÚYˆ™\]Y\İ˜š[™[™Ë™Y™™XİÚYˆš[™[™×ÙYÙ\İÜÚLMˆ™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹\›İ˜[Ü™XÙZ\ÚYˆ™\]Y\İ˜\›İ˜[œ™XÙZ\ÚYˆYÙ]Ü™XÙZ\ÚYˆ™\]Y\İ˜YÙ]œ™XÙZ\ÚYYÙ]ÜÛXŞWÚYˆ™\]Y\İ˜š[™[™Ë˜YÙ]ÜÛXŞWÚYˆYÙ]İÚ[™İÜÎˆÙ[XİYÚ[™İÜËˆÜİÚYˆ™\]Y\İ˜š[™[™ËšÜİÚYˆ™\Ù\™YØÛÜİİ\Ùˆ™\]Y\İ˜š[™[™Ëœ™\]Y\İYØÛÜİİ\Ù™\Ù\™YØ]ˆ˜[œØXİ[Û“›İËˆ™\Ù\˜][Û—Ù^\™\×Ø]ˆ™\]Y\İœ™\Ù\˜][Û—Ù^\™\×Ø]ˆÛÛœİ[YWİÚÙ[ˆ™\]Y\İ˜ÛÛœİ[YWİÚÙ[‹ˆØ[˜Ù[İÚÙ[ˆ™\]Y\İ˜Ø[˜Ù[İÚÙ[‹ˆİ]Nˆ	Ü™\Ù\™Y[›İ\İ\Y	ËˆNÂˆÛÛœİÈÛÛœİ[YWİÚÙ[ˆØÛÛœİ[YUÚÙ[‹Ø[˜Ù[İÚÙ[ˆØØ[˜Ù[ÚÙ[‹‹‹œ™\Ù\˜][Û]Y]HH™\Ù\˜][ÛÂˆ]ØZ]ÛY[œ]Y\JˆS”ÑT•S•ÈİØ\›WØ]]Üš]WØ]Y]
+]™[Ü\˜][Û—ÚYš[™[™×ÙYÙ\İÜÚLM‹]]Z[
+BˆSQTÈ
+	Ü™\Ù\™Y	Ë	K	‹	Î[Y\İ[\‹	šœÛÛ˜ŠXˆÜ™\]Y\İ˜š[™[™Ë›Ü\˜][Û—ÚY™\]Y\İ˜š[™[™×ÙYÙ\İÜÚLM‹˜[œØXİ[Û“›İË”ÓÓ‹œİš[™ÚYJ™\Ù\˜][Û]Y]
+WKˆ
+NÂˆ]ØZ]ÛY[œ]Y\J	ĞÓÓSRU	ÊNÂˆ™]\›ˆÈYZ]YˆYK™\Ù\˜][Û‹›ØÚÙ\œÎˆ×HNÂˆHØ]Ú
+\œ›ÜŠHÂˆ]ØZ]ÛY[œ]Y\J	Ô“ÓPÒÉÊNÂˆ›İÈ\œ›ÜÂˆHš[˜[HÈÛY[œ™[X\ÙOËŠ
+NÈBˆBŸB

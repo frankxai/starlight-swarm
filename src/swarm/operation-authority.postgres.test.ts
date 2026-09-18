@@ -21,9 +21,17 @@ import {
   attestUsageEvidenceDatabaseSession,
   brokerDatabaseRoleGrantSql,
   usageAuthorityRoutineOwnerGrantSql,
+  remoteStopAuthorityRoutineOwnerGrantSql,
   usageEvidenceDatabaseRoleGrantSql,
+  remoteStopDatabaseRoleGrantSql,
+  REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
   type BrokerDatabaseSessionAttestor,
 } from './authority-role-contract';
+import type {
+  RemoteStopAcknowledgement,
+  RemoteStopAcknowledgementAttestation,
+  RemoteStopRequest,
+} from './remote-stop-conformance';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const approvalSecret = 'postgres-approval-secret-at-least-32-bytes';
@@ -72,6 +80,7 @@ const runnerSessionAttestor: RunnerSessionAttestor = async () => {
 let currentStartEvidence: RunnerStartEvidence | undefined;
 let currentOutcomeEvidence: RunnerOutcomeEvidence | undefined;
 let currentUsageEvidence: RunnerUsageEvidence | undefined;
+let currentRemoteStopAcknowledgement: RemoteStopAcknowledgement | undefined;
 const runnerStartEvidenceAttestor: RunnerStartEvidenceAttestor = async () => currentStartEvidence
   ? { valid: true, evidence: currentStartEvidence, blockers: [] }
   : { valid: false, evidence: null, blockers: ['No server-owned process evidence exists.'] };
@@ -81,6 +90,10 @@ const runnerOutcomeEvidenceAttestor: RunnerOutcomeEvidenceAttestor = async () =>
 const runnerUsageEvidenceAttestor: RunnerUsageEvidenceAttestor = async () => currentUsageEvidence
   ? { valid: true, evidence: currentUsageEvidence, blockers: [] }
   : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
+const remoteStopAcknowledgementAttestor = async (): Promise<RemoteStopAcknowledgementAttestation> =>
+  currentRemoteStopAcknowledgement
+    ? { valid: true, acknowledgement: currentRemoteStopAcknowledgement, blockers: [] }
+    : { valid: false, acknowledgement: null, blockers: ['No supervisor acknowledgement exists.'] };
 const storeOptions = {
   brokerSessionAttestor, runnerSessionAttestor, runnerStartEvidenceAttestor, runnerOutcomeEvidenceAttestor,
   runnerUsageEvidenceAttestor,
@@ -149,10 +162,13 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   // Ephemeral CI-only roles; these credentials never leave the disposable test database.
   const brokerPassword = 'postgres-broker-test-only';
   const verifierPassword = 'postgres-verifier-test-only';
+  const remoteStopPassword = 'postgres-remote-stop-test-only';
   await pool.query(`
     REVOKE CREATE,TEMPORARY ON DATABASE starlight_test FROM PUBLIC;
     CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_remote_stop_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${remoteStopAuthorityRoutineOwnerGrantSql('starlight_remote_stop_owner')}
     CREATE ROLE starlight_postgres_test_broker LOGIN PASSWORD '${brokerPassword}'
       NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     GRANT CONNECT,TEMPORARY ON DATABASE starlight_test TO starlight_postgres_test_broker;
@@ -161,6 +177,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     GRANT CONNECT ON DATABASE starlight_test TO starlight_postgres_usage_verifier;
     ${usageEvidenceDatabaseRoleGrantSql('starlight_postgres_usage_verifier')}
+    CREATE ROLE starlight_postgres_remote_stop_verifier LOGIN PASSWORD '${remoteStopPassword}'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    GRANT CONNECT ON DATABASE starlight_test TO starlight_postgres_remote_stop_verifier;
+    ${remoteStopDatabaseRoleGrantSql('starlight_postgres_remote_stop_verifier')}
   `);
   const connectionFor = (role: string, password: string) => {
     const parsed = new URL(databaseUrl!);
@@ -173,6 +193,9 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   });
   const verifierRolePool = new Pool({
     connectionString: connectionFor('starlight_postgres_usage_verifier', verifierPassword), max: 8,
+  });
+  const remoteStopRolePool = new Pool({
+    connectionString: connectionFor('starlight_postgres_remote_stop_verifier', remoteStopPassword), max: 8,
   });
   const adaptPool = (rolePool: Pool): AuthoritySqlPool => ({
     connect: async () => {
@@ -188,9 +211,12 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   });
   const brokerRoleAuthorityPool = adaptPool(brokerRolePool);
   const verifierRoleAuthorityPool = adaptPool(verifierRolePool);
+  const remoteStopRoleAuthorityPool = adaptPool(remoteStopRolePool);
   const usageStoreOptions = {
     ...storeOptions,
     usageEvidencePool: verifierRoleAuthorityPool,
+    remoteStopAcknowledgementPool: remoteStopRoleAuthorityPool,
+    remoteStopAcknowledgementAttestor,
   };
   const store = new PostgresOperationAuthorityStore(authorityPool, usageStoreOptions);
 
@@ -199,9 +225,11 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     currentStartEvidence = undefined;
     currentOutcomeEvidence = undefined;
     currentUsageEvidence = undefined;
+    currentRemoteStopAcknowledgement = undefined;
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
       swarm_authority_budgets,swarm_authority_prepared_operations,
       swarm_authority_budget_holds,swarm_authority_budget_windows,
+      swarm_authority_remote_stop_acknowledgements,swarm_authority_remote_stop_principals,
       swarm_authority_usage_evidence,swarm_authority_usage_tokens,swarm_authority_heartbeat_tokens,
       swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);
     const operation = binding();
@@ -1149,6 +1177,148 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(Number(state.rows[0].authorized_slots), 1);
     });
 
+    await t.test('duplicate remote-stop acknowledgements persist once and principal disablement fails closed', async () => {
+      const h = await prepare();
+      currentRunnerLaunchAttemptId = 'postgres-launch-attempt-remote-stop';
+      const claimInput = await authorize(h, '84');
+      const claim = await h.authority.claimRunnerStart(claimInput);
+      assert.equal(claim.claimed, true, claim.blockers.join(' '));
+      if (!claim.claimed) return;
+      const fixtureClient = await pool.connect();
+      try {
+        await fixtureClient.query('BEGIN');
+        await fixtureClient.query('SELECT starlight_authority_lock()');
+        await fixtureClient.query(
+          "UPDATE swarm_authority_reservations SET state='stop-requested' WHERE reservation_id=$1",
+          [h.reservation.reservation_id],
+        );
+        await fixtureClient.query(`INSERT INTO swarm_authority_audit
+          (event,operation_id,binding_digest_sha256,at,detail)
+          VALUES ('stop-requested',$1,$2,clock_timestamp()-interval '10 seconds',
+            jsonb_build_object('reservation_id',$3::text,'reason','remote-stop race fixture',
+              'execution_state','unknown','released_cost_usd',0))`,
+        [h.consume.operation_id, h.consume.binding_digest_sha256, h.reservation.reservation_id]);
+        await fixtureClient.query('COMMIT');
+      } catch (error) {
+        await fixtureClient.query('ROLLBACK');
+        throw error;
+      } finally {
+        fixtureClient.release();
+      }
+      const audit = await pool.query(`SELECT seq,encode(sha256(convert_to(jsonb_build_object(
+          'seq',seq,'event',event,'operation_id',operation_id,'binding_digest_sha256',binding_digest_sha256,
+          'at_epoch_microseconds',floor(extract(epoch FROM at)*1000000)::bigint,'detail',detail)::text,'UTF8')),'hex') AS digest
+        FROM swarm_authority_audit WHERE event='stop-requested' ORDER BY seq DESC LIMIT 1`);
+      const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+      const observedAt = new Date().toISOString();
+      const principal = {
+        schema_version: 'starlight.remote_stop_principal_evidence.v1' as const,
+        database_role: 'starlight_postgres_remote_stop_verifier', database_name: 'starlight_test',
+        role_contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+        supervisor_id: 'postgres-supervisor-001', supervisor_instance_id: 'postgres-supervisor-instance-001',
+        supervisor_epoch: 1, observed_at: observedAt, access_review_expires_at: expiresAt, state: 'ready' as const,
+      };
+      await h.store.putRemoteStopPrincipalEvidence(principal);
+      const request: RemoteStopRequest = {
+        schema_version: 'starlight.remote_stop_request.v1',
+        stop_request_id: '00000000-0000-4000-8000-000000001084', stop_sequence: 1,
+        stop_request_audit_seq: Number(audit.rows[0].seq), stop_request_audit_sha256: audit.rows[0].digest,
+        reservation_id: h.reservation.reservation_id, claim_id: claim.receipt.claim_id,
+        operation_id: h.consume.operation_id, effect_id: h.consume.effect_id,
+        binding_digest_sha256: h.consume.binding_digest_sha256, runner_id: claim.receipt.runner_id,
+        runner_instance_id: claim.receipt.runner_instance_id, runtime_id: claim.receipt.runtime_id,
+        host_id: claim.receipt.host_id, channel_binding_sha256: claim.receipt.channel_binding_sha256,
+        launch_attempt_id: claim.receipt.launch_attempt_id, process_instance_sha256: null,
+        execution_generation: claim.receipt.fencing_generation,
+        stop_fence_generation: claim.receipt.fencing_generation + 1,
+        requested_at: new Date(Date.now() - 1_000).toISOString(),
+        acknowledgement_deadline: new Date(Date.now() + 60_000).toISOString(), reason: 'supervisor-recovery',
+      };
+      currentRemoteStopAcknowledgement = {
+        schema_version: 'starlight.remote_stop_acknowledgement.v1',
+        acknowledgement_id: '00000000-0000-4000-8000-000000001184',
+        stop_request_id: request.stop_request_id, stop_sequence: request.stop_sequence,
+        stop_request_audit_seq: request.stop_request_audit_seq,
+        stop_request_audit_sha256: request.stop_request_audit_sha256,
+        request_sha256: sha256Digest(request), reservation_id: request.reservation_id,
+        claim_id: request.claim_id, operation_id: request.operation_id, effect_id: request.effect_id,
+        binding_digest_sha256: request.binding_digest_sha256, runner_id: request.runner_id,
+        runner_instance_id: request.runner_instance_id, runtime_id: request.runtime_id, host_id: request.host_id,
+        channel_binding_sha256: request.channel_binding_sha256, launch_attempt_id: request.launch_attempt_id,
+        process_instance_sha256: null, execution_generation: request.execution_generation,
+        observed_stop_fence_generation: request.stop_fence_generation,
+        supervisor_id: principal.supervisor_id, supervisor_instance_id: principal.supervisor_instance_id,
+        supervisor_epoch: 1, acknowledgement_state: 'received',
+        acknowledged_at: new Date(Date.now() - 900).toISOString(),
+        observed_at: new Date(Date.now() - 800).toISOString(), access_review_expires_at: expiresAt,
+        evidence_ref: 'postgres-remote-stop-evidence-001', evidence_sha256: 'a'.repeat(64),
+        replay_state: 'fresh', transport_authenticated: true,
+      };
+      const results = await Promise.all([
+        h.authority.recordRunnerRemoteStopAcknowledgement(request),
+        h.secondAuthority.recordRunnerRemoteStopAcknowledgement(request),
+      ]);
+      assert.ok(results.every((result) => result.recorded),
+        results.flatMap((result) => result.blockers).join(' '));
+      assert.equal(new Set(results.flatMap((result) => result.recorded ? [result.receipt.accepted_at] : [])).size, 1);
+      const persisted = await pool.query(`SELECT COUNT(*)::integer AS count FROM swarm_authority_remote_stop_acknowledgements`);
+      const events = await pool.query(`SELECT COUNT(*)::integer AS count FROM swarm_authority_audit
+        WHERE event='runner-remote-stop-acknowledged'`);
+      assert.deepEqual([persisted.rows[0].count, events.rows[0].count], [1, 1]);
+      const resources = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.deepEqual([resources.rows[0].state, Number(resources.rows[0].committed_usd),
+        Number(resources.rows[0].authorized_slots)], ['stop-requested', 0.25, 1]);
+      const outcomeAt = claim.receipt.accepted_at;
+      currentOutcomeEvidence = {
+        schema_version: 'starlight.runner_outcome_evidence.v1',
+        outcome_event_id: '00000000-0000-4000-8000-000000000784', outcome_kind: 'never-started',
+        reservation_id: request.reservation_id, claim_id: request.claim_id,
+        operation_id: request.operation_id, effect_id: request.effect_id,
+        binding_digest_sha256: request.binding_digest_sha256, runner_id: request.runner_id,
+        runner_identity_evidence_ref: 'postgres-identity-evidence-001',
+        runner_instance_id: request.runner_instance_id, runtime_id: request.runtime_id,
+        host_id: request.host_id, channel_binding_sha256: request.channel_binding_sha256,
+        launch_attempt_id: request.launch_attempt_id, fencing_generation: request.execution_generation,
+        process_instance_sha256: null, start_observation_id: null, start_evidence_ref: null,
+        start_evidence_sha256: null, process_started_at: null, exit_disposition: null,
+        evidence_ref: 'postgres-outcome-evidence-remote-stop-race', evidence_sha256: '8'.repeat(64),
+        outcome_at: outcomeAt, observed_at: outcomeAt, access_review_expires_at: expiresAt,
+        restart_fenced: true, launch_queue_closed: true, descendants_quiesced: true,
+        remote_stop_confirmed: false,
+      };
+      const [retryRace, outcomeRace] = await Promise.all([
+        h.authority.recordRunnerRemoteStopAcknowledgement(request),
+        h.authority.settleRunnerOutcome({
+          outcome_request_id: '00000000-0000-4000-8000-000000000884',
+          reservation_id: request.reservation_id, claim_id: request.claim_id,
+          operation_id: request.operation_id, effect_id: request.effect_id,
+          binding_digest_sha256: request.binding_digest_sha256, outcome_token: h.tokens.outcome,
+        }),
+        h.authority.cancel({
+          reservation_id: request.reservation_id,
+          cancel_token: h.reservation.cancel_token,
+          reason: 'remote-stop cancellation race fixture',
+        }),
+      ]);
+      assert.equal(outcomeRace.settled, true, outcomeRace.blockers.join(' '));
+      assert.equal(retryRace.recorded, true, retryRace.blockers.join(' '));
+      assert.equal(retryRace.recorded && retryRace.receipt.accepted_at,
+        results[0].recorded && results[0].receipt.accepted_at);
+      const racedResources = await pool.query(`SELECT r.state,b.committed_usd,h.authorized_slots
+        FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts h`);
+      assert.deepEqual([racedResources.rows[0].state, Number(racedResources.rows[0].committed_usd),
+        Number(racedResources.rows[0].authorized_slots)], ['runner-never-started-observed', 0.25, 1]);
+      const [disableRace] = await Promise.all([
+        h.authority.recordRunnerRemoteStopAcknowledgement(request),
+        h.store.putRemoteStopPrincipalEvidence({ ...principal, state: 'disabled' }),
+      ]);
+      if (!disableRace.recorded) assert.match(disableRace.blockers.join(' '), /principal is unavailable/i);
+      const disabled = await h.authority.recordRunnerRemoteStopAcknowledgement(request);
+      assert.equal(disabled.recorded, false);
+      assert.match(disabled.blockers.join(' '), /principal is unavailable/i);
+    });
+
     await t.test('duplicate provider usage evidence records one immutable event and releases no budget', async () => {
       const h = await prepare();
       const usage = await settleForUsageEvidence(
@@ -1691,6 +1861,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   } finally {
     await brokerRolePool.end();
     await verifierRolePool.end();
+    await remoteStopRolePool.end();
     await pool.end();
   }
 });

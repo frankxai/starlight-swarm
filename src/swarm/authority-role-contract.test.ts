@@ -10,6 +10,9 @@ import {
   attestUsageEvidenceDatabaseSession,
   usageEvidenceDatabaseRoleGrantSql,
   usageAuthorityRoutineOwnerGrantSql,
+  attestRemoteStopDatabaseSession,
+  remoteStopAuthorityRoutineOwnerGrantSql,
+  remoteStopDatabaseRoleGrantSql,
 } from './authority-role-contract';
 import { OPERATION_AUTHORITY_MIGRATION_SQL } from './postgres-operation-authority';
 
@@ -47,6 +50,27 @@ async function restrictedUsageDatabase(extra = '') {
     ${usageEvidenceDatabaseRoleGrantSql('starlight_usage_verifier')}
     ${extra}
     SET SESSION AUTHORIZATION starlight_usage_verifier;`);
+  return db;
+}
+
+async function restrictedRemoteStopDatabase(extra = '') {
+  const db = new PGlite();
+  await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
+  await db.exec(`INSERT INTO pg_init_privs (objoid,classoid,objsubid,privtype,initprivs)
+    SELECT c.oid,'pg_class'::regclass,0,'i',c.relacl
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='information_schema' AND c.relacl IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM pg_init_privs initial
+        WHERE initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=0);`);
+  await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_remote_stop_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${remoteStopAuthorityRoutineOwnerGrantSql('starlight_remote_stop_owner')}
+    CREATE ROLE starlight_remote_stop_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
+    ${remoteStopDatabaseRoleGrantSql('starlight_remote_stop_verifier')}
+    ${extra}
+    SET SESSION AUTHORIZATION starlight_remote_stop_verifier;`);
   return db;
 }
 
@@ -476,6 +500,40 @@ test('rejects every direct or PUBLIC column grant on the provider verifier', asy
         const result = await attestUsageEvidenceDatabaseSession(db);
         assert.equal(result.valid, false);
         assert.match(result.blockers.join(' '), /column privileges/i);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('attests the isolated remote-stop verifier and its separate safe owner', async () => {
+  const db = await restrictedRemoteStopDatabase();
+  try {
+    const result = await attestRemoteStopDatabaseSession(db);
+    assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
+  } finally { await db.close(); }
+});
+
+test('remote-stop verifier rejects system, column, schema, and owner authority drift', async (t) => {
+  const probes = [
+    ['system relation', 'GRANT SELECT ON pg_catalog.pg_authid TO starlight_remote_stop_verifier',
+      /system-relation or sequence authority/i],
+    ['public column', 'GRANT UPDATE (state) ON swarm_authority_reservations TO PUBLIC',
+      /authority-column privileges/i],
+    ['foreign schema', `CREATE SCHEMA starlight_escape;
+      GRANT USAGE ON SCHEMA starlight_escape TO starlight_remote_stop_verifier`,
+      /outside the public verifier boundary/i],
+    ['routine body', `CREATE OR REPLACE FUNCTION public.starlight_record_remote_stop_refusal(jsonb,text)
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+      AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`,
+      /authority routine/i],
+  ] as const;
+  for (const [name, mutation, expected] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedRemoteStopDatabase(`${mutation};`);
+      try {
+        const result = await attestRemoteStopDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), expected);
       } finally { await db.close(); }
     });
   }

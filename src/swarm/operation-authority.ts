@@ -3,6 +3,11 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { z } from 'zod';
 
 import { canonicalJson, sha256Digest } from './runtime-digest';
+import {
+  remoteStopRequestSchema,
+  type RemoteStopAcknowledgementPersistenceResult,
+  type RemoteStopRequest,
+} from './remote-stop-conformance';
 
 const id = z.string().min(3).max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
@@ -608,6 +613,9 @@ export interface OperationAuthorityStore {
   observeRunnerStart(input: RunnerStartObservationInput): Promise<RunnerStartObservationResult>;
   settleRunnerOutcome(input: RunnerOutcomeInput): Promise<RunnerOutcomeResult>;
   recordRunnerUsageEvidence(input: RunnerUsageEvidenceInput): Promise<RunnerUsageEvidenceResult>;
+  recordRunnerRemoteStopAcknowledgement?(
+    input: RemoteStopRequest,
+  ): Promise<RemoteStopAcknowledgementPersistenceResult>;
   cancel(input: CancellationInput): Promise<CancellationResult>;
   recordDenial(bindingDigest: string, operationId: string, at: string, blockers: string[]): Promise<void>;
 }
@@ -853,6 +861,23 @@ export class OperationAuthority {
       return { recorded: false, receipt: null, blockers: ['A durable authority store is required.'] };
     }
     return this.store.recordRunnerUsageEvidence(parsed.data);
+  }
+
+  async recordRunnerRemoteStopAcknowledgement(
+    input: unknown,
+  ): Promise<RemoteStopAcknowledgementPersistenceResult> {
+    const parsed = remoteStopRequestSchema.safeParse(input);
+    if (!parsed.success) {
+      return { recorded: false, receipt: null, blockers: ['Remote-stop request is invalid.'] };
+    }
+    if (!this.store.durable || !this.store.recordRunnerRemoteStopAcknowledgement) {
+      return {
+        recorded: false,
+        receipt: null,
+        blockers: ['Durable function-only remote-stop acknowledgement authority is not configured.'],
+      };
+    }
+    return this.store.recordRunnerRemoteStopAcknowledgement(parsed.data);
   }
 
   async cancel(input: unknown): Promise<CancellationResult> {

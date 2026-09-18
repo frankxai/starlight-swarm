@@ -59,7 +59,30 @@ export const remoteStopRequestSchema = z.object({
 
 export type RemoteStopRequest = z.infer<typeof remoteStopRequestSchema>;
 
-const remoteStopAcknowledgementSchema = z.object({
+export const remoteStopPrincipalEvidenceSchema = z.object({
+  schema_version: z.literal('starlight.remote_stop_principal_evidence.v1'),
+  database_role: controlId,
+  database_name: controlId,
+  role_contract_digest_sha256: digest,
+  supervisor_id: controlId,
+  supervisor_instance_id: controlId,
+  supervisor_epoch: generation,
+  observed_at: instant,
+  access_review_expires_at: instant,
+  state: z.enum(['ready', 'disabled']),
+}).strict().superRefine((value, context) => {
+  if (Date.parse(value.observed_at) >= Date.parse(value.access_review_expires_at)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['access_review_expires_at'],
+      message: 'Remote-stop principal access review must expire after observation.',
+    });
+  }
+});
+
+export type RemoteStopPrincipalEvidence = z.infer<typeof remoteStopPrincipalEvidenceSchema>;
+
+export const remoteStopAcknowledgementSchema = z.object({
   schema_version: z.literal('starlight.remote_stop_acknowledgement.v1'),
   acknowledgement_id: z.uuid(),
   stop_request_id: z.uuid(),
@@ -150,6 +173,42 @@ export interface RemoteStopConformanceResult {
   released_cost_usd: '0.000000';
   blockers: string[];
 }
+
+export interface RemoteStopAcknowledgementReceipt {
+  schema_version: 'starlight.remote_stop_acknowledgement_receipt.v1';
+  acknowledgement_id: string;
+  stop_request_id: string;
+  stop_request_audit_seq: number;
+  reservation_id: string;
+  claim_id: string;
+  operation_id: string;
+  binding_digest_sha256: string;
+  supervisor_id: string;
+  supervisor_instance_id: string;
+  supervisor_epoch: number;
+  observed_stop_fence_generation: number;
+  acknowledgement_bundle_sha256: string;
+  accepted_at: string;
+  verifier_database_role: string;
+  verifier_database_name: string;
+  verifier_role_contract_sha256: string;
+  transport_state: 'attested-not-deployed';
+  dispatch_state: 'not-dispatched';
+  remote_stop_request_acknowledged: true;
+  remote_stop_confirmed: false;
+  remote_stop_effect_observed: false;
+  process_terminal_observed: false;
+  descendants_quiesced: false;
+  host_capacity_released: false;
+  released_host_slots: 0;
+  budget_commitment_released: false;
+  released_cost_usd: '0.000000';
+  state: 'stop-requested';
+}
+
+export type RemoteStopAcknowledgementPersistenceResult =
+  | { recorded: true; receipt: RemoteStopAcknowledgementReceipt; blockers: [] }
+  | { recorded: false; receipt: null; blockers: string[] };
 
 const refused = (blockers: string[]): RemoteStopConformanceResult => ({
   schema_version: 'starlight.remote_stop_conformance.v1',

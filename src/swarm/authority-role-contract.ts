@@ -7,10 +7,21 @@ import {
   USAGE_REFUSAL_ROUTINE,
   USAGE_STREAM_INITIALIZE_ROUTINE,
 } from './usage-authority-routines';
+import {
+  REMOTE_STOP_AUTHORITY_ROUTINES,
+  REMOTE_STOP_APPEND_ROUTINE,
+  REMOTE_STOP_DATABASE_ROLE_CONTRACT,
+  REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+  REMOTE_STOP_REFUSAL_ROUTINE,
+} from './remote-stop-authority-routines';
 export {
   USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT,
   USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT_SHA256,
 } from './usage-authority-routines';
+export {
+  REMOTE_STOP_DATABASE_ROLE_CONTRACT,
+  REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+} from './remote-stop-authority-routines';
 
 interface QueryResult { rows: Record<string, unknown>[] }
 export interface RoleContractSqlClient {
@@ -124,6 +135,8 @@ export type BrokerDatabaseSessionAttestor = (
 
 export type UsageEvidenceDatabaseSessionAttestation = BrokerDatabaseSessionAttestation;
 export type UsageEvidenceDatabaseSessionAttestor = BrokerDatabaseSessionAttestor;
+export type RemoteStopDatabaseSessionAttestation = BrokerDatabaseSessionAttestation;
+export type RemoteStopDatabaseSessionAttestor = BrokerDatabaseSessionAttestor;
 
 function sameSet(actual: string[], expected: readonly string[]): boolean {
   return actual.length === expected.length && actual.every((value, index) => value === expected[index]);
@@ -574,6 +587,209 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   };
 };
 
+/** Attests the isolated supervisor session used only for durable receipt append. */
+export const attestRemoteStopDatabaseSession: RemoteStopDatabaseSessionAttestor = async (client) => {
+  const blockers: string[] = [];
+  const identity = await client.query(`
+    SELECT current_user AS database_role,session_user AS session_role,current_database() AS database_name,
+           rolsuper,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls,rolinherit,rolcanlogin
+    FROM pg_roles WHERE rolname=current_user
+  `);
+  if (identity.rows.length !== 1) {
+    return { valid: false, session: null, blockers: ['Remote-stop database session role is missing or ambiguous.'] };
+  }
+  const row = identity.rows[0];
+  const databaseRole = String(row.database_role);
+  const databaseName = String(row.database_name);
+  if (databaseRole !== String(row.session_role)) blockers.push('Remote-stop role must be the directly authenticated session role.');
+  if (row.rolcanlogin !== true) blockers.push('Remote-stop database role must be login-capable.');
+  for (const flag of REMOTE_STOP_DATABASE_ROLE_CONTRACT.forbidden_role_flags) {
+    if (row[flag] !== false) blockers.push(`Remote-stop database role has forbidden ${flag} authority.`);
+  }
+  const memberships = await client.query(`
+    SELECT
+      (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname=current_user)) AS outbound,
+      (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE roleid=(SELECT oid FROM pg_roles WHERE rolname=current_user)) AS inbound
+  `);
+  if (Number(memberships.rows[0]?.outbound) !== 0 || Number(memberships.rows[0]?.inbound) !== 0) {
+    blockers.push('Remote-stop database role must have no role memberships in either direction.');
+  }
+  const schema = await client.query(`SELECT has_schema_privilege(current_user,'public','USAGE') AS can_use,
+    has_schema_privilege(current_user,'public','CREATE') AS can_create`);
+  if (schema.rows[0]?.can_use !== true || schema.rows[0]?.can_create !== false) {
+    blockers.push('Remote-stop database role must have public USAGE without CREATE.');
+  }
+  const databaseGrants = await client.query(`
+    SELECT p.privilege_type FROM (VALUES ('CONNECT'),('CREATE'),('TEMPORARY')) p(privilege_type)
+    WHERE has_database_privilege(current_user,current_database(),p.privilege_type) ORDER BY p.privilege_type
+  `);
+  if (!sameSet(databaseGrants.rows.map((grant) => String(grant.privilege_type)).sort(),
+    REMOTE_STOP_DATABASE_ROLE_CONTRACT.database_grants)) {
+    blockers.push('Remote-stop database grants do not exactly match the verifier contract.');
+  }
+  const unexpectedSchemaAccess = await client.query(`
+    SELECT 1 FROM pg_namespace n WHERE n.nspname<>'public'
+      AND (has_schema_privilege(current_user,n.oid,'CREATE')
+        OR (n.nspname<>'information_schema' AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+          AND has_schema_privilege(current_user,n.oid,'USAGE'))) LIMIT 1
+  `);
+  if (unexpectedSchemaAccess.rows.length) {
+    blockers.push('Remote-stop database role must not access schemas outside the public verifier boundary.');
+  }
+  const unexpectedSystemRoutineAuthority = await client.query(`
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=p.oid AND initial.classoid='pg_proc'::regclass AND initial.objsubid=0
+    CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND actual.privilege_type='EXECUTE'
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault('f',p.proowner))) baseline
+        WHERE baseline.grantee=actual.grantee AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable) LIMIT 1
+  `);
+  if (unexpectedSystemRoutineAuthority.rows.length) {
+    blockers.push('Remote-stop database role must not gain non-default system-routine execution authority.');
+  }
+  const unexpectedSystemRelationAuthority = await client.query(`
+    SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=0
+    CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault(
+      CASE WHEN c.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,c.relowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND c.relkind IN ('r','p','v','m','f','S','t')
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT (initial.initprivs IS NULL AND n.nspname='information_schema' AND c.oid<16384
+        AND c.relkind IN ('r','v') AND actual.grantee=0 AND actual.privilege_type='SELECT'
+        AND actual.is_grantable=FALSE)
+      AND NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault(
+        CASE WHEN c.relkind='S' THEN 's'::"char" ELSE 'r'::"char" END,c.relowner))) baseline
+        WHERE baseline.grantee=actual.grantee AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable) LIMIT 1
+  `);
+  if (unexpectedSystemRelationAuthority.rows.length) {
+    blockers.push('Remote-stop database role must not gain non-default system-relation or sequence authority.');
+  }
+  const unexpectedSystemColumnAuthority = await client.query(`
+    SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+    LEFT JOIN pg_init_privs initial
+      ON initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=a.attnum
+    CROSS JOIN LATERAL aclexplode(COALESCE(a.attacl,acldefault('c',c.relowner))) actual
+    WHERE (n.nspname='information_schema' OR n.nspname LIKE 'pg\\_%' ESCAPE '\\')
+      AND c.relkind IN ('r','p','v','m','f','t')
+      AND actual.grantee IN (0,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+      AND NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(initial.initprivs,acldefault('c',c.relowner))) baseline
+        WHERE baseline.grantee=actual.grantee AND baseline.privilege_type=actual.privilege_type
+          AND baseline.is_grantable=actual.is_grantable) LIMIT 1
+  `);
+  if (unexpectedSystemColumnAuthority.rows.length) {
+    blockers.push('Remote-stop database role must not gain non-default system-column authority.');
+  }
+  const publicAuthority = await client.query(`
+    SELECT
+      EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE'),('REFERENCES'),('TRIGGER'),
+          ('MAINTAIN')) p(privilege_type)
+        WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
+          AND has_table_privilege(current_user,c.oid,p.privilege_type)) AS relation_authority,
+      EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+        CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) p(privilege_type)
+        WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f')
+          AND has_column_privilege(current_user,c.oid,a.attnum,p.privilege_type)) AS column_authority,
+      EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        CROSS JOIN (VALUES ('SELECT'),('USAGE'),('UPDATE')) p(privilege_type)
+        WHERE n.nspname='public' AND c.relkind='S'
+          AND has_sequence_privilege(current_user,c.oid,p.privilege_type)) AS sequence_authority
+  `);
+  if (publicAuthority.rows[0]?.relation_authority === true) blockers.push('Remote-stop database role must have no authority-table privileges.');
+  if (publicAuthority.rows[0]?.column_authority === true) blockers.push('Remote-stop database role must have no authority-column privileges.');
+  if (publicAuthority.rows[0]?.sequence_authority === true) blockers.push('Remote-stop database role must have no sequence privileges.');
+  const ownedObjects = await client.query(`
+    SELECT 1 FROM pg_class c WHERE c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+    UNION ALL SELECT 1 FROM pg_proc p WHERE p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+    UNION ALL SELECT 1 FROM pg_namespace n WHERE n.nspowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+    LIMIT 1
+  `);
+  if (ownedObjects.rows.length) blockers.push('Remote-stop database role must not own database objects.');
+  const routines = await client.query(`
+    SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' AS routine_name
+    FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND has_function_privilege(current_user,p.oid,'EXECUTE') ORDER BY routine_name
+  `);
+  const actualRoutines = routines.rows.map((grant) => `${String(grant.routine_name)}:EXECUTE`).sort();
+  if (!sameSet(actualRoutines, REMOTE_STOP_DATABASE_ROLE_CONTRACT.routine_grants)) {
+    blockers.push('Remote-stop routine grants do not exactly match the verifier contract.');
+  }
+  const authorityRoutines = await client.query(`
+    SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' AS routine_name,
+      p.prosecdef,p.prosrc,COALESCE(array_to_string(p.proconfig,','),'') AS proconfig,
+      owner.oid AS owner_oid,owner.rolname AS owner_name,owner.rolcanlogin,owner.rolsuper,
+      owner.rolcreaterole,owner.rolcreatedb,owner.rolreplication,owner.rolbypassrls,owner.rolinherit,
+      (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE member=owner.oid) AS owner_outbound,
+      (SELECT COUNT(*)::INTEGER FROM pg_auth_members WHERE roleid=owner.oid) AS owner_inbound,
+      has_schema_privilege(owner.rolname,'public','CREATE') AS owner_schema_create,
+      has_database_privilege(owner.rolname,current_database(),'CREATE') AS owner_database_create,
+      (SELECT COUNT(*)::INTEGER FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl
+        WHERE acl.privilege_type='EXECUTE'
+          AND (acl.grantee NOT IN (p.proowner,(SELECT oid FROM pg_roles WHERE rolname=current_user))
+            OR (acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND acl.is_grantable)))
+        AS unexpected_execute_entries,
+      (SELECT COUNT(*)::INTEGER FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl
+        WHERE acl.privilege_type='EXECUTE' AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+          AND acl.is_grantable=FALSE) AS verifier_execute_entries,
+      EXISTS (SELECT 1 FROM pg_class owned_class WHERE owned_class.relowner=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_namespace owned_schema WHERE owned_schema.nspowner=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_database owned_database WHERE owned_database.datdba=owner.oid)
+        OR EXISTS (SELECT 1 FROM pg_proc owned_proc JOIN pg_namespace owned_ns ON owned_ns.oid=owned_proc.pronamespace
+             WHERE owned_proc.proowner=owner.oid AND (owned_ns.nspname<>'public'
+               OR owned_proc.proname||'('||pg_get_function_identity_arguments(owned_proc.oid)||')' NOT IN
+                 ('starlight_record_remote_stop_refusal(jsonb, text)',
+                  'starlight_append_remote_stop_acknowledgement(jsonb)'))) AS owner_has_unreviewed_objects,
+      has_function_privilege('public',p.oid,'EXECUTE') AS public_execute
+    FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles owner ON owner.oid=p.proowner
+    WHERE n.nspname='public' AND p.proname IN
+      ('starlight_record_remote_stop_refusal','starlight_append_remote_stop_acknowledgement')
+    ORDER BY routine_name
+  `);
+  const expectedIdentities = [REMOTE_STOP_REFUSAL_ROUTINE, REMOTE_STOP_APPEND_ROUTINE];
+  const exactRoutines = authorityRoutines.rows.filter((routine) =>
+    expectedIdentities.includes(String(routine.routine_name)));
+  if (authorityRoutines.rows.length !== 2 || exactRoutines.length !== 2) {
+    blockers.push('Remote-stop authority surface must contain exactly the append and refusal routines.');
+  }
+  for (const identityName of expectedIdentities) {
+    const expected = REMOTE_STOP_AUTHORITY_ROUTINES.find((candidate) => candidate.identity === identityName);
+    const actual = authorityRoutines.rows.find((candidate) => String(candidate.routine_name) === identityName);
+    if (!expected || !actual || actual.prosecdef !== true
+      || sha256Digest(String(actual.prosrc).trim()) !== expected.body_sha256
+      || String(actual.proconfig).replace(/\s/g, '') !== 'search_path=pg_catalog,public'
+      || actual.rolcanlogin !== false || actual.rolsuper !== false || actual.rolcreaterole !== false
+      || actual.rolcreatedb !== false || actual.rolreplication !== false || actual.rolbypassrls !== false
+      || actual.rolinherit !== false || Number(actual.owner_outbound) !== 0 || Number(actual.owner_inbound) !== 0
+      || actual.owner_schema_create !== false || actual.owner_database_create !== false
+      || Number(actual.unexpected_execute_entries) !== 0
+      || Number(actual.verifier_execute_entries) !== (identityName === REMOTE_STOP_APPEND_ROUTINE ? 1 : 0)
+      || actual.owner_has_unreviewed_objects !== false || actual.public_execute === true
+      || String(actual.owner_name) === databaseRole) {
+      blockers.push(`Remote-stop authority routine ${identityName} is missing, drifted, publicly executable, or unsafely owned.`);
+    }
+  }
+  const owners = new Set(exactRoutines.map((routine) => String(routine.owner_oid)));
+  if (exactRoutines.length === 2 && owners.size !== 1) {
+    blockers.push('Remote-stop append and refusal routines must share one safe owner.');
+  }
+  if (blockers.length) return { valid: false, session: null, blockers };
+  return {
+    valid: true,
+    session: { database_role: databaseRole, database_name: databaseName,
+      contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256 },
+    blockers: [],
+  };
+};
+
 function roleIdentifier(role: string): string {
   if (!/^[a-z][a-z0-9_]{2,62}$/.test(role)) throw new Error('Broker role name is invalid.');
   return role;
@@ -626,6 +842,21 @@ export function usageEvidenceDatabaseRoleGrantSql(untrustedRole: string): string
   ].join('\n');
 }
 
+/** Dedicated remote-stop verifier: one routine and no direct authority-table access. */
+export function remoteStopDatabaseRoleGrantSql(untrustedRole: string): string {
+  const role = roleIdentifier(untrustedRole);
+  return [
+    '-- External prerequisite: effective current-database grants must be CONNECT only.',
+    `ALTER ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;`,
+    `REVOKE ALL ON SCHEMA public FROM ${role};`,
+    `GRANT USAGE ON SCHEMA public TO ${role};`,
+    `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${role};`,
+    `REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${role};`,
+    `REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM ${role};`,
+    `GRANT EXECUTE ON FUNCTION public.${REMOTE_STOP_APPEND_ROUTINE} TO ${role};`,
+  ].join('\n');
+}
+
 /** Review artifact for a dedicated NOLOGIN routine owner; it is never applied by runtime code. */
 export function usageAuthorityRoutineOwnerGrantSql(untrustedRole: string): string {
   const role = roleIdentifier(untrustedRole);
@@ -635,7 +866,7 @@ export function usageAuthorityRoutineOwnerGrantSql(untrustedRole: string): strin
     `GRANT USAGE ON SCHEMA public TO ${role};`,
     `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${role};`,
     `REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${role};`,
-    `GRANT SELECT ON swarm_authority_control,swarm_authority_reservations,swarm_authority_broker_principals,swarm_authority_prepared_operations,swarm_authority_revocations,swarm_authority_budgets,swarm_authority_budget_windows,swarm_authority_budget_holds,swarm_authority_heartbeat_tokens,swarm_authority_usage_tokens,swarm_authority_usage_evidence TO ${role};`,
+    `GRANT SELECT ON swarm_authority_control,swarm_authority_reservations,swarm_authority_broker_principals,swarm_authority_prepared_operations,swarm_authority_revocations,swarm_authority_budgets,swarm_authority_budget_windows,swarm_authority_budget_holds,swarm_authority_heartbeat_tokens,swarm_authority_usage_tokens,swarm_authority_usage_evidence,swarm_authority_audit TO ${role};`,
     `GRANT INSERT ON swarm_authority_usage_tokens,swarm_authority_usage_evidence,swarm_authority_audit TO ${role};`,
     `GRANT UPDATE (updated_at) ON swarm_authority_control TO ${role};`,
     `GRANT UPDATE (usage_reconciliation_token_sha256,provider_usage_correlation_id) ON swarm_authority_reservations TO ${role};`,
@@ -646,5 +877,25 @@ export function usageAuthorityRoutineOwnerGrantSql(untrustedRole: string): strin
     `REVOKE ALL ON FUNCTION public.${USAGE_REFUSAL_ROUTINE} FROM PUBLIC;`,
     `REVOKE ALL ON FUNCTION public.${USAGE_STREAM_INITIALIZE_ROUTINE} FROM PUBLIC;`,
     `REVOKE ALL ON FUNCTION public.${USAGE_EVIDENCE_APPEND_ROUTINE} FROM PUBLIC;`,
+  ].join('\n');
+}
+
+/** Review artifact for the isolated remote-stop routine owner; runtime never applies it. */
+export function remoteStopAuthorityRoutineOwnerGrantSql(untrustedRole: string): string {
+  const role = roleIdentifier(untrustedRole);
+  return [
+    `ALTER ROLE ${role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;`,
+    `REVOKE ALL ON SCHEMA public FROM ${role};`,
+    `GRANT USAGE ON SCHEMA public TO ${role};`,
+    `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${role};`,
+    `REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${role};`,
+    `GRANT SELECT ON swarm_authority_control,swarm_authority_reservations,swarm_authority_remote_stop_principals,swarm_authority_remote_stop_acknowledgements,swarm_authority_audit TO ${role};`,
+    `GRANT INSERT ON swarm_authority_remote_stop_acknowledgements,swarm_authority_audit TO ${role};`,
+    `GRANT UPDATE (updated_at) ON swarm_authority_control TO ${role};`,
+    `GRANT USAGE ON SEQUENCE swarm_authority_audit_seq_seq TO ${role};`,
+    `ALTER FUNCTION public.${REMOTE_STOP_REFUSAL_ROUTINE} OWNER TO ${role};`,
+    `ALTER FUNCTION public.${REMOTE_STOP_APPEND_ROUTINE} OWNER TO ${role};`,
+    `REVOKE ALL ON FUNCTION public.${REMOTE_STOP_REFUSAL_ROUTINE} FROM PUBLIC;`,
+    `REVOKE ALL ON FUNCTION public.${REMOTE_STOP_APPEND_ROUTINE} FROM PUBLIC;`,
   ].join('\n');
 }
