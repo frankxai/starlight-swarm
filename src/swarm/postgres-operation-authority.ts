@@ -1799,6 +1799,69 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await client.query('BEGIN');
       if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
       const transactionAt = await wallClock(client);
+      const existing = await client.query(
+        `SELECT *, observed_at=(evidence->>'observed_at')::timestamptz AS observed_matches,
+           access_review_expires_at=(evidence->>'access_review_expires_at')::timestamptz AS expiry_matches
+         FROM swarm_authority_remote_stop_principals
+         WHERE database_role=$1 AND database_name=$2 FOR UPDATE`,
+        [trusted.database_role, trusted.database_name],
+      );
+      const previous = existing.rows[0]
+        ? remoteStopPrincipalEvidenceSchema.parse(existing.rows[0].evidence) : null;
+      if (previous) {
+        const row = existing.rows[0];
+        const scalarMatches = [
+          'database_role', 'database_name', 'role_contract_digest_sha256',
+          'supervisor_id', 'supervisor_instance_id', 'state',
+        ].every((field) => row[field] === previous[field as keyof RemoteStopPrincipalEvidence]);
+        if (!scalarMatches || Number(row.supervisor_epoch) !== previous.supervisor_epoch
+          || row.observed_matches !== true || row.expiry_matches !== true) {
+          throw new Error('Remote-stop persisted principal evidence disagrees with its authority columns.');
+        }
+      }
+      // A retry of the currently persisted evidence is a no-op, even after expiry.
+      // It cannot refresh authority or manufacture another registration audit event.
+      if (previous && sha256Digest(previous) === sha256Digest(trusted)) {
+        await client.query('COMMIT');
+        return;
+      }
+      const observedMs = Date.parse(trusted.observed_at);
+      const transactionMs = Date.parse(transactionAt);
+      if (observedMs > transactionMs) {
+        throw new Error('Remote-stop principal observation is in the future.');
+      }
+      // Match the receipt function's fixed one-minute principal freshness boundary.
+      // Old disablement remains safe to register; it never grants authority.
+      if (trusted.state === 'ready' && (transactionMs - observedMs > 60_000
+        || Date.parse(trusted.access_review_expires_at) <= transactionMs)) {
+        throw new Error('Remote-stop ready principal evidence is stale or expired.');
+      }
+      if (previous) {
+        const previousObservedMs = Date.parse(previous.observed_at);
+        if (trusted.supervisor_id !== previous.supervisor_id) {
+          throw new Error('Remote-stop supervisor identity is immutable for this database principal.');
+        }
+        if (trusted.supervisor_epoch < previous.supervisor_epoch || observedMs < previousObservedMs) {
+          throw new Error('Remote-stop principal epoch and observation must not decrease.');
+        }
+        if (trusted.supervisor_epoch === previous.supervisor_epoch) {
+          if (trusted.supervisor_instance_id !== previous.supervisor_instance_id
+            || trusted.role_contract_digest_sha256 !== previous.role_contract_digest_sha256) {
+            throw new Error('Remote-stop principal instance and role contract are immutable within an epoch.');
+          }
+          if (previous.state === 'disabled' && trusted.state === 'ready') {
+            throw new Error('Remote-stop principal reactivation requires a higher epoch.');
+          }
+          // Disablement wins an equal-observation race, but ready evidence cannot
+          // extend an access review at the same observation by changing its expiry.
+          if (trusted.state === 'ready' && observedMs === previousObservedMs) {
+            throw new Error('Remote-stop ready principal refresh requires a newer observation.');
+          }
+        } else if (previous.state === 'disabled' && trusted.state === 'ready'
+          && observedMs <= previousObservedMs) {
+          throw new Error('Remote-stop principal reactivation requires a newer observation.');
+        }
+      }
       await client.query(
         `INSERT INTO swarm_authority_remote_stop_principals
          (database_role,database_name,role_contract_digest_sha256,supervisor_id,supervisor_instance_id,

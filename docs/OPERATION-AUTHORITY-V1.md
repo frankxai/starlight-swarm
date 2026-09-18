@@ -52,6 +52,33 @@ The provider attestor is a normative trust boundary: an embedding must verify th
 
 HMAC secrets are server-side material. Callers receive signed receipts, never signing keys. Issuers and key IDs are explicitly allowlisted; rotation is enforced by revoking `key:<issuer>:<key_id>` before removing the key from the configured keyring.
 
+### Remote-stop principal epoch ordering
+
+`putRemoteStopPrincipalEvidence` is a trusted control-plane registration path, not a
+supervisor transport attestor. Registration takes the same durable authority lock as
+acknowledgement persistence. For each database role/database pair, the supervisor ID
+is stable and epochs never decrease. Within an epoch, the supervisor instance and
+role-contract digest cannot change; a ready refresh must advance its observation,
+and disablement is absorbing. Within the same epoch, a disablement at the same
+observation time wins over ready evidence regardless of transaction order. Reactivation requires both a higher
+epoch and a strictly newer observation, so an old ready registration cannot undo a
+revocation. Exact current retries are no-ops rather than duplicate registration audits,
+including after their review expires; they neither refresh nor restore authority.
+
+Ready evidence must be nonfuture, at most 60 seconds old, and access-reviewed beyond
+database wall time. Disablement cannot be future-dated; it need not prove a currently
+live access review to remove authority. Rejected registrations roll back without
+changing the principal or its registration audit. These rules do not authenticate a
+control-plane writer: an authorized writer can still deliberately register a higher
+epoch. Direct administrative SQL remains outside this method's trust boundary.
+
+No schema or grant migration is required. Existing evidence is checked before an
+update, not silently repaired. Existing callers that reuse an epoch after disablement
+must instead obtain a fresh, higher-epoch control-plane decision. Rollback of this
+ordering guard would reopen stale reactivation; keep the supervisor unwired when
+reverting. This guard adds no stop delivery, terminal evidence, resource release,
+settlement, or dispatch authority.
+
 ## Queen session binding
 
 The operation binding includes the full subordinate call identity expected by the bounded maker/checker Queen session:

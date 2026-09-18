@@ -31,6 +31,7 @@ import type {
   RemoteStopAcknowledgement,
   RemoteStopAcknowledgementAttestation,
   RemoteStopRequest,
+  RemoteStopPrincipalEvidence,
 } from './remote-stop-conformance';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -1177,6 +1178,98 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       assert.equal(Number(state.rows[0].authorized_slots), 1);
     });
 
+    await t.test('remote-stop registrations serialize refresh, disablement, and epoch rotation', async (t) => {
+      // Hold the first writer after acquiring the shared authority lock, then make
+      // the second writer contend on it. This exercises actual PostgreSQL waits.
+      const contend = async (first: RemoteStopPrincipalEvidence, second: RemoteStopPrincipalEvidence) => {
+        let firstLocked!: () => void;
+        let secondAttempted!: () => void;
+        let releaseFirst!: () => void;
+        const locked = new Promise<void>((resolve) => { firstLocked = resolve; });
+        const attempted = new Promise<void>((resolve) => { secondAttempted = resolve; });
+        const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+        const gatedPool = (position: 'first' | 'second'): AuthoritySqlPool => ({
+          connect: async () => {
+            const client = await authorityPool.connect();
+            return {
+              query: async (sql, values) => {
+                const isLock = sql.includes('SELECT starlight_authority_lock()');
+                if (isLock && position === 'second') secondAttempted();
+                const result = await client.query(sql, values);
+                if (isLock && position === 'first') { firstLocked(); await release; }
+                return result;
+              },
+              release: () => client.release?.(),
+            };
+          },
+        });
+        const firstWrite = new PostgresOperationAuthorityStore(gatedPool('first')).putRemoteStopPrincipalEvidence(first);
+        const firstSettled = Promise.allSettled([firstWrite]);
+        let secondSettled: Promise<PromiseSettledResult<void>[]> | undefined;
+        const waitForSignal = async (signal: Promise<void>, settled: Promise<unknown>, label: string) => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              signal,
+              settled.then(() => { throw new Error(`${label} writer completed before its lock signal.`); }),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${label} lock signal timed out.`)), 5_000);
+              }),
+            ]);
+          } finally { clearTimeout(timer); }
+        };
+        try {
+          await waitForSignal(locked, firstSettled, 'First');
+          const secondWrite = new PostgresOperationAuthorityStore(gatedPool('second')).putRemoteStopPrincipalEvidence(second);
+          secondSettled = Promise.allSettled([secondWrite]);
+          await waitForSignal(attempted, secondSettled, 'Second');
+        } finally {
+          releaseFirst();
+          await firstSettled;
+          if (secondSettled) await secondSettled;
+        }
+        return [...await firstSettled, ...await secondSettled];
+      };
+      for (const disableFirst of [false, true]) {
+        await t.test(`equal-time disable dominates ${disableFirst ? 'before' : 'after'} fresh ready refresh`, async () => {
+          const h = await prepare();
+          const now = Date.now();
+          const principal: RemoteStopPrincipalEvidence = {
+            schema_version: 'starlight.remote_stop_principal_evidence.v1',
+            database_role: 'starlight_postgres_remote_stop_verifier', database_name: 'starlight_test',
+            role_contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+            supervisor_id: 'postgres-supervisor-001', supervisor_instance_id: 'instance-001',
+            supervisor_epoch: 1, observed_at: new Date(now - 2_000).toISOString(),
+            access_review_expires_at: new Date(now + 60_000).toISOString(), state: 'ready',
+          };
+          await h.store.putRemoteStopPrincipalEvidence(principal);
+          const refreshed = { ...principal, observed_at: new Date(now - 1_000).toISOString() };
+          const disabled = { ...refreshed, state: 'disabled' as const };
+          const results = await contend(disableFirst ? disabled : refreshed, disableFirst ? refreshed : disabled);
+          assert.equal(results[0].status, 'fulfilled');
+          assert.equal(results[1].status, disableFirst ? 'rejected' : 'fulfilled');
+          assert.deepEqual((await pool.query('SELECT evidence FROM swarm_authority_remote_stop_principals')).rows,
+            [{ evidence: disabled }]);
+          const audits = await pool.query("SELECT event FROM swarm_authority_audit WHERE event LIKE 'remote-stop-principal-%'");
+          assert.equal(audits.rowCount, disableFirst ? 2 : 3);
+          const before = await pool.query('SELECT * FROM swarm_authority_remote_stop_principals');
+          await assert.rejects(h.store.putRemoteStopPrincipalEvidence(refreshed), /higher epoch/i);
+          assert.deepEqual((await pool.query('SELECT * FROM swarm_authority_remote_stop_principals')).rows, before.rows);
+          assert.equal((await pool.query("SELECT event FROM swarm_authority_audit WHERE event LIKE 'remote-stop-principal-%'")).rowCount,
+            audits.rowCount);
+          // A higher epoch requires an observation after the disablement.
+          const rotated = { ...refreshed, supervisor_epoch: 2, supervisor_instance_id: 'instance-002',
+            observed_at: new Date(now).toISOString() };
+          const stale = { ...disabled, observed_at: new Date(now - 500).toISOString() };
+          const rotationResults = await contend(disableFirst ? stale : rotated, disableFirst ? rotated : stale);
+          assert.equal(rotationResults[disableFirst ? 1 : 0].status, 'fulfilled');
+          assert.equal(rotationResults[disableFirst ? 0 : 1].status, disableFirst ? 'fulfilled' : 'rejected');
+          assert.deepEqual((await pool.query('SELECT evidence FROM swarm_authority_remote_stop_principals')).rows,
+            [{ evidence: rotated }]);
+        });
+      }
+    });
+
     await t.test('duplicate remote-stop acknowledgements persist once and principal disablement fails closed', async () => {
       const h = await prepare();
       currentRunnerLaunchAttemptId = 'postgres-launch-attempt-remote-stop';
@@ -1314,6 +1407,11 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         h.store.putRemoteStopPrincipalEvidence({ ...principal, state: 'disabled' }),
       ]);
       if (!disableRace.recorded) assert.match(disableRace.blockers.join(' '), /principal is unavailable/i);
+      const principalBeforeStale = await pool.query('SELECT * FROM swarm_authority_remote_stop_principals');
+      const auditBeforeStale = await pool.query('SELECT * FROM swarm_authority_audit ORDER BY seq');
+      await assert.rejects(h.store.putRemoteStopPrincipalEvidence(principal), /higher epoch/i);
+      assert.deepEqual((await pool.query('SELECT * FROM swarm_authority_remote_stop_principals')).rows, principalBeforeStale.rows);
+      assert.deepEqual((await pool.query('SELECT * FROM swarm_authority_audit ORDER BY seq')).rows, auditBeforeStale.rows);
       const disabled = await h.authority.recordRunnerRemoteStopAcknowledgement(request);
       assert.equal(disabled.recorded, false);
       assert.match(disabled.blockers.join(' '), /principal is unavailable/i);

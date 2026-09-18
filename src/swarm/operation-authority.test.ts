@@ -41,6 +41,7 @@ import type {
   RemoteStopAcknowledgement,
   RemoteStopAcknowledgementAttestation,
   RemoteStopRequest,
+  RemoteStopPrincipalEvidence,
 } from './remote-stop-conformance';
 
 const NOW_MS = Date.now();
@@ -2107,6 +2108,124 @@ test('settles fenced runner outcomes once, releases only host capacity, and reta
   });
 });
 
+test('remote-stop principal registration is monotonic, idempotent, and fail closed', async (t) => {
+  const h = await harness();
+  const now = Date.now();
+  const principal: RemoteStopPrincipalEvidence = {
+    schema_version: 'starlight.remote_stop_principal_evidence.v1',
+    database_role: 'remote_stop_test', database_name: 'postgres',
+    role_contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+    supervisor_id: 'supervisor-001', supervisor_instance_id: 'instance-001', supervisor_epoch: 2,
+    observed_at: new Date(now - 2_000).toISOString(),
+    access_review_expires_at: new Date(now + 60_000).toISOString(), state: 'ready',
+  };
+  const snapshot = async () => ({
+    principals: await h.pool.rows('SELECT * FROM swarm_authority_remote_stop_principals'),
+    audit: await h.pool.rows('SELECT * FROM swarm_authority_audit ORDER BY seq'),
+  });
+  const refuse = async (input: RemoteStopPrincipalEvidence, reason: RegExp) => {
+    const before = await snapshot();
+    await assert.rejects(h.store.putRemoteStopPrincipalEvidence(input), reason);
+    assert.deepEqual(await snapshot(), before);
+  };
+  try {
+    await h.store.putRemoteStopPrincipalEvidence(principal);
+    const initial = await snapshot();
+    await h.store.putRemoteStopPrincipalEvidence(principal);
+    assert.deepEqual(await snapshot(), initial, 'exact retry must not append another audit event');
+    await t.test('refusals leave principal and audit unchanged', async () => {
+      await refuse({ ...principal, supervisor_epoch: 1 }, /must not decrease/i);
+      await refuse({ ...principal, observed_at: new Date(now - 3_000).toISOString() }, /must not decrease/i);
+      await refuse({ ...principal, supervisor_id: 'different-supervisor', supervisor_epoch: 3 }, /identity is immutable/i);
+      await refuse({ ...principal, supervisor_instance_id: 'different-instance' }, /immutable within an epoch/i);
+      await refuse({ ...principal, role_contract_digest_sha256: 'e'.repeat(64) }, /immutable within an epoch/i);
+      await refuse({ ...principal, access_review_expires_at: new Date(now + 120_000).toISOString() }, /newer observation/i);
+      await refuse({ ...principal, observed_at: new Date(now + 30_000).toISOString() }, /future/i);
+      await refuse({ ...principal, observed_at: new Date(now - 120_000).toISOString() }, /stale or expired/i);
+      await refuse({ ...principal, access_review_expires_at: new Date(now - 1_000).toISOString() }, /stale or expired/i);
+      await refuse({ ...principal, supervisor_epoch: 1.5 }, /expected int/i);
+      await refuse({ ...principal, observed_at: principal.observed_at.replace('Z', '1Z') }, /datetime/i);
+    });
+    const refreshed = { ...principal, observed_at: new Date(now - 1_000).toISOString() };
+    await h.store.putRemoteStopPrincipalEvidence(refreshed);
+    const disabled = { ...refreshed, state: 'disabled' as const };
+    await h.store.putRemoteStopPrincipalEvidence(disabled);
+    await refuse(refreshed, /reactivation requires a higher epoch/i);
+    await refuse({ ...refreshed, observed_at: new Date(now).toISOString() }, /higher epoch/i);
+    await refuse({ ...refreshed, supervisor_epoch: 3 }, /newer observation/i);
+    const reactivated = {
+      ...refreshed, supervisor_epoch: 3, supervisor_instance_id: 'instance-002',
+      observed_at: new Date(now).toISOString(),
+    };
+    await h.store.putRemoteStopPrincipalEvidence(reactivated);
+    await refuse(disabled, /must not decrease/i);
+    await t.test('timestamp column drift below milliseconds fails closed', async () => {
+      await h.pool.execute("UPDATE swarm_authority_remote_stop_principals SET observed_at=observed_at+interval '1 microsecond'");
+      await refuse(reactivated, /disagrees with its authority columns/i);
+      await h.pool.execute("UPDATE swarm_authority_remote_stop_principals SET observed_at=(evidence->>'observed_at')::timestamptz");
+    });
+    await t.test('persisted scalar/evidence drift is not silently repaired by retries', async () => {
+      await h.pool.execute("UPDATE swarm_authority_remote_stop_principals SET state='disabled'");
+      await refuse(reactivated, /disagrees with its authority columns/i);
+    });
+  } finally { await h.pool.close(); }
+});
+
+test('remote-stop expired exact retry is a no-op and cannot renew authority', async () => {
+  const h = await harness();
+  try {
+    const principal: RemoteStopPrincipalEvidence = {
+      schema_version: 'starlight.remote_stop_principal_evidence.v1',
+      database_role: 'remote_stop_test', database_name: 'postgres',
+      role_contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+      supervisor_id: 'supervisor-001', supervisor_instance_id: 'instance-001', supervisor_epoch: 1,
+      observed_at: '2020-01-01T00:00:00.000Z', access_review_expires_at: '2020-01-01T00:01:00.000Z', state: 'ready',
+    };
+    // Restore a historical row as a migration fixture; new expired registrations are refused.
+    const client = await h.pool.connect();
+    try {
+      await client.query(`INSERT INTO swarm_authority_remote_stop_principals
+        (database_role,database_name,role_contract_digest_sha256,supervisor_id,supervisor_instance_id,
+         supervisor_epoch,observed_at,access_review_expires_at,state,evidence)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`,
+      [principal.database_role, principal.database_name, principal.role_contract_digest_sha256,
+        principal.supervisor_id, principal.supervisor_instance_id, principal.supervisor_epoch,
+        principal.observed_at, principal.access_review_expires_at, principal.state, JSON.stringify(principal)]);
+    } finally { client.release?.(); }
+    const before = await h.pool.rows('SELECT * FROM swarm_authority_remote_stop_principals');
+    const auditBefore = await h.pool.rows('SELECT * FROM swarm_authority_audit ORDER BY seq');
+    await h.store.putRemoteStopPrincipalEvidence(principal);
+    assert.deepEqual(await h.pool.rows('SELECT * FROM swarm_authority_remote_stop_principals'), before);
+    assert.deepEqual(await h.pool.rows('SELECT * FROM swarm_authority_audit ORDER BY seq'), auditBefore);
+  } finally { await h.pool.close(); }
+});
+
+test('remote-stop principal equal-time disablement wins either registration order', async () => {
+  for (const disableFirst of [false, true]) {
+    const h = await harness();
+    try {
+      const now = Date.now();
+      const principal: RemoteStopPrincipalEvidence = {
+        schema_version: 'starlight.remote_stop_principal_evidence.v1',
+        database_role: 'remote_stop_test', database_name: 'postgres',
+        role_contract_digest_sha256: REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
+        supervisor_id: 'supervisor-001', supervisor_instance_id: 'instance-001', supervisor_epoch: 1,
+        observed_at: new Date(now - 1_000).toISOString(),
+        access_review_expires_at: new Date(now + 60_000).toISOString(), state: 'ready',
+      };
+      await h.store.putRemoteStopPrincipalEvidence(principal);
+      const refresh = { ...principal, observed_at: new Date(now).toISOString() };
+      const disabled = { ...refresh, state: 'disabled' as const };
+      const candidates = disableFirst ? [disabled, refresh] : [refresh, disabled];
+      const results = await Promise.allSettled(candidates.map((candidate) => h.store.putRemoteStopPrincipalEvidence(candidate)));
+      assert.equal(results[disableFirst ? 0 : 1].status, 'fulfilled');
+      assert.equal(results[disableFirst ? 1 : 0].status, disableFirst ? 'rejected' : 'fulfilled');
+      const row = (await h.pool.rows('SELECT state,evidence FROM swarm_authority_remote_stop_principals'))[0];
+      assert.deepEqual(row, { state: 'disabled', evidence: disabled });
+    } finally { await h.pool.close(); }
+  }
+});
+
 test('persists one function-only remote-stop acknowledgement without releasing resources', async () => {
   let currentAcknowledgement: RemoteStopAcknowledgement | undefined;
   const remoteStopAttestor = async (): Promise<RemoteStopAcknowledgementAttestation> =>
@@ -2217,6 +2336,17 @@ test('persists one function-only remote-stop acknowledgement without releasing r
       [first.receipt.state, first.receipt.released_host_slots, first.receipt.released_cost_usd],
       [String(before.state), 0, '0.000000'],
     );
+    // PGlite's RESET SESSION AUTHORIZATION retains the last simulated login;
+    // restore the fixture's trusted registrar before this separate admin operation.
+    await h.pool.execute('SET SESSION AUTHORIZATION postgres');
+    await h.store.putRemoteStopPrincipalEvidence({ ...principalEvidence, state: 'disabled' });
+    await assert.rejects(h.store.putRemoteStopPrincipalEvidence(principalEvidence), /higher epoch/i);
+    const disabled = await h.authority.recordRunnerRemoteStopAcknowledgement(request);
+    assert.equal(disabled.recorded, false);
+    assert.match(disabled.blockers.join(' '), /principal is unavailable/i);
+    await h.pool.execute('SET SESSION AUTHORIZATION postgres');
+    assert.deepEqual((await h.pool.rows(`SELECT r.state,b.committed_usd,host.authorized_slots
+      FROM swarm_authority_reservations r,swarm_authority_budgets b,swarm_authority_hosts host`))[0], before);
   } finally { await h.pool.close(); }
 });
 
