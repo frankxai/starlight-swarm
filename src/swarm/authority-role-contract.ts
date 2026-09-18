@@ -375,10 +375,11 @@ export const attestUsageEvidenceDatabaseSession: UsageEvidenceDatabaseSessionAtt
   }
   const unexpectedSchemaAccess = await client.query(`
     SELECT n.nspname FROM pg_namespace n
-    WHERE n.nspname <> 'public' AND n.nspname <> 'information_schema'
-      AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
-      AND (has_schema_privilege(current_user,n.oid,'USAGE')
-        OR has_schema_privilege(current_user,n.oid,'CREATE'))
+    WHERE n.nspname <> 'public'
+      AND (has_schema_privilege(current_user,n.oid,'CREATE')
+        OR (n.nspname <> 'information_schema'
+          AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+          AND has_schema_privilege(current_user,n.oid,'USAGE')))
     LIMIT 1
   `);
   if (unexpectedSchemaAccess.rows.length) {

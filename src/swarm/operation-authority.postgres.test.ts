@@ -1257,6 +1257,33 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       }
     });
 
+    await t.test('real verifier attestation rejects system-schema CREATE authority', async () => {
+      let client: PoolClient | undefined;
+      let grantApplied = false;
+      try {
+        await pool.query('GRANT CREATE ON SCHEMA pg_catalog TO starlight_postgres_usage_verifier');
+        grantApplied = true;
+        client = await verifierRolePool.connect();
+        const attestation = await attestUsageEvidenceDatabaseSession({
+          query: async (sql, values) => {
+            assert.ok(client);
+            const result = await client.query(sql, values);
+            return { rows: result.rows as Record<string, unknown>[] };
+          },
+        });
+        assert.equal(attestation.valid, false);
+        assert.match(attestation.blockers.join(' '), /must not access schemas outside the public verifier boundary/i);
+      } finally {
+        try {
+          client?.release();
+        } finally {
+          if (grantApplied) {
+            await pool.query('REVOKE CREATE ON SCHEMA pg_catalog FROM starlight_postgres_usage_verifier');
+          }
+        }
+      }
+    });
+
     await t.test('usage evidence versus broker disable never releases committed authority', async () => {
       const h = await prepare();
       const usage = await settleForUsageEvidence(h, '75');

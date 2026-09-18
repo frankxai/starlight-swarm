@@ -319,6 +319,25 @@ test('provider verifier rejects a PUBLIC grant restored on an initially restrict
   } finally { await db.close(); }
 });
 
+test('provider verifier rejects CREATE authority in representative system schemas', async (t) => {
+  const probes = [
+    ['pg_catalog direct', 'GRANT CREATE ON SCHEMA pg_catalog TO starlight_usage_verifier'],
+    ['information_schema direct', 'GRANT CREATE ON SCHEMA information_schema TO starlight_usage_verifier'],
+    ['pg_toast direct', 'GRANT CREATE ON SCHEMA pg_toast TO starlight_usage_verifier'],
+    ['pg_toast PUBLIC-derived', 'GRANT CREATE ON SCHEMA pg_toast TO PUBLIC'],
+  ] as const;
+  for (const [name, mutation] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(`${mutation};`);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), /must not access schemas outside the public verifier boundary/i);
+      } finally { await db.close(); }
+    });
+  }
+});
+
 test('provider verifier rejects non-default system relation, column, and sequence authority', async (t) => {
   const probes = [
     ['direct relation', 'GRANT SELECT ON pg_catalog.pg_authid TO starlight_usage_verifier',
