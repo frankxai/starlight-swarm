@@ -262,8 +262,8 @@ const denyUnconfiguredRunnerOutcomeEvidence: RunnerOutcomeEvidenceAttestor = asy
 });
 
 const exactUsd = z.string().regex(/^(0|[1-9][0-9]{0,7})\.[0-9]{6}$/);
-export const runnerUsageEvidenceSchema = z.object({
-  schema_version: z.literal('starlight.runner_usage_provider_evidence.v1'),
+const exactProviderUsdV2 = z.string().regex(/^(0|[1-9][0-9]{0,7})\.[0-9]{12}$/);
+const runnerUsageEvidenceBaseSchema = z.object({
   provider_event_id: z.uuid(),
   reservation_id: z.uuid(),
   claim_id: z.uuid(),
@@ -293,11 +293,20 @@ export const runnerUsageEvidenceSchema = z.object({
   observed_at: controlTime,
   access_review_expires_at: controlTime,
   currency: z.literal('USD'),
-  cumulative_cost_usd: exactUsd,
   authn_kind: z.literal('provider-signed-statement'),
   issuer: controlId,
   key_id: controlId,
-}).strict().superRefine((value, context) => {
+}).strict();
+export const runnerUsageEvidenceSchema = z.discriminatedUnion('schema_version', [
+  runnerUsageEvidenceBaseSchema.extend({
+    schema_version: z.literal('starlight.runner_usage_provider_evidence.v1'),
+    cumulative_cost_usd: exactUsd,
+  }),
+  runnerUsageEvidenceBaseSchema.extend({
+    schema_version: z.literal('starlight.runner_usage_provider_evidence.v2'),
+    cumulative_cost_usd: exactProviderUsdV2,
+  }),
+]).superRefine((value, context) => {
   const started = Date.parse(value.usage_started_at);
   const ended = Date.parse(value.usage_ended_at);
   const observed = Date.parse(value.observed_at);
@@ -448,6 +457,7 @@ CREATE TABLE IF NOT EXISTS swarm_authority_usage_tokens (
 CREATE TABLE IF NOT EXISTS swarm_authority_usage_evidence (
   usage_evidence_id UUID PRIMARY KEY, usage_request_id UUID NOT NULL UNIQUE,
   usage_sequence INTEGER NOT NULL CHECK (usage_sequence >= 1),
+  evidence_schema_version TEXT NOT NULL,
   provider_event_id UUID NOT NULL UNIQUE, reservation_id UUID NOT NULL,
   claim_id UUID NOT NULL, outcome_id UUID NOT NULL,
   operation_id TEXT NOT NULL, effect_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
@@ -461,13 +471,16 @@ CREATE TABLE IF NOT EXISTS swarm_authority_usage_evidence (
   statement_finalized_at TIMESTAMPTZ,
   evidence_observed_at TIMESTAMPTZ NOT NULL, accepted_at TIMESTAMPTZ NOT NULL,
   currency CHAR(3) NOT NULL CHECK (currency='USD'),
-  cumulative_cost_usd NUMERIC(20,6) NOT NULL CHECK (cumulative_cost_usd >= 0),
+  cumulative_cost_usd NUMERIC(20,12) NOT NULL CHECK (cumulative_cost_usd >= 0),
   authorized_cost_usd NUMERIC(20,6) NOT NULL CHECK (authorized_cost_usd >= 0),
   budget_breach_observed BOOLEAN NOT NULL,
   presented_token_sha256 CHAR(64) NOT NULL,
   next_token_sha256 CHAR(64) NOT NULL,
   issuer TEXT NOT NULL, key_id TEXT NOT NULL,
   authn_kind TEXT NOT NULL CHECK (authn_kind='provider-signed-statement'),
+  CONSTRAINT swarm_authority_usage_evidence_schema_version_check CHECK (
+    evidence_schema_version IN ('starlight.runner_usage_provider_evidence.v1','starlight.runner_usage_provider_evidence.v2')
+  ),
   UNIQUE (reservation_id,usage_sequence),
   CHECK (usage_started_at <= usage_ended_at),
   CHECK (usage_ended_at <= evidence_observed_at),
@@ -485,9 +498,47 @@ ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS verifier_dat
   NOT NULL DEFAULT 'legacy-unattested';
 ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS verifier_role_contract_sha256 CHAR(64)
   NOT NULL DEFAULT '${'0'.repeat(64)}';
+ALTER TABLE swarm_authority_usage_evidence ADD COLUMN IF NOT EXISTS evidence_schema_version TEXT
+  NOT NULL DEFAULT 'starlight.runner_usage_provider_evidence.v1';
 ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_database_role DROP DEFAULT;
 ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_database_name DROP DEFAULT;
 ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN verifier_role_contract_sha256 DROP DEFAULT;
+ALTER TABLE swarm_authority_usage_evidence ALTER COLUMN evidence_schema_version DROP DEFAULT;
+DO $usage_evidence_schema_constraint$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conname='swarm_authority_usage_evidence_schema_version_check'
+        AND conrelid='public.swarm_authority_usage_evidence'::regclass) THEN
+    ALTER TABLE swarm_authority_usage_evidence ADD CONSTRAINT
+      swarm_authority_usage_evidence_schema_version_check CHECK (
+        evidence_schema_version IN ('starlight.runner_usage_provider_evidence.v1',
+          'starlight.runner_usage_provider_evidence.v2')
+      );
+  END IF;
+END
+$usage_evidence_schema_constraint$;
+DO $usage_cost_precision_migration$
+DECLARE
+  stored_precision INTEGER;
+  stored_scale INTEGER;
+BEGIN
+  SELECT numeric_precision,numeric_scale INTO stored_precision,stored_scale
+    FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='swarm_authority_usage_evidence'
+     AND column_name='cumulative_cost_usd';
+  IF stored_precision=20 AND stored_scale=6 THEN
+    IF EXISTS (SELECT 1 FROM swarm_authority_usage_evidence
+        WHERE cumulative_cost_usd<0 OR cumulative_cost_usd>=100000000::numeric) THEN
+      RAISE EXCEPTION 'legacy provider usage cost cannot migrate to the v2 precision envelope';
+    END IF;
+    ALTER TABLE swarm_authority_usage_evidence
+      ALTER COLUMN cumulative_cost_usd TYPE NUMERIC(20,12)
+      USING cumulative_cost_usd::NUMERIC(20,12);
+  ELSIF stored_precision IS DISTINCT FROM 20 OR stored_scale IS DISTINCT FROM 12 THEN
+    RAISE EXCEPTION 'provider usage cost precision is unexpected: NUMERIC(%,%)',stored_precision,stored_scale;
+  END IF;
+END
+$usage_cost_precision_migration$;
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
   seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
@@ -700,6 +751,11 @@ BEGIN
       OR e.binding_digest_sha256 IS DISTINCT FROM r.binding_digest_sha256
       OR e.provider_usage_correlation_id IS DISTINCT FROM r.provider_usage_correlation_id
       OR e.authorized_cost_usd IS DISTINCT FROM r.committed_cost_usd
+      OR e.evidence_schema_version NOT IN ('starlight.runner_usage_provider_evidence.v1',
+        'starlight.runner_usage_provider_evidence.v2')
+      OR (e.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
+        AND e.cumulative_cost_usd<>trunc(e.cumulative_cost_usd,6))
+      OR e.cumulative_cost_usd>=100000000::numeric
       OR e.usage_started_at < date_trunc('milliseconds',r.runner_claim_accepted_at)
       OR e.usage_ended_at > date_trunc('milliseconds',r.runner_outcome_at)
       OR e.budget_breach_observed IS DISTINCT FROM (
@@ -721,6 +777,7 @@ BEGIN
     WITH ordered AS (
       SELECT e.*,
         LAG(provider_id) OVER chain AS prior_provider_id,
+        LAG(evidence_schema_version) OVER chain AS prior_evidence_schema_version,
         LAG(provider_account_ref) OVER chain AS prior_provider_account_ref,
         LAG(provider_usage_correlation_id) OVER chain AS prior_correlation,
         LAG(meter_id) OVER chain AS prior_meter_id,
@@ -737,6 +794,7 @@ BEGIN
     )
     SELECT 1 FROM ordered WHERE usage_sequence>1 AND (
       provider_id IS DISTINCT FROM prior_provider_id
+      OR evidence_schema_version IS DISTINCT FROM prior_evidence_schema_version
       OR provider_account_ref IS DISTINCT FROM prior_provider_account_ref
       OR provider_usage_correlation_id IS DISTINCT FROM prior_correlation
       OR meter_id IS DISTINCT FROM prior_meter_id
@@ -1431,6 +1489,23 @@ function canonicalUsd(value: unknown): string {
   const match = /^(0|[1-9][0-9]{0,7})(?:\.([0-9]{1,6}))?$/.exec(raw);
   if (!match) throw new Error('Database returned a non-canonical USD amount.');
   return `${match[1]}.${(match[2] ?? '').padEnd(6, '0')}`;
+}
+
+function canonicalProviderUsd(
+  value: unknown,
+  schemaVersion: 'starlight.runner_usage_provider_evidence.v1' | 'starlight.runner_usage_provider_evidence.v2',
+): string {
+  const raw = String(value);
+  const match = /^(0|[1-9][0-9]{0,7})(?:\.([0-9]{1,12}))?$/.exec(raw);
+  if (!match) throw new Error('Database returned a provider USD amount outside the precision envelope.');
+  const fractional = (match[2] ?? '').padEnd(12, '0');
+  if (schemaVersion === 'starlight.runner_usage_provider_evidence.v1') {
+    if (!/^0{6}$/.test(fractional.slice(6))) {
+      throw new Error('Database returned a v1 provider USD amount with excess precision.');
+    }
+    return `${match[1]}.${fractional.slice(0, 6)}`;
+  }
+  return `${match[1]}.${fractional}`;
 }
 
 function hostEvidence(row: Record<string, unknown> | undefined): TrustedHostEvidence | null {
@@ -4453,8 +4528,16 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await client.query('COMMIT');
       return runnerUsageEvidenceDenied(blocker);
     };
-    const receiptFrom = (row: Record<string, unknown>): RunnerUsageEvidenceReceipt => ({
-      schema_version: 'starlight.runner_usage_evidence.v1',
+    const receiptFrom = (row: Record<string, unknown>): RunnerUsageEvidenceReceipt => {
+      const providerSchemaVersion = String(row.evidence_schema_version);
+      if (providerSchemaVersion !== 'starlight.runner_usage_provider_evidence.v1'
+        && providerSchemaVersion !== 'starlight.runner_usage_provider_evidence.v2') {
+        throw new Error('Database returned an unsupported provider usage-evidence schema version.');
+      }
+      return ({
+      schema_version: providerSchemaVersion === 'starlight.runner_usage_provider_evidence.v1'
+        ? 'starlight.runner_usage_evidence.v1'
+        : 'starlight.runner_usage_evidence.v2',
       usage_evidence_id: String(row.usage_evidence_id),
       usage_request_id: String(row.usage_request_id),
       usage_sequence: Number(row.usage_sequence),
@@ -4478,7 +4561,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       accepted_at: sqlInstant(row.accepted_at),
       statement_status: row.statement_status as 'provisional' | 'final',
       currency: 'USD',
-      cumulative_cost_usd: canonicalUsd(row.cumulative_cost_usd),
+      cumulative_cost_usd: canonicalProviderUsd(row.cumulative_cost_usd, providerSchemaVersion),
       authorized_cost_usd: canonicalUsd(row.authorized_cost_usd),
       budget_breach_observed: row.budget_breach_observed === true,
       actual_usage_reconciled: false,
@@ -4488,6 +4571,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       dispatch_state: 'not-dispatched',
       workload_effect_observed: false,
     });
+    };
     try {
       await client.query('BEGIN');
       brokerTransactionOpen = true;
@@ -4643,6 +4727,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         `SELECT public.starlight_append_runner_usage_evidence($1::jsonb) AS result`,
         [JSON.stringify({
           usage_evidence_id: usageEvidenceId, usage_request_id: request.usage_request_id,
+          evidence_schema_version: evidence.schema_version,
           usage_sequence: request.usage_sequence, provider_event_id: evidence.provider_event_id,
           reservation_id: request.reservation_id, claim_id: request.claim_id, outcome_id: request.outcome_id,
           operation_id: request.operation_id, effect_id: request.effect_id,

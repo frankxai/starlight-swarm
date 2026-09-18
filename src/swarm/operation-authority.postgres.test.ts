@@ -469,6 +469,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     suffix: string,
     statementStatus: 'provisional' | 'final' = 'final',
     cumulativeCostUsd = '0.000000',
+    evidenceSchemaVersion: RunnerUsageEvidence['schema_version'] = 'starlight.runner_usage_provider_evidence.v1',
   ) => {
     const outcomeRequest = await claimForNeverStartedOutcome(h, suffix);
     const settled = await h.authority.settleRunnerOutcome(outcomeRequest);
@@ -476,7 +477,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     if (!settled.settled) throw new Error('runner outcome failed');
     const observedAt = settled.receipt.outcome_at;
     currentUsageEvidence = {
-      schema_version: 'starlight.runner_usage_provider_evidence.v1',
+      schema_version: evidenceSchemaVersion,
       provider_event_id: `00000000-0000-4000-8000-0000000009${suffix}`,
       reservation_id: h.reservation.reservation_id,
       claim_id: settled.receipt.claim_id,
@@ -1150,7 +1151,9 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
 
     await t.test('duplicate provider usage evidence records one immutable event and releases no budget', async () => {
       const h = await prepare();
-      const usage = await settleForUsageEvidence(h, '74');
+      const usage = await settleForUsageEvidence(
+        h, '74', 'final', '0.000000000001', 'starlight.runner_usage_provider_evidence.v2',
+      );
       const results = await Promise.all([
         h.authority.recordRunnerUsageEvidence(usage),
         h.secondAuthority.recordRunnerUsageEvidence(usage),
@@ -1162,8 +1165,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         FROM swarm_authority_budgets b,swarm_authority_hosts h`);
       assert.equal(Number(state.rows[0].committed_usd), 0.25);
       assert.equal(Number(state.rows[0].authorized_slots), 1);
-      const evidence = await pool.query('SELECT usage_sequence,cumulative_cost_usd FROM swarm_authority_usage_evidence');
-      assert.deepEqual(evidence.rows.map((row) => [Number(row.usage_sequence), Number(row.cumulative_cost_usd)]), [[1, 0]]);
+      const evidence = await pool.query(`SELECT usage_sequence,evidence_schema_version,
+        cumulative_cost_usd::text AS cumulative_cost_usd FROM swarm_authority_usage_evidence`);
+      assert.deepEqual(evidence.rows.map((row) => [Number(row.usage_sequence), row.evidence_schema_version,
+        row.cumulative_cost_usd]), [[1, 'starlight.runner_usage_provider_evidence.v2', '0.000000000001']]);
       const events = await pool.query("SELECT event FROM swarm_authority_audit WHERE event='runner-usage-evidence-observed'");
       assert.equal(events.rowCount, 1);
     });

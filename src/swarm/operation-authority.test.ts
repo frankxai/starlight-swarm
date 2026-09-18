@@ -12,6 +12,7 @@ import {
 } from './operation-authority';
 import {
   PostgresOperationAuthorityStore,
+  runnerUsageEvidenceSchema,
   type AuthoritySqlClient,
   type AuthoritySqlPool,
   type RunnerSessionAttestor,
@@ -2256,7 +2257,18 @@ test('records authenticated provider usage evidence without releasing committed 
       usageEvidence = runnerUsageEvidence(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
         claim.receipt.accepted_at, settled.receipt.outcome_at,
+        {
+          schema_version: 'starlight.runner_usage_provider_evidence.v2',
+          cumulative_cost_usd: '0.000000000001',
+        },
       );
+      assert.equal(runnerUsageEvidenceSchema.safeParse(usageEvidence).success, true);
+      for (const malformed of ['0.000000', '0.0000000000001', '1e-12', '-0.000000000001',
+        '00.000000000001', '100000000.000000000000']) {
+        assert.equal(runnerUsageEvidenceSchema.safeParse({
+          ...usageEvidence, cumulative_cost_usd: malformed,
+        }).success, false, malformed);
+      }
       const firstInput = runnerUsageRequest(h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id);
       const first = await h.authority.recordRunnerUsageEvidence(firstInput);
       assert.equal(first.recorded, true, first.blockers.join(' '));
@@ -2265,10 +2277,23 @@ test('records authenticated provider usage evidence without releasing committed 
         first.receipt.statement_status, first.receipt.cumulative_cost_usd,
         first.receipt.actual_usage_reconciled, first.receipt.budget_commitment_released,
         first.receipt.released_cost_usd,
-      ], ['provisional', '0.000000', false, false, '0.000000']);
+        first.receipt.schema_version,
+      ], ['provisional', '0.000000000001', false, false, '0.000000',
+        'starlight.runner_usage_evidence.v2']);
+      assert.equal(first.receipt.budget_breach_observed, true);
       const retry = await h.authority.recordRunnerUsageEvidence(firstInput);
       assert.equal(retry.recorded, true, retry.blockers.join(' '));
       if (retry.recorded) assert.deepEqual(retry.receipt, first.receipt);
+      const firstAudit = await h.pool.rows(`SELECT detail FROM swarm_authority_audit
+        WHERE event='runner-usage-evidence-observed'`);
+      assert.equal(firstAudit.length, 1);
+      assert.equal((firstAudit[0]?.detail as Record<string, unknown>).cumulative_cost_usd, '0.000000000001');
+      assert.equal((firstAudit[0]?.detail as Record<string, unknown>).authorized_cost_usd, '0.250000');
+
+      usageEvidence = { ...usageEvidence, cumulative_cost_usd: '0.000000000002' };
+      const retryDrift = await h.authority.recordRunnerUsageEvidence(firstInput);
+      assert.equal(retryDrift.recorded, false);
+      assert.match(retryDrift.blockers.join(' '), /retry drifted/i);
 
       const finalEvidence = runnerUsageEvidence(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
@@ -2278,7 +2303,8 @@ test('records authenticated provider usage evidence without releasing committed 
           evidence_ref: 'provider-usage-evidence-002',
           evidence_sha256: 'f'.repeat(64),
           statement_status: 'final',
-          cumulative_cost_usd: '0.000000',
+          schema_version: 'starlight.runner_usage_provider_evidence.v2',
+          cumulative_cost_usd: '0.000000000002',
         },
       );
       const finalInput = runnerUsageRequest(
@@ -2299,6 +2325,7 @@ test('records authenticated provider usage evidence without releasing committed 
         ['start', { usage_started_at: settled.receipt.outcome_at }],
         ['end', { usage_ended_at: claim.receipt.accepted_at,
           statement_finalized_at: finalEvidence.observed_at }],
+        ['cost', { cumulative_cost_usd: '0.000000000000' }],
       ];
       for (const [name, drift] of driftCases) {
         usageEvidence = { ...finalEvidence, ...drift };
@@ -2319,28 +2346,49 @@ test('records authenticated provider usage evidence without releasing committed 
   });
 
   await t.test('over-budget evidence is retained as a breach while every commitment remains locked', async () => {
+    let startEvidence: RunnerStartEvidence | undefined;
     let outcomeEvidence: RunnerOutcomeEvidence | undefined;
     let usageEvidence: RunnerUsageEvidence | undefined;
+    const startAttestor: RunnerStartEvidenceAttestor = async () => startEvidence
+      ? { valid: true, evidence: startEvidence, blockers: [] }
+      : { valid: false, evidence: null, blockers: ['No server-owned start evidence exists.'] };
     const outcomeAttestor: RunnerOutcomeEvidenceAttestor = async () => outcomeEvidence
       ? { valid: true, evidence: outcomeEvidence, blockers: [] }
       : { valid: false, evidence: null, blockers: ['No server-owned outcome evidence exists.'] };
     const usageAttestor: RunnerUsageEvidenceAttestor = async () => usageEvidence
       ? { valid: true, evidence: usageEvidence, blockers: [] }
       : { valid: false, evidence: null, blockers: ['No provider usage evidence exists.'] };
-    const h = await harness(binding(), {}, runnerSessionAttestor, undefined, outcomeAttestor, usageAttestor);
+    const h = await harness(binding(), {}, runnerSessionAttestor, startAttestor, outcomeAttestor, usageAttestor);
     try {
       const { reservation, redeemed } = await authorizeForRunnerClaim(h, 90_000);
       const claim = await h.authority.claimRunnerStart(runnerClaim(h, reservation, redeemed.receipt.redemption_id));
       assert.equal(claim.claimed, true, claim.blockers.join(' '));
       if (!claim.claimed) return;
-      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'never-started');
+      startEvidence = runnerStartEvidence(h, reservation, claim.receipt.claim_id);
+      const started = await h.authority.observeRunnerStart(
+        runnerStartObservation(h, reservation, claim.receipt.claim_id),
+      );
+      assert.equal(started.observed, true, started.blockers.join(' '));
+      if (!started.observed) return;
+      const terminalAt = new Date(Math.max(Date.now(), Date.parse(started.receipt.process_started_at))).toISOString();
+      outcomeEvidence = runnerOutcomeEvidence(h, reservation, claim.receipt.claim_id, 'process-terminal', {
+        start_observation_id: started.receipt.observation_id,
+        process_started_at: started.receipt.process_started_at,
+        outcome_at: terminalAt,
+        observed_at: terminalAt,
+      });
       const settled = await h.authority.settleRunnerOutcome(runnerOutcome(h, reservation, claim.receipt.claim_id));
       assert.equal(settled.settled, true, settled.blockers.join(' '));
       if (!settled.settled) return;
       usageEvidence = runnerUsageEvidence(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
         claim.receipt.accepted_at, settled.receipt.outcome_at,
-        { statement_status: 'final', cumulative_cost_usd: '0.300000' },
+        {
+          schema_version: 'starlight.runner_usage_provider_evidence.v2',
+          statement_status: 'final',
+          cumulative_cost_usd: '0.250000000001',
+          process_instance_sha256: started.receipt.process_instance_sha256,
+        },
       );
       const recorded = await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
@@ -2348,6 +2396,9 @@ test('records authenticated provider usage evidence without releasing committed 
       assert.equal(recorded.recorded, true, recorded.blockers.join(' '));
       if (!recorded.recorded) return;
       assert.equal(recorded.receipt.budget_breach_observed, true);
+      assert.equal(recorded.receipt.schema_version, 'starlight.runner_usage_evidence.v2');
+      assert.equal(recorded.receipt.cumulative_cost_usd, '0.250000000001');
+      assert.equal(recorded.receipt.authorized_cost_usd, '0.250000');
       assert.equal(recorded.receipt.budget_commitment_released, false);
       assert.equal(recorded.receipt.released_cost_usd, '0.000000');
       const ledgers = await h.pool.rows(`SELECT b.committed_usd,w.committed_usd AS window_committed
@@ -2380,17 +2431,22 @@ test('records authenticated provider usage evidence without releasing committed 
       usageEvidence = runnerUsageEvidence(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
         claim.receipt.accepted_at, settled.receipt.outcome_at,
+        { cumulative_cost_usd: '0.123456' },
       );
       assert.equal((await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
       ))).recorded, true);
+      const v1Audit = await h.pool.rows(`SELECT detail FROM swarm_authority_audit
+        WHERE event='runner-usage-evidence-observed' ORDER BY seq DESC LIMIT 1`);
+      assert.equal((v1Audit[0]?.detail as Record<string, unknown>).cumulative_cost_usd, '0.123456');
+      assert.equal((v1Audit[0]?.detail as Record<string, unknown>).authorized_cost_usd, '0.250000');
       usageEvidence = runnerUsageEvidence(
         h, reservation, claim.receipt.claim_id, settled.receipt.outcome_id,
         claim.receipt.accepted_at, settled.receipt.outcome_at,
         {
           provider_event_id: '00000000-0000-4000-8000-000000000903',
           evidence_ref: 'provider-usage-evidence-003', evidence_sha256: 'a'.repeat(64),
-          statement_status: 'final', cumulative_cost_usd: '0.000000',
+          statement_status: 'final', cumulative_cost_usd: '0.123457',
         },
       );
       assert.equal((await h.authority.recordRunnerUsageEvidence(runnerUsageRequest(
@@ -2422,6 +2478,27 @@ test('records authenticated provider usage evidence without releasing committed 
       await h.pool.execute(`UPDATE swarm_authority_usage_evidence
         SET authorized_cost_usd=${Number(original.authorized_cost_usd)} WHERE usage_sequence=2`);
       await h.store.initialize();
+
+      await h.pool.execute(`
+        ALTER TABLE swarm_authority_usage_evidence
+          DROP CONSTRAINT swarm_authority_usage_evidence_schema_version_check;
+        ALTER TABLE swarm_authority_usage_evidence DROP COLUMN evidence_schema_version;
+        ALTER TABLE swarm_authority_usage_evidence
+          ALTER COLUMN cumulative_cost_usd TYPE NUMERIC(20,6)
+          USING cumulative_cost_usd::NUMERIC(20,6);
+      `);
+      await h.store.initialize();
+      await h.store.initialize();
+      const migrated = await h.pool.rows(`SELECT evidence_schema_version,cumulative_cost_usd::text AS cost
+        FROM swarm_authority_usage_evidence ORDER BY usage_sequence`);
+      assert.deepEqual(migrated.map((row) => [row.evidence_schema_version, row.cost]), [
+        ['starlight.runner_usage_provider_evidence.v1', '0.123456000000'],
+        ['starlight.runner_usage_provider_evidence.v1', '0.123457000000'],
+      ]);
+      const precision = await h.pool.rows(`SELECT numeric_precision,numeric_scale
+        FROM information_schema.columns WHERE table_schema='public'
+          AND table_name='swarm_authority_usage_evidence' AND column_name='cumulative_cost_usd'`);
+      assert.deepEqual([Number(precision[0]?.numeric_precision), Number(precision[0]?.numeric_scale)], [20, 12]);
     } finally { await h.pool.close(); }
   });
 });

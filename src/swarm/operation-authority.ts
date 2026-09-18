@@ -548,7 +548,7 @@ export type RunnerOutcomeResult =
   | { settled: false; receipt: null; blockers: string[] };
 
 export interface RunnerUsageEvidenceReceipt {
-  schema_version: 'starlight.runner_usage_evidence.v1';
+  schema_version: 'starlight.runner_usage_evidence.v1' | 'starlight.runner_usage_evidence.v2';
   usage_evidence_id: string;
   usage_request_id: string;
   usage_sequence: number;

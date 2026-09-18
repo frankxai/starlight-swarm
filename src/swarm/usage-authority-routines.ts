@@ -234,7 +234,7 @@ BEGIN
     RETURN public.starlight_record_usage_refusal(p,
       'Usage verifier routine execution grants do not identify one sole non-grantable verifier.');
   END IF;
-  IF NOT (p ?& ARRAY['usage_evidence_id','usage_request_id','usage_sequence','provider_event_id','reservation_id',
+  IF NOT (p ?& ARRAY['usage_evidence_id','usage_request_id','usage_sequence','evidence_schema_version','provider_event_id','reservation_id',
       'claim_id','outcome_id','operation_id','effect_id','binding_digest_sha256','role_contract_digest_sha256',
       'verifier_database_role','verifier_database_name','verifier_role_contract_sha256',
       'runner_id','runner_identity_evidence_ref','runner_instance_id',
@@ -243,7 +243,7 @@ BEGIN
       'usage_started_at','usage_ended_at','statement_status','statement_finalized_at','evidence_observed_at',
       'access_review_expires_at','cumulative_cost_usd','usage_reconciliation_token',
       'next_usage_reconciliation_token','issuer','key_id','authn_kind']::pg_catalog.text[])
-     OR p - ARRAY['usage_evidence_id','usage_request_id','usage_sequence','provider_event_id','reservation_id',
+     OR p - ARRAY['usage_evidence_id','usage_request_id','usage_sequence','evidence_schema_version','provider_event_id','reservation_id',
       'claim_id','outcome_id','operation_id','effect_id','binding_digest_sha256','role_contract_digest_sha256',
       'verifier_database_role','verifier_database_name','verifier_role_contract_sha256',
       'runner_id','runner_identity_evidence_ref','runner_instance_id',
@@ -275,7 +275,12 @@ BEGIN
      OR p->>'usage_reconciliation_token' !~ '^[A-Za-z0-9_-]{43}$'
      OR p->>'next_usage_reconciliation_token' !~ '^[A-Za-z0-9_-]{43}$'
      OR p->>'usage_reconciliation_token'=p->>'next_usage_reconciliation_token'
-     OR p->>'cumulative_cost_usd' !~ '^(0|[1-9][0-9]{0,7})\.[0-9]{6}$'
+     OR p->>'evidence_schema_version' NOT IN ('starlight.runner_usage_provider_evidence.v1',
+       'starlight.runner_usage_provider_evidence.v2')
+     OR (p->>'evidence_schema_version'='starlight.runner_usage_provider_evidence.v1'
+       AND p->>'cumulative_cost_usd' !~ '^(0|[1-9][0-9]{0,7})\.[0-9]{6}$')
+     OR (p->>'evidence_schema_version'='starlight.runner_usage_provider_evidence.v2'
+       AND p->>'cumulative_cost_usd' !~ '^(0|[1-9][0-9]{0,7})\.[0-9]{12}$')
      OR p->>'usage_sequence' !~ '^[1-9][0-9]{0,8}$'
      OR p->>'fencing_generation' !~ '^[1-9][0-9]{0,8}$'
      OR p->>'usage_started_at' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$'
@@ -395,6 +400,7 @@ BEGIN
    WHERE usage_request_id=(p->>'usage_request_id')::pg_catalog.uuid;
   IF FOUND THEN
     IF prior.reservation_id=(p->>'reservation_id')::pg_catalog.uuid
+       AND prior.evidence_schema_version=p->>'evidence_schema_version'
        AND prior.claim_id=(p->>'claim_id')::pg_catalog.uuid AND prior.outcome_id=(p->>'outcome_id')::pg_catalog.uuid
        AND prior.operation_id=p->>'operation_id' AND prior.effect_id=p->>'effect_id'
        AND prior.binding_digest_sha256=p->>'binding_digest_sha256'
@@ -416,7 +422,13 @@ BEGIN
        AND prior.evidence_observed_at=(p->>'evidence_observed_at')::pg_catalog.timestamptz
        AND prior.currency='USD' AND prior.cumulative_cost_usd=(p->>'cumulative_cost_usd')::pg_catalog.numeric
        AND prior.issuer=p->>'issuer' AND prior.key_id=p->>'key_id' AND prior.authn_kind=p->>'authn_kind' THEN
-      RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',TRUE,'row',pg_catalog.to_jsonb(prior));
+      RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',TRUE,'row',
+        pg_catalog.to_jsonb(prior) || pg_catalog.jsonb_build_object(
+          'cumulative_cost_usd',CASE
+            WHEN prior.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
+              THEN prior.cumulative_cost_usd::pg_catalog.numeric(20,6)::pg_catalog.text
+            ELSE prior.cumulative_cost_usd::pg_catalog.text END,
+          'authorized_cost_usd',prior.authorized_cost_usd::pg_catalog.text));
     END IF;
     RETURN public.starlight_record_usage_refusal(p,'Runner usage-evidence retry drifted.');
   END IF;
@@ -436,7 +448,8 @@ BEGIN
           AND t.sequence=prior_sequence) THEN
     RETURN public.starlight_record_usage_refusal(p,'Usage-reconciliation credential is invalid or already rotated.');
   END IF;
-  IF prior_sequence > 0 AND (latest.provider_id IS DISTINCT FROM p->>'provider_id'
+  IF prior_sequence > 0 AND (latest.evidence_schema_version IS DISTINCT FROM p->>'evidence_schema_version'
+     OR latest.provider_id IS DISTINCT FROM p->>'provider_id'
      OR latest.verifier_database_role IS DISTINCT FROM p->>'verifier_database_role'
      OR latest.verifier_database_name IS DISTINCT FROM p->>'verifier_database_name'
      OR latest.verifier_role_contract_sha256 IS DISTINCT FROM p->>'verifier_role_contract_sha256'
@@ -498,14 +511,14 @@ BEGIN
   breach := (p->>'cumulative_cost_usd')::pg_catalog.numeric > r.committed_cost_usd
          OR (r.runner_outcome_kind='never-started' AND (p->>'cumulative_cost_usd')::pg_catalog.numeric <> 0);
   INSERT INTO public.swarm_authority_usage_evidence
-    (usage_evidence_id,usage_request_id,usage_sequence,provider_event_id,reservation_id,claim_id,outcome_id,
+    (usage_evidence_id,usage_request_id,usage_sequence,evidence_schema_version,provider_event_id,reservation_id,claim_id,outcome_id,
      operation_id,effect_id,binding_digest_sha256,verifier_database_role,verifier_database_name,
      verifier_role_contract_sha256,provider_id,provider_account_ref,provider_usage_correlation_id,
      meter_id,evidence_ref,evidence_sha256,usage_started_at,usage_ended_at,statement_status,statement_finalized_at,
      evidence_observed_at,accepted_at,currency,cumulative_cost_usd,authorized_cost_usd,budget_breach_observed,
      presented_token_sha256,next_token_sha256,issuer,key_id,authn_kind)
   VALUES ((p->>'usage_evidence_id')::pg_catalog.uuid,(p->>'usage_request_id')::pg_catalog.uuid,
-     (p->>'usage_sequence')::pg_catalog.int4,(p->>'provider_event_id')::pg_catalog.uuid,r.reservation_id,r.runner_claim_id,
+     (p->>'usage_sequence')::pg_catalog.int4,p->>'evidence_schema_version',(p->>'provider_event_id')::pg_catalog.uuid,r.reservation_id,r.runner_claim_id,
      r.runner_outcome_id,r.operation_id,r.effect_id,r.binding_digest_sha256,p->>'verifier_database_role',
      p->>'verifier_database_name',p->>'verifier_role_contract_sha256',p->>'provider_id',p->>'provider_account_ref',
      p->>'provider_usage_correlation_id',p->>'meter_id',p->>'evidence_ref',p->>'evidence_sha256',
@@ -521,16 +534,32 @@ BEGIN
   VALUES (next_digest,r.reservation_id,(p->>'usage_sequence')::pg_catalog.int4,
           (p->>'usage_request_id')::pg_catalog.uuid,accepted_at,'usage-evidence');
   INSERT INTO public.swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
-  VALUES ('runner-usage-evidence-observed',r.operation_id,r.binding_digest_sha256,accepted_at,pg_catalog.to_jsonb(inserted));
+  VALUES ('runner-usage-evidence-observed',r.operation_id,r.binding_digest_sha256,accepted_at,
+    pg_catalog.to_jsonb(inserted) || pg_catalog.jsonb_build_object(
+      'cumulative_cost_usd',CASE
+        WHEN inserted.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
+          THEN inserted.cumulative_cost_usd::pg_catalog.numeric(20,6)::pg_catalog.text
+        ELSE inserted.cumulative_cost_usd::pg_catalog.text END,
+      'authorized_cost_usd',inserted.authorized_cost_usd::pg_catalog.text));
   IF breach THEN
     INSERT INTO public.swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
     VALUES ('runner-usage-budget-breach',r.operation_id,r.binding_digest_sha256,accepted_at,
       pg_catalog.jsonb_build_object('reservation_id',r.reservation_id,'claim_id',r.runner_claim_id,
         'outcome_id',r.runner_outcome_id,'usage_evidence_id',inserted.usage_evidence_id,
-        'cumulative_cost_usd',inserted.cumulative_cost_usd,'authorized_cost_usd',r.committed_cost_usd,
+        'cumulative_cost_usd',CASE
+          WHEN inserted.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
+            THEN inserted.cumulative_cost_usd::pg_catalog.numeric(20,6)::pg_catalog.text
+          ELSE inserted.cumulative_cost_usd::pg_catalog.text END,
+        'authorized_cost_usd',r.committed_cost_usd::pg_catalog.text,
         'released_cost_usd','0.000000','actual_usage_reconciled',FALSE));
   END IF;
-  RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',FALSE,'row',pg_catalog.to_jsonb(inserted));
+  RETURN pg_catalog.jsonb_build_object('ok',TRUE,'retry',FALSE,'row',
+    pg_catalog.to_jsonb(inserted) || pg_catalog.jsonb_build_object(
+      'cumulative_cost_usd',CASE
+        WHEN inserted.evidence_schema_version='starlight.runner_usage_provider_evidence.v1'
+          THEN inserted.cumulative_cost_usd::pg_catalog.numeric(20,6)::pg_catalog.text
+        ELSE inserted.cumulative_cost_usd::pg_catalog.text END,
+      'authorized_cost_usd',inserted.authorized_cost_usd::pg_catalog.text));
 EXCEPTION
   WHEN invalid_datetime_format OR datetime_field_overflow OR invalid_text_representation
        OR numeric_value_out_of_range THEN
