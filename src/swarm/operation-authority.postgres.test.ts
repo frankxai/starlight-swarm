@@ -1259,10 +1259,8 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
 
     await t.test('real verifier attestation rejects system-schema CREATE authority', async () => {
       let client: PoolClient | undefined;
-      let grantApplied = false;
       try {
         await pool.query('GRANT CREATE ON SCHEMA pg_catalog TO starlight_postgres_usage_verifier');
-        grantApplied = true;
         client = await verifierRolePool.connect();
         const attestation = await attestUsageEvidenceDatabaseSession({
           query: async (sql, values) => {
@@ -1277,9 +1275,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         try {
           client?.release();
         } finally {
-          if (grantApplied) {
-            await pool.query('REVOKE CREATE ON SCHEMA pg_catalog FROM starlight_postgres_usage_verifier');
-          }
+          await pool.query('REVOKE CREATE ON SCHEMA pg_catalog FROM starlight_postgres_usage_verifier');
         }
       }
     });
