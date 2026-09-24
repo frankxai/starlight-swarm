@@ -41,6 +41,7 @@ export async function runPlan(plan, options) {
       receipt.results[id] = structuredClone(result);
     }
     for (const task of plan.tasks.filter(t => receipt.results[t.id])) requireValue(task.dependsOn.every(d => receipt.results[d]), 'Checkpoint missing dependency');
+    receipt.events = structuredClone(old.events);
   }
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason ?? new Error('Cancelled'));

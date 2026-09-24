@@ -102,6 +102,7 @@ test('resume re-verifies artifacts and rejects stale or tampered checkpoints', a
   const first = await runPlan(plan(), options()); let calls = 0, checks = 0;
   const resumed = await runPlan(plan(), options({ checkpoint: first, adapter: async () => { calls++; }, verify: async () => { checks++; return verify(); } }));
   assert.equal(resumed.status, 'complete'); assert.equal(calls, 0); assert.equal(checks, 1);
+  assert.deepEqual(resumed.events, first.events);
   await assert.rejects(runPlan({ ...plan(), id: 'changed' }, options({ checkpoint: first })), /Checkpoint/);
   await assert.rejects(runPlan(plan(), options({ checkpoint: first, verify: async () => ({ passed: false }) })), /Verification/);
 });
