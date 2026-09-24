@@ -8,5 +8,6 @@ const receipt = await runPlan(plan, {
   catalog: [{ model: 'gpt-6-luna', provider: 'fixture', runtime: 'demo', available: true, verifiedAt: new Date().toISOString(), efforts: ['medium'], tools: [], evidenceRef: 'fixture:not-a-live-model' }],
   adapter: async (task, { selection }) => ({ model: selection.model, provider: selection.provider, runtime: selection.runtime, artifacts: [`fixture:${task.id}`] }),
   verify: async () => ({ passed: true, evidenceRefs: ['fixture:contract-check-only'] }),
+  onCheckpoint: async () => {}, // Fixture only; production integrations must persist before dispatch.
 });
 console.log(JSON.stringify({ mode: 'dry-run-fixture', liveModelInvocations: 0, receipt }, null, 2));

@@ -32,11 +32,17 @@ means an implementer and verifier, with one correction attempt. Reads may overla
 writer scopes must be disjoint, including parent/child and case aliases.
 
 The caller provides admission, catalog, an execution `adapter`, a `verify`
-callback and optional AbortSignal/checkpoint callback. The adapter must honor
-AbortSignal and stop its own work; the library cannot forcibly stop remote jobs.
-Timeout stops scheduling, but is not proof of remote cancellation. The adapter
-must enforce actual filesystem scopes, permissions and tool grants; contract
-validation is not an OS sandbox. External effects require idempotency controls.
+callback and a required `onCheckpoint` writer. The writer must durably persist
+each snapshot before acknowledging it; the included demo deliberately uses a
+volatile fixture callback. A dispatch-intent checkpoint precedes every adapter
+call. The adapter receives a stable `idempotencyKey` for each task attempt and
+must bind it to external effects or reconcile those effects before retrying.
+The adapter must honor AbortSignal and stop its own work; the library cannot
+forcibly stop remote jobs. A timeout or unverified post-dispatch error returns
+`unknown`, retains the task's capacity claim in the receipt, and blocks checkpoint
+resume until an integration reconciles the effect. The adapter must enforce
+actual filesystem scopes, permissions and tool grants; contract validation is
+not an OS sandbox.
 
 Adapters report actual model/provider/runtime, artifact references and optional
 usage. Verifiers return `passed`, `evidenceRefs`, and failure `feedback`.
@@ -45,9 +51,10 @@ are trusted integration boundaries; provider strings are not cryptographic proof
 Hosts must bind them to actual invocation receipts before production use.
 
 Checkpoints bind the exact plan and policy. Resume re-verifies artifact existence
-and validity through the verifier before skipping work. Callers persist receipts
-privately and redact them before sharing. Missing usage stays null. Capability
-failure returns hold; execution failure preserves verified work for diagnosis.
+and validity through the verifier before skipping work. An unresolved dispatch
+cannot be resumed as a new invocation. Callers persist receipts privately and
+redact them before sharing. Missing usage stays null. Capability failure returns
+hold; execution failure preserves verified work for diagnosis.
 
 ## Leadership and adoption
 

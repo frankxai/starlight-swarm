@@ -4,15 +4,23 @@ import { digest, requireValue, selectModel, validatePlan } from './router.mjs';
 // Adapters own sandboxing, cooperative cancellation and artifact verification.
 export async function runPlan(plan, options) {
   validatePlan(plan);
-  const { catalog, presets, adapter, verify, signal, onCheckpoint = async () => {} } = options;
+  const { catalog, presets, adapter, verify, signal, onCheckpoint } = options;
   requireValue(typeof adapter === 'function' && typeof verify === 'function', 'Execution and verification adapters are required');
+  requireValue(typeof onCheckpoint === 'function', 'A checkpoint writer is required before execution');
   const admission = options.admission;
   requireValue(admission?.decision === 'allow' && Number.isInteger(admission.maxParallel) && admission.maxParallel >= 1, 'Execution admission is required');
   const concurrency = Math.min(2, admission.maxParallel);
   const timeoutMs = options.timeoutMs ?? 120_000;
   requireValue(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 900_000, 'Invalid task timeout');
   const planDigest = digest({ plan, policy: presets });
-  const receipt = { version: 1, planId: plan.id, planDigest, status: 'running', results: {}, events: [] };
+  const receipt = { version: 1, planId: plan.id, planDigest, status: 'running', results: {}, events: [], unresolvedTaskIds: [], capacityRetained: false };
+  let checkpointTail = Promise.resolve();
+  async function persist() {
+    const snapshot = structuredClone(receipt);
+    const write = checkpointTail.then(() => onCheckpoint(snapshot));
+    checkpointTail = write.catch(() => {});
+    await write;
+  }
   const now = options.now ?? Date.now();
   const selections = Object.fromEntries(plan.tasks.map(t => [t.id, selectModel(t.request, catalog, presets, { now })]));
   const holds = Object.entries(selections).filter(([, s]) => s.status === 'hold');
@@ -21,6 +29,10 @@ export async function runPlan(plan, options) {
     const old = options.checkpoint;
     requireValue(old.version === 1 && old.planDigest === planDigest, 'Checkpoint does not match plan and policy');
     requireValue(old.results && typeof old.results === 'object' && !Array.isArray(old.results), 'Malformed checkpoint');
+    requireValue(Array.isArray(old.events), 'Malformed checkpoint events');
+    const unresolved = old.events.filter(event => event.phase === 'dispatch_intent' && !old.results[event.taskId] &&
+      !old.events.some(other => other.phase === 'not_started' && other.taskId === event.taskId && other.attempt === event.attempt));
+    requireValue(unresolved.length === 0 && !old.capacityRetained, 'Checkpoint has unresolved execution; reconcile before resume');
     for (const [id, result] of Object.entries(old.results)) {
       const task = plan.tasks.find(t => t.id === id);
       requireValue(task && result.status === 'verified' && result.selection.model === selections[id].model && result.selection.effort === selections[id].effort && result.selection.provider === selections[id].provider && result.selection.runtime === selections[id].runtime, 'Checkpoint task or selection changed');
@@ -42,6 +54,7 @@ export async function runPlan(plan, options) {
     controller.signal.addEventListener('abort', cancel, { once: true });
     if (controller.signal.aborted) cancel();
     let timer;
+    let dispatched = false;
     try {
       const work = async () => {
         let feedback;
@@ -50,13 +63,23 @@ export async function runPlan(plan, options) {
           child.signal.throwIfAborted();
           const input = { selection: selected, signal: child.signal, attempt, feedback,
             dependencies: Object.fromEntries(task.dependsOn.map(id => [id, receipt.results[id].output])) };
-          const output = await adapter(structuredClone(task), input);
+          const idempotencyKey = digest({ planDigest, taskId: task.id, attempt });
+          receipt.events.push({ taskId: task.id, attempt, phase: 'dispatch_intent', idempotencyKey, selection: selected });
+          try {
+            await persist();
+          } catch (error) {
+            receipt.events.push({ taskId: task.id, attempt, phase: 'not_started', reason: 'Dispatch intent was not persisted' });
+            throw error;
+          }
+          child.signal.throwIfAborted();
+          dispatched = true;
+          const output = await adapter(structuredClone(task), { ...input, idempotencyKey });
           child.signal.throwIfAborted();
           requireValue(output?.model === selected.model && output.provider === selected.provider && output.runtime === selected.runtime, 'Adapter reported a different model/provider/runtime');
           requireValue(Array.isArray(output.artifacts) && output.artifacts.length > 0 && output.artifacts.every(a => typeof a === 'string' && a.length), 'Adapter must return artifact references');
           const checked = await verify(task, output, { resumed: false, attempt, signal: child.signal });
           child.signal.throwIfAborted();
-          receipt.events.push({ taskId: task.id, attempt, usage: output.usage ?? null, verified: checked?.passed === true });
+          receipt.events.push({ taskId: task.id, attempt, phase: 'verification', usage: output.usage ?? null, verified: checked?.passed === true });
           if (checked?.passed === true) {
             assertVerified(task, checked, output.provider);
             return { status: 'verified', selection: selected, output, verification: checked, attempts: attempt, elapsedMs: Date.now() - started };
@@ -71,6 +94,16 @@ export async function runPlan(plan, options) {
         timer = setTimeout(() => child.abort(new Error('Task timeout; adapter must stop owned work')), timeoutMs);
       });
       return await Promise.race([work(), stopped]);
+    } catch (error) {
+      if (dispatched) {
+        receipt.events.push({ taskId: task.id, phase: 'unknown_execution', reason: error instanceof Error ? error.message : String(error) });
+        if (!receipt.unresolvedTaskIds.includes(task.id)) receipt.unresolvedTaskIds.push(task.id);
+        receipt.capacityRetained = true;
+        const unresolved = error instanceof Error ? error : new Error(String(error));
+        unresolved.executionUnknown = true;
+        throw unresolved;
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
       controller.signal.removeEventListener('abort', cancel);
@@ -89,17 +122,17 @@ export async function runPlan(plan, options) {
         else error ??= o.reason;
       });
       if (error) throw error;
-      await onCheckpoint(structuredClone(receipt));
+      await persist();
     }
     receipt.status = 'complete';
   } catch (error) {
     controller.abort(error);
-    receipt.status = signal?.aborted ? 'cancelled' : 'failed';
+    receipt.status = receipt.capacityRetained ? 'unknown' : signal?.aborted ? 'cancelled' : 'failed';
     receipt.error = error instanceof Error ? error.message : String(error);
   } finally {
     signal?.removeEventListener('abort', abort);
   }
-  await onCheckpoint(structuredClone(receipt));
+  await persist();
   return receipt;
 }
 
