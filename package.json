@@ -14,7 +14,9 @@
     "runtime:assess": "tsx scripts/assess-team-runtime.ts",
     "runtime:pack": "tsx scripts/compile-team-pack.ts",
     "runtime:pack:verify": "tsx scripts/verify-team-pack.ts",
-    "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts"
+    "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts",
+    "orchestration:test": "node --test src/swarm/orchestration/orchestration.test.mjs",
+    "orchestration:demo": "node src/swarm/orchestration/demo.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",
