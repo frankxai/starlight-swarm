@@ -1,5 +1,7 @@
 # God Mode Model Router Spec v1
 
+> **See also:** [MODEL-ARCHITECTURE-CAPABILITY-DISPATCH.md](./MODEL-ARCHITECTURE-CAPABILITY-DISPATCH.md) — Wave 2 capability-checked orchestration patterns from [PR #27](https://github.com/frankxai/starlight-swarm/pull/27). All presets remain provisional; no production promotion without human gates (Queen/Frank).
+
 **Purpose**: Eliminate single-model fragility. Every Queen/lane must declare primary + fallbacks. Runtime selects intelligently and reports exactly what ran.
 
 **Location in architecture**: Called by SO / Queen coordinators before launching any specialist swarm or campaign lane. Output is recorded in receipts and state.
