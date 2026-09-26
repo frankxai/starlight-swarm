@@ -30,7 +30,7 @@
 > human holds the last line. The orchestration *contract*, in typed TypeScript —
 > never wired to live funds.
 
-![Status](https://img.shields.io/badge/status-v0.3_dry--run_only-f59e0b?style=for-the-badge&labelColor=0d1117)
+![Status](https://img.shields.io/badge/status-v0.4_kernel_observatory-f59e0b?style=for-the-badge&labelColor=0d1117)
 ![Layer](https://img.shields.io/badge/layer-L6_Swarm_Runtime-7fffd4?style=for-the-badge&labelColor=0d1117)
 ![Safety](https://img.shields.io/badge/money_movement-none_by_design-c084fc?style=for-the-badge&labelColor=0d1117)
 [![Built on SIP](https://img.shields.io/badge/Built_on-SIP-78a6ff?style=for-the-badge&labelColor=0d1117)](https://github.com/frankxai/Starlight-Intelligence-System)
@@ -52,7 +52,31 @@
 
 ## ⚠️ Status
 
-**v0.3 — benevolence charter wired into the queen tier (still dry-run only).**
+**v0.4 — kernel observatory. Still dry-run only. Not admitted. No live funds.**
+
+This repo is the **canonical L6 runtime**, not a 50-repo merge. Adjacent Starlight
+products stay in their own remotes and are pinned here as contracts. Open swarm
+research (Ruflo, oh-my-openagent, OpenAI Swarm, OpenFang) is absorbed as
+**attributed patterns** with an explicit refuse line — never as a second Queen.
+
+| Demand | State |
+|---|---|
+| One canonical L6 | this repo |
+| Estate monorepo | **rejected** |
+| Transfer tool | **none** |
+| Admission | report-only, `admitted: false` |
+| SIS Gateway / activation / actualization | **open** (issues #10, #15, #18) |
+
+Operator view: [`/swarm`](src/pages/swarm.tsx) · criteria: [`docs/SUCCESS-CRITERIA.md`](docs/SUCCESS-CRITERIA.md) · pin: [`docs/ECOSYSTEM-KERNEL.md`](docs/ECOSYSTEM-KERNEL.md) · public surface: [`src/swarm/contracts.ts`](src/swarm/contracts.ts)
+
+<details>
+<summary><strong>Kernel map</strong></summary>
+<p align="center">
+  <img src="assets/github/kernel-map.svg" alt="Starlight Swarm kernel pin — contracts, not a monorepo" width="100%">
+</p>
+</details>
+
+**v0.3** wired the benevolence charter into the queen tier (still dry-run only).
 
 What v0.3 adds: an executable [benevolence charter](#benevolence-charter) — six non-waivable
 clauses that run as a second, independent read on every proposal. It can raise a gate and never
@@ -235,22 +259,24 @@ To spawn a Queen for your own vertical, business, or team, follow
 
 ```
 src/swarm/
+  contracts.ts     public export surface other repos should import
+  kernel.ts        adjacent-product pin (no monorepo)
+  absorption.ts    attributed research ledger (Ruflo, omo, Swarm, …)
+  success-criteria.ts  highest demands, checkable
+  observatory.ts   read-only snapshot for /swarm
   streams.ts       4 income streams + queens + workers as typed config
   queen.ts         Queen class — owns workers, runs a loop step, act-vs-escalate
   worker.ts        Worker interface — one job, append-only memory, never self-gates
   escalation.ts    classify(action) → autonomous | queen-gate | founder-board | human-gate
   charter.ts       checkCharter(action, ctx) → the six benevolence clauses, raise-only
   integrations.ts  MCP integration: SIS sis_* stubs + REAL payments-MCP adapter (verify-only, fail-closed)
-  index.ts         the dry-run: prints the tree + escalation path + charter reads + a real payments-MCP round-trip
-  escalation.test.ts    full-branch tests for the safety spine (incl. fail-closed)
-  queen.test.ts         worker-guard + act-vs-escalate routing tests
-  charter.test.ts       monotonicity + fail-closed + ledger refusals + actionability
-  integrations.test.ts  payments-MCP adapter wire shape + fail-closed + queen↔adapter tests
+  index.ts         dry-run: tree + kernel pin + escalation + charter + payments-MCP
 src/pages/
-  swarm.tsx        cockpit page rendering the stream → queen → worker tree + legend
+  swarm.tsx        Kernel Observatory — hold state, pins, streams, absorption
+docs/SUCCESS-CRITERIA.md     the demands that count as "best"
+docs/ECOSYSTEM-KERNEL.md     current wiring (replaces the stale June slice)
 docs/SWARM-ARCHITECTURE.md   the architecture narrative
 docs/QUEEN-CHARTER.md        how to spawn a Queen for a vertical, business, or team
-local-cockpit.html           static operator console (now includes the swarm tree)
 ```
 
 ---
@@ -261,7 +287,8 @@ local-cockpit.html           static operator console (now includes the swarm tre
 
 ```bash
 npm install
-npm run swarm:dry-run    # founder→queen→worker tree + escalation ladder + per-queen loop step + real payments-MCP round-trip
+npm run swarm:dry-run    # tree + kernel pin + absorbed research + escalation + charter + payments-MCP
+npm run swarm:kernel     # JSON observatory snapshot (report-only)
 npm run typecheck        # tsc --noEmit
 npm test                 # tsc --noEmit && node --test --import tsx src/swarm/*.test.ts
 npm run build            # next build (cockpit)

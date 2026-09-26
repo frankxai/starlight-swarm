@@ -8,8 +8,8 @@
  *   3. demonstrates the full escalation ladder (autonomous → queen-gate →
  *      founder-board → human-gate) WITHOUT firing any real action.
  *
- * ⚠️ v0.1 SCAFFOLD — DRY-RUN ONLY. No real action fires. No money moves.
- * MCP integration points are referenced via dry-run stubs (integrations.ts).
+ * ⚠️ v0.4 KERNEL OBSERVATORY — DRY-RUN ONLY. No real action fires. No money moves.
+ * Prints the kernel pin, absorbed research, and checked-in admission blockers.
  *
  * Run:  npm run swarm:dry-run   (tsx)  ·  or  npx tsx src/swarm/index.ts
  */
@@ -22,6 +22,7 @@ import { classify } from './escalation';
 import { BENEVOLENCE_CHARTER, checkCharter, explain, raiseTo } from './charter';
 import type { CharterContext } from './charter';
 import { makeDryRunVault, makeDryRunPayments, connectRealPayments } from './integrations';
+import { observatorySnapshot } from './observatory';
 import { resolve } from 'node:path';
 
 const out = (m = '') => console.log(m);
@@ -50,7 +51,7 @@ function action(stream: StreamId, partial: Partial<Action> & Pick<Action, 'kind'
 function printTree(): void {
   const tree = swarmTree();
   out('═══════════════════════════════════════════════════════════════');
-  out('  STARLIGHT SWARM — L6 Runtime (dry-run)  ·  hybrid queens-per-stream');
+  out('  STARLIGHT SWARM — L6 Kernel Observatory (dry-run)');
   out('═══════════════════════════════════════════════════════════════');
   out('');
   out(`  FOUNDER  ${tree.founder.name}   [gate: ${tree.founder.gate}]`);
@@ -218,8 +219,49 @@ async function demoRealPaymentsMcp(): Promise<void> {
   out('');
 }
 
+function printKernelObservatory(): void {
+  const snap = observatorySnapshot();
+  out('───────────────────────────────────────────────────────────────');
+  out('  KERNEL PIN (adjacent products — contracts, not a monorepo)');
+  out('───────────────────────────────────────────────────────────────');
+  out(`  version ${snap.version}  ·  admitted=${snap.admitted}  ·  ${snap.criteria.headline}`);
+  out('');
+  out('  Kernel ring:');
+  for (const m of snap.kernel.kernel) {
+    out(`    • [${m.layer}] ${m.repo}  posture=${m.posture}  evidence=${m.evidence}`);
+    out(`        ${m.role}`);
+  }
+  out('');
+  out('  Satellites (consume, do not merge):');
+  for (const m of snap.kernel.satellites) {
+    out(`    • ${m.repo}  (${m.posture})`);
+  }
+  out('');
+  out('  Deprecated:');
+  for (const m of snap.kernel.deprecated) {
+    out(`    • ${m.repo} — ${m.role}`);
+  }
+  out('');
+  out('  Absorbed research (attributed; refuse lines hold):');
+  for (const p of snap.absorbed.items) {
+    out(`    • ${p.id}  ← ${p.source}  → ${p.mapsTo}  [${p.disposition}]`);
+  }
+  out('');
+  out('  Admission blockers (unknown stays unknown):');
+  for (const b of snap.admission.blockers) {
+    out(`    • ${b}`);
+  }
+  out('');
+  out('  Open success criteria:');
+  for (const c of snap.criteria.items.filter((row) => row.status === 'open')) {
+    out(`    • ${c.id}  ${c.demand}`);
+  }
+  out('');
+}
+
 async function main(): Promise<void> {
   printTree();
+  printKernelObservatory();
   demoEscalationLadder();
   demoCharter();
   await runLoopSteps();

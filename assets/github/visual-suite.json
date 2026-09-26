@@ -8,6 +8,7 @@
     "header": "assets/github/header.svg",
     "howItWorks": "assets/github/how-it-works.svg",
     "buildDeployVerify": "assets/github/build-deploy-verify.svg",
+    "kernelMap": "assets/github/kernel-map.svg",
     "visualSuite": "assets/github/visual-suite.json"
   },
   "mapping": {
