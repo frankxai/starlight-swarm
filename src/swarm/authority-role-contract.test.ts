@@ -7,16 +7,70 @@ import {
   attestBrokerDatabaseSession,
   brokerDatabaseRoleGrantSql,
   BROKER_DATABASE_ROLE_CONTRACT_SHA256,
+  attestUsageEvidenceDatabaseSession,
+  usageEvidenceDatabaseRoleGrantSql,
+  usageAuthorityRoutineOwnerGrantSql,
+  attestRemoteStopDatabaseSession,
+  remoteStopAuthorityRoutineOwnerGrantSql,
+  remoteStopDatabaseRoleGrantSql,
 } from './authority-role-contract';
 import { OPERATION_AUTHORITY_MIGRATION_SQL } from './postgres-operation-authority';
 
 async function restrictedDatabase(extra = '') {
   const db = new PGlite();
   await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
-  await db.exec(`CREATE ROLE starlight_broker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+  await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_broker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     ${brokerDatabaseRoleGrantSql('starlight_broker')}
     ${extra}
     SET SESSION AUTHORIZATION starlight_broker;`);
+  return db;
+}
+
+async function restrictedUsageDatabase(extra = '') {
+  const db = new PGlite();
+  await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
+  // PGlite omits the initdb-time information_schema relation ACL baselines that
+  // PostgreSQL records in pg_init_privs. Seed only this clean, ephemeral test
+  // catalog so production attestation can remain fail-closed when they are absent.
+  await db.exec(`INSERT INTO pg_init_privs (objoid,classoid,objsubid,privtype,initprivs)
+    SELECT c.oid,'pg_class'::regclass,0,'i',c.relacl
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='information_schema' AND c.relacl IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_init_privs initial
+        WHERE initial.objoid=c.oid AND initial.classoid='pg_class'::regclass
+          AND initial.objsubid=0
+      );`);
+  await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_usage_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
+    ${usageEvidenceDatabaseRoleGrantSql('starlight_usage_verifier')}
+    ${extra}
+    SET SESSION AUTHORIZATION starlight_usage_verifier;`);
+  return db;
+}
+
+async function restrictedRemoteStopDatabase(extra = '') {
+  const db = new PGlite();
+  await db.exec(OPERATION_AUTHORITY_MIGRATION_SQL);
+  await db.exec(`INSERT INTO pg_init_privs (objoid,classoid,objsubid,privtype,initprivs)
+    SELECT c.oid,'pg_class'::regclass,0,'i',c.relacl
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='information_schema' AND c.relacl IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM pg_init_privs initial
+        WHERE initial.objoid=c.oid AND initial.classoid='pg_class'::regclass AND initial.objsubid=0);`);
+  await db.exec(`CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+    CREATE ROLE starlight_remote_stop_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${remoteStopAuthorityRoutineOwnerGrantSql('starlight_remote_stop_owner')}
+    CREATE ROLE starlight_remote_stop_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
+    ${remoteStopDatabaseRoleGrantSql('starlight_remote_stop_verifier')}
+    ${extra}
+    SET SESSION AUTHORIZATION starlight_remote_stop_verifier;`);
   return db;
 }
 
@@ -24,7 +78,7 @@ test('attests one direct-login broker role with only the exact redemption grants
   const db = await restrictedDatabase();
   try {
     const result = await attestBrokerDatabaseSession(db);
-    assert.equal(result.valid, true);
+    assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
     if (!result.valid) return;
     assert.equal(result.session.database_role, 'starlight_broker');
     assert.equal(result.session.contract_digest_sha256, BROKER_DATABASE_ROLE_CONTRACT_SHA256);
@@ -93,10 +147,66 @@ test('rejects superuser posture and role-name injection in grant generation', as
   } finally { await db.close(); }
 });
 
+test('rejects usage routine body, ownership, and PUBLIC execution drift', async (t) => {
+  await t.test('body replacement', async () => {
+    const db = await restrictedDatabase(`CREATE OR REPLACE FUNCTION public.starlight_append_runner_usage_evidence(jsonb)
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+      AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`);
+    try {
+      const result = await attestBrokerDatabaseSession(db);
+      assert.equal(result.valid, false);
+      assert.match(result.blockers.join(' '), /missing, drifted/i);
+    } finally { await db.close(); }
+  });
+  await t.test('broker ownership', async () => {
+    const db = await restrictedDatabase(
+      'ALTER FUNCTION public.starlight_append_runner_usage_evidence(jsonb) OWNER TO starlight_broker;',
+    );
+    try {
+      const result = await attestBrokerDatabaseSession(db);
+      assert.equal(result.valid, false);
+      assert.match(result.blockers.join(' '), /unsafely owned/i);
+    } finally { await db.close(); }
+  });
+  await t.test('PUBLIC execute', async () => {
+    const db = await restrictedDatabase(
+      'GRANT EXECUTE ON FUNCTION public.starlight_append_runner_usage_evidence(jsonb) TO PUBLIC;',
+    );
+    try {
+      const result = await attestBrokerDatabaseSession(db);
+      assert.equal(result.valid, false);
+      assert.match(result.blockers.join(' '), /publicly executable/i);
+    } finally { await db.close(); }
+  });
+  await t.test('inbound owner membership', async () => {
+    const db = await restrictedDatabase(
+      'CREATE ROLE attacker LOGIN; GRANT starlight_authority_owner TO attacker;',
+    );
+    try {
+      const result = await attestBrokerDatabaseSession(db);
+      assert.equal(result.valid, false);
+      assert.match(result.blockers.join(' '), /unsafely owned/i);
+    } finally { await db.close(); }
+  });
+  await t.test('owner-held overload', async () => {
+    const db = await restrictedDatabase(`CREATE FUNCTION public.starlight_append_runner_usage_evidence(text)
+      RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
+      ALTER FUNCTION public.starlight_append_runner_usage_evidence(text) OWNER TO starlight_authority_owner;
+      REVOKE ALL ON FUNCTION public.starlight_append_runner_usage_evidence(text) FROM PUBLIC;`);
+    try {
+      const result = await attestBrokerDatabaseSession(db);
+      assert.equal(result.valid, false);
+      assert.match(result.blockers.join(' '), /unsafely owned/i);
+    } finally { await db.close(); }
+  });
+});
+
 test('the restricted role can execute the redemption SQL surface but not control-plane or unrelated access', async () => {
   const db = new PGlite();
   await db.exec(`${OPERATION_AUTHORITY_MIGRATION_SQL}
     CREATE TABLE unrelated_private_sentinel (value TEXT);
+    CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
     CREATE ROLE starlight_broker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
     ${brokerDatabaseRoleGrantSql('starlight_broker')}
     SET SESSION AUTHORIZATION starlight_broker;`);
@@ -139,9 +249,292 @@ test('the restricted role can execute the redemption SQL surface but not control
           '00000000-0000-4000-8000-000000000002',clock_timestamp(),'claim');
       ROLLBACK;`);
     await assert.rejects(
+      db.query(`INSERT INTO swarm_authority_usage_tokens
+        (token_sha256,reservation_id,sequence,issued_by_request_id,issued_at,kind)
+        VALUES (repeat('a',64),'00000000-0000-4000-8000-000000000001',0,
+          '00000000-0000-4000-8000-000000000002',clock_timestamp(),'claim')`),
+      /permission denied/i,
+    );
+    await assert.rejects(
+      db.query(`UPDATE swarm_authority_reservations
+        SET usage_reconciliation_token_sha256=repeat('b',64) WHERE FALSE`),
+      /permission denied/i,
+    );
+    await assert.rejects(
+      db.query(`SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb)`),
+      /permission denied/i,
+    );
+    await assert.rejects(
+      db.query(`INSERT INTO swarm_authority_usage_evidence
+        (usage_evidence_id,usage_request_id,usage_sequence,provider_event_id,reservation_id,claim_id,outcome_id,
+         operation_id,effect_id,binding_digest_sha256,provider_id,provider_account_ref,
+         provider_usage_correlation_id,meter_id,evidence_ref,evidence_sha256,usage_started_at,usage_ended_at,
+         statement_status,statement_finalized_at,evidence_observed_at,accepted_at,currency,cumulative_cost_usd,
+         authorized_cost_usd,budget_breach_observed,presented_token_sha256,next_token_sha256,issuer,key_id,authn_kind)
+        VALUES ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002',1,
+         '00000000-0000-4000-8000-000000000003','00000000-0000-4000-8000-000000000004',
+         '00000000-0000-4000-8000-000000000005','00000000-0000-4000-8000-000000000006','op','effect',
+         repeat('0',64),'provider','account','correlation','meter','ref',repeat('1',64),clock_timestamp(),
+         clock_timestamp(),'final',clock_timestamp(),clock_timestamp(),clock_timestamp(),'USD',0,0,FALSE,
+         repeat('2',64),repeat('3',64),'issuer','key','provider-signed-statement')`),
+      /permission denied/i,
+    );
+    await assert.rejects(
       db.query("UPDATE swarm_authority_prepared_operations SET state='cancelled'"),
       /permission denied/i,
     );
     await assert.rejects(db.query('SELECT * FROM unrelated_private_sentinel'), /permission denied/i);
   } finally { await db.close(); }
+});
+
+test('attests a separate no-table-access provider verifier role', async () => {
+  const db = await restrictedUsageDatabase();
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
+    await assert.rejects(db.query('SELECT * FROM swarm_authority_reservations'), /permission denied/i);
+    await assert.rejects(
+      db.query(`SELECT public.starlight_record_usage_refusal('{}'::jsonb,'forged')`),
+      /permission denied/i,
+    );
+    const invalid = await db.query<{ result: { ok: boolean; blocker: string; audited: boolean } }>(
+      `SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb) AS result`,
+    );
+    assert.equal(invalid.rows[0]?.result.ok, false);
+    assert.equal(invalid.rows[0]?.result.audited, true);
+    assert.match(invalid.rows[0]?.result.blocker ?? '', /input is invalid/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects executable authority in another user schema', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE SCHEMA verifier_escape;
+    CREATE FUNCTION verifier_escape.unreviewed() RETURNS BOOLEAN LANGUAGE sql SECURITY DEFINER
+      AS 'SELECT TRUE';
+    GRANT USAGE ON SCHEMA verifier_escape TO starlight_usage_verifier;
+    GRANT EXECUTE ON FUNCTION verifier_escape.unreviewed() TO starlight_usage_verifier;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /schemas outside the public verifier boundary/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects non-default system-routine execution authority', async () => {
+  const db = await restrictedUsageDatabase(`
+    GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO starlight_usage_verifier;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /non-default system-routine execution authority/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects a PUBLIC grant restored on an initially restricted system routine', async () => {
+  const db = await restrictedUsageDatabase(`
+    GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /non-default system-routine execution authority/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier rejects CREATE authority in representative system schemas', async (t) => {
+  const probes = [
+    ['pg_catalog direct', 'GRANT CREATE ON SCHEMA pg_catalog TO starlight_usage_verifier'],
+    ['information_schema direct', 'GRANT CREATE ON SCHEMA information_schema TO starlight_usage_verifier'],
+    ['pg_toast direct', 'GRANT CREATE ON SCHEMA pg_toast TO starlight_usage_verifier'],
+    ['pg_toast PUBLIC-derived', 'GRANT CREATE ON SCHEMA pg_toast TO PUBLIC'],
+  ] as const;
+  for (const [name, mutation] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(`${mutation};`);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), /must not access schemas outside the public verifier boundary/i);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('provider verifier rejects non-default system relation, column, and sequence authority', async (t) => {
+  const probes = [
+    ['direct relation', 'GRANT SELECT ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-relation or sequence authority/i],
+    ['PUBLIC relation', 'GRANT SELECT ON pg_catalog.pg_authid TO PUBLIC',
+      /non-default system-relation or sequence authority/i],
+    ['direct relation grant option',
+      'GRANT SELECT ON pg_catalog.pg_authid TO starlight_usage_verifier WITH GRANT OPTION',
+      /non-default system-relation or sequence authority/i],
+    ['system relation MAINTAIN', 'GRANT MAINTAIN ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-relation or sequence authority/i],
+    ['direct column', 'GRANT SELECT (rolpassword) ON pg_catalog.pg_authid TO starlight_usage_verifier',
+      /non-default system-column authority/i],
+    ['system sequence', `CREATE SEQUENCE pg_catalog.starlight_verifier_escape_seq;
+      GRANT USAGE ON SEQUENCE pg_catalog.starlight_verifier_escape_seq TO starlight_usage_verifier`,
+      /non-default system-relation or sequence authority/i],
+    ['TOAST relation', 'GRANT SELECT ON pg_toast.pg_toast_1255 TO PUBLIC',
+      /non-default system-relation or sequence authority/i],
+    ['new information_schema view', `CREATE VIEW information_schema.starlight_verifier_leak
+        AS SELECT rolpassword FROM pg_catalog.pg_authid;
+      GRANT SELECT ON information_schema.starlight_verifier_leak TO PUBLIC`,
+      /non-default system-relation or sequence authority/i],
+  ] as const;
+  for (const [name, mutation, expected] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(`${mutation};`);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), expected);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('provider verifier rejects MAINTAIN authority on public tables', async () => {
+  const db = await restrictedUsageDatabase(
+    'GRANT MAINTAIN ON swarm_authority_reservations TO starlight_usage_verifier;',
+  );
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /no authority-table privileges/i);
+  } finally { await db.close(); }
+});
+
+test('append routine itself rejects an additional executable grantee', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE ROLE starlight_rogue_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    GRANT USAGE ON SCHEMA public TO starlight_rogue_verifier;
+    GRANT EXECUTE ON FUNCTION public.starlight_append_runner_usage_evidence(jsonb)
+      TO starlight_rogue_verifier;
+  `);
+  try {
+    await db.exec('RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION starlight_rogue_verifier;');
+    const refused = await db.query<{ result: { ok: boolean; blocker: string; audited: boolean } }>(
+      `SELECT public.starlight_append_runner_usage_evidence('{}'::jsonb) AS result`,
+    );
+    assert.equal(refused.rows[0]?.result.ok, false);
+    assert.equal(refused.rows[0]?.result.audited, true);
+    assert.match(refused.rows[0]?.result.blocker ?? '', /one sole non-grantable verifier/i);
+  } finally { await db.close(); }
+});
+
+test('provider verifier attestation rejects transitive refusal-helper drift', async (t) => {
+  const probes = [
+    ['body', `CREATE OR REPLACE FUNCTION public.starlight_record_usage_refusal(jsonb,text)
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+      AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`],
+    ['owner', 'ALTER FUNCTION public.starlight_record_usage_refusal(jsonb,text) OWNER TO starlight_usage_verifier;'],
+    ['PUBLIC execute', 'GRANT EXECUTE ON FUNCTION public.starlight_record_usage_refusal(jsonb,text) TO PUBLIC;'],
+    ['extra append grantee', `CREATE ROLE starlight_rogue_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+      GRANT EXECUTE ON FUNCTION public.starlight_append_runner_usage_evidence(jsonb)
+        TO starlight_rogue_verifier;`],
+    ['verifier grant option', `GRANT EXECUTE ON FUNCTION
+      public.starlight_append_runner_usage_evidence(jsonb) TO starlight_usage_verifier WITH GRANT OPTION;`],
+    ['owner-held overload', `CREATE FUNCTION public.starlight_record_usage_refusal(text,text)
+      RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
+      ALTER FUNCTION public.starlight_record_usage_refusal(text,text) OWNER TO starlight_authority_owner;
+      REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(text,text) FROM PUBLIC;`],
+  ] as const;
+  for (const [name, mutation] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedUsageDatabase(mutation);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), /usage authority routine|routine grants/i);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('provider verifier requires only the exact append/refusal surface with one safe owner', async () => {
+  const db = await restrictedUsageDatabase(`
+    CREATE ROLE starlight_refusal_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    CREATE ROLE starlight_overload_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+      NOREPLICATION NOBYPASSRLS NOINHERIT;
+    ALTER FUNCTION public.starlight_record_usage_refusal(jsonb,text) OWNER TO starlight_refusal_owner;
+    REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(jsonb,text) FROM PUBLIC;
+    CREATE FUNCTION public.starlight_record_usage_refusal(text,text)
+      RETURNS jsonb LANGUAGE sql AS 'SELECT ''{}''::jsonb';
+    ALTER FUNCTION public.starlight_record_usage_refusal(text,text) OWNER TO starlight_overload_owner;
+    REVOKE ALL ON FUNCTION public.starlight_record_usage_refusal(text,text) FROM PUBLIC;
+  `);
+  try {
+    const result = await attestUsageEvidenceDatabaseSession(db);
+    assert.equal(result.valid, false);
+    assert.match(result.blockers.join(' '), /exactly the append and refusal routines/i);
+    assert.match(result.blockers.join(' '), /append and refusal routines must share one safe owner/i);
+  } finally { await db.close(); }
+});
+
+test('rejects every direct or PUBLIC column grant on the provider verifier', async (t) => {
+  const probes = [
+    ['column SELECT', 'GRANT SELECT (binding_digest_sha256) ON swarm_authority_reservations TO starlight_usage_verifier'],
+    ['column INSERT', 'GRANT INSERT (usage_evidence_id) ON swarm_authority_usage_evidence TO starlight_usage_verifier'],
+    ['column UPDATE', 'GRANT UPDATE (usage_reconciliation_token_sha256) ON swarm_authority_reservations TO starlight_usage_verifier'],
+    ['PUBLIC column UPDATE', 'GRANT UPDATE (provider_usage_correlation_id) ON swarm_authority_reservations TO PUBLIC'],
+  ] as const;
+  for (const [name, grant] of probes) {
+    await t.test(name, async () => {
+      const db = new PGlite();
+      await db.exec(`${OPERATION_AUTHORITY_MIGRATION_SQL}
+        CREATE ROLE starlight_authority_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+        ${usageAuthorityRoutineOwnerGrantSql('starlight_authority_owner')}
+        CREATE ROLE starlight_usage_verifier LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+        REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;
+        ${usageEvidenceDatabaseRoleGrantSql('starlight_usage_verifier')}
+        ${grant};
+        SET SESSION AUTHORIZATION starlight_usage_verifier;`);
+      try {
+        const result = await attestUsageEvidenceDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), /column privileges/i);
+      } finally { await db.close(); }
+    });
+  }
+});
+
+test('attests the isolated remote-stop verifier and its separate safe owner', async () => {
+  const db = await restrictedRemoteStopDatabase();
+  try {
+    const result = await attestRemoteStopDatabaseSession(db);
+    assert.equal(result.valid, true, result.valid ? undefined : result.blockers.join(' '));
+  } finally { await db.close(); }
+});
+
+test('remote-stop verifier rejects system, column, schema, and owner authority drift', async (t) => {
+  const probes = [
+    ['system relation', 'GRANT SELECT ON pg_catalog.pg_authid TO starlight_remote_stop_verifier',
+      /system-relation or sequence authority/i],
+    ['public column', 'GRANT UPDATE (state) ON swarm_authority_reservations TO PUBLIC',
+      /authority-column privileges/i],
+    ['foreign schema', `CREATE SCHEMA starlight_escape;
+      GRANT USAGE ON SCHEMA starlight_escape TO starlight_remote_stop_verifier`,
+      /outside the public verifier boundary/i],
+    ['routine body', `CREATE OR REPLACE FUNCTION public.starlight_record_remote_stop_refusal(jsonb,text)
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog, public
+      AS 'BEGIN RETURN jsonb_build_object(''ok'',TRUE); END';`,
+      /authority routine/i],
+  ] as const;
+  for (const [name, mutation, expected] of probes) {
+    await t.test(name, async () => {
+      const db = await restrictedRemoteStopDatabase(`${mutation};`);
+      try {
+        const result = await attestRemoteStopDatabaseSession(db);
+        assert.equal(result.valid, false);
+        assert.match(result.blockers.join(' '), expected);
+      } finally { await db.close(); }
+    });
+  }
 });
