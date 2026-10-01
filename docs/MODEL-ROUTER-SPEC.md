@@ -1,3 +1,11 @@
+# Model routing: executable candidate
+
+The dependency-free [quality-first reference kit](../src/swarm/orchestration/README.md) implements capability-checked selection and five bounded patterns. GPT-6 presets remain provisional until the frozen live pilot passes. Existing runtime activation gates remain in force.
+
+The historical v1 proposal below is retained for provenance. Its model aliases, personality matches and heuristic scores are not verified availability or a production routing policy.
+
+---
+
 # God Mode Model Router Spec v1
 
 **Purpose**: Eliminate single-model fragility. Every Queen/lane must declare primary + fallbacks. Runtime selects intelligently and reports exactly what ran.
