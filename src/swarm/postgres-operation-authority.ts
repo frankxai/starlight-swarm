@@ -2135,7 +2135,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       );
       await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK');
+      try { await client.query('ROLLBACK'); } catch { /* Preserve the original unknown persistence outcome. */ }
       await this.recordIntegrityRefusal(client, operationId, bindingDigest, {
         action: 'cancel-prepared-operation', error: error instanceof Error ? error.message : 'unknown preparation cancellation failure',
       });
@@ -5499,7 +5499,10 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       await client.query('COMMIT');
       return { admitted: true, reservation, blockers: [] };
     } catch (error) {
-      await client.query('ROLLBACK');
+      try { await client.query('ROLLBACK'); } catch { /* Preserve the original unknown persistence outcome. */ }
+      await this.recordIntegrityRefusal(client, request.binding.operation_id, request.binding_digest_sha256, {
+        action: 'reserve', error: 'Reservation persistence did not complete.',
+      });
       throw error;
     } finally { client.release?.(); }
   }

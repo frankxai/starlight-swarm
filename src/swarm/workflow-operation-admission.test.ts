@@ -5,6 +5,7 @@ import { CloudflareWorkflowOperationAdmission } from './workflow-operation-admis
 import { bindCloudflareWorkflowOperation } from './workflow-operation-context';
 import { workflowOperationFixture } from './workflow-operation-test-fixtures';
 import { sha256Digest } from './runtime-digest';
+import type { AtomicAdmissionRequest } from './operation-authority';
 
 const digest = 'a'.repeat(64);
 const now = new Date().toISOString();
@@ -33,6 +34,23 @@ function sqlFixture(existing?: Record<string, unknown>, failAt?: string, breakRo
 test('rollback transport failure preserves the original unknown commit failure', async () => {
   const h = sqlFixture(undefined, 'COMMIT', true);
   await assert.rejects(() => h.store.registerPreparedOperation('operation-one', digest), /injected persistence failure/);
+  assert.equal(h.queries.at(-1), 'RELEASE');
+});
+test('prepared cancellation preserves the original commit failure when rollback also disconnects', async () => {
+  const h = sqlFixture({ operation_id: 'operation-one', binding_digest_sha256: digest, registered_at: now, state: 'ready' }, 'COMMIT', true);
+  await assert.rejects(() => h.store.cancelPreparedOperation('operation-one'), /injected persistence failure/);
+  assert.equal(h.queries.at(-1), 'RELEASE');
+});
+test('reservation persistence failure survives a failed rollback and never returns authority', async () => {
+  const h = sqlFixture(undefined, 'FROM swarm_authority_revocations', true);
+  const operation = bound();
+  const authorityReceipt = { receipt_id: 'test-receipt', issuer: 'test-issuer', key_id: 'test-key', expires_at: new Date(Date.now() + 60_000).toISOString() };
+  const request: AtomicAdmissionRequest = { reservation_id: '11111111-1111-4111-8111-111111111111',
+    now, reservation_expires_at: authorityReceipt.expires_at, consume_token: 'x'.repeat(43), consume_token_sha256: digest,
+    cancel_token: 'y'.repeat(43), cancel_token_sha256: 'b'.repeat(64), binding: operation.binding,
+    binding_digest_sha256: sha256Digest(operation.binding), approval: authorityReceipt,
+    budget: { ...authorityReceipt, hard_limit_usd: 1 }, max_host_evidence_age_ms: 1000 };
+  await assert.rejects(() => h.store.reserve(request), /injected persistence failure/);
   assert.equal(h.queries.at(-1), 'RELEASE');
 });
 
