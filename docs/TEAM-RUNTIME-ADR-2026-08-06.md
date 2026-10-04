@@ -36,7 +36,7 @@ authority/pilot work in [Swarm issue15](https://github.com/frankxai/starlight-sw
 
 ### Implemented state and migration boundary
 
-The current `starlight.runtime_plan.v1` planner, policy, schemas, adapters and
+The current `starlight.team_runtime_plan.v1` planner, policy, schemas, adapters and
 checked-in generated packs still encode `railway-temporal` and defer
 `cloudflare-agents`. They are historical, non-activating reference artifacts.
 Their presence, hashes and test results do not implement or approve the accepted
