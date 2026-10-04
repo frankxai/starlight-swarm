@@ -114,6 +114,9 @@
                   },
                   "durable_engine": {
                     "const": "cloudflare-workflows"
+                  },
+                  "binding": {
+                    "const": "STARLIGHT_WORKFLOW"
                   }
                 }
               },
@@ -127,6 +130,9 @@
                   },
                   "durable_engine": {
                     "const": "vercel-workflow"
+                  },
+                  "binding": {
+                    "const": "starlight-mission"
                   }
                 }
               }
@@ -363,7 +369,124 @@
           "required_secret_names",
           "runtime_config"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "runtime": {
+                  "const": "cloudflare-workflows"
+                }
+              },
+              "required": [
+                "runtime"
+              ]
+            },
+            "then": {
+              "properties": {
+                "runtime_config": {
+                  "properties": {
+                    "kind": {
+                      "const": "cloudflare-workflows"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "runtime": {
+                  "const": "vercel-workflow"
+                }
+              },
+              "required": [
+                "runtime"
+              ]
+            },
+            "then": {
+              "properties": {
+                "runtime_config": {
+                  "properties": {
+                    "kind": {
+                      "const": "vercel-workflow"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "runtime": {
+                  "const": "railway-worker"
+                }
+              },
+              "required": [
+                "runtime"
+              ]
+            },
+            "then": {
+              "properties": {
+                "runtime_config": {
+                  "properties": {
+                    "kind": {
+                      "const": "railway-worker"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "runtime": {
+                  "const": "hermes-local"
+                }
+              },
+              "required": [
+                "runtime"
+              ]
+            },
+            "then": {
+              "properties": {
+                "runtime_config": {
+                  "properties": {
+                    "kind": {
+                      "const": "hermes-local"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "runtime": {
+                  "const": "n8n-integration"
+                }
+              },
+              "required": [
+                "runtime"
+              ]
+            },
+            "then": {
+              "properties": {
+                "runtime_config": {
+                  "properties": {
+                    "kind": {
+                      "const": "n8n-integration"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
       },
       "uniqueItems": true
     },

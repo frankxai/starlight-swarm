@@ -19,7 +19,7 @@
         },
         "commit_sha": {
           "type": "string",
-          "pattern": "^[a-f0-9]{40}$"
+          "pattern": "^(?!0{40}$)[a-f0-9]{40}$"
         },
         "path": {
           "type": "string",
@@ -448,6 +448,13 @@
               "properties": {
                 "runtime": {
                   "const": "hermes-local"
+                },
+                "workload_contract": {
+                  "properties": {
+                    "always_available": {
+                      "const": false
+                    }
+                  }
                 }
               }
             }

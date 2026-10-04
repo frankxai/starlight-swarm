@@ -27,7 +27,7 @@
         },
         "commit_sha": {
           "type": "string",
-          "pattern": "^[a-f0-9]{40}$"
+          "pattern": "^(?!0{40}$)[a-f0-9]{40}$"
         },
         "path": {
           "type": "string",
