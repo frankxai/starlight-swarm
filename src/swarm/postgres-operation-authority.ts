@@ -90,6 +90,14 @@ const budgetWindowSchema = z.object({
 export type BudgetWindowRegistrationResult =
   | { registered: true; already_registered: boolean; blockers: [] }
   | { registered: false; already_registered: false; blockers: string[] };
+export type PreparedOperationRegistrationResult =
+  | { registered: true; already_registered: boolean; blockers: []; receipt: {
+    schema_version: 'starlight.prepared_operation_registration.v1';
+    operation_id: string; binding_digest_sha256: string;
+    registered_at: string; observed_at: string; state: 'ready';
+    execution_authority_granted: false;
+  } }
+  | { registered: false; already_registered: false; receipt: null; blockers: string[] };
 const revocationRefsSchema = z.array(z.string().min(5).max(500)).min(1).max(12);
 const hostEvidenceSchema = z.object({
   host_id: controlId,
@@ -1980,17 +1988,83 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
   }
 
   async putPreparedOperation(operationId: string, bindingDigestSha256: string, registeredAt: string): Promise<void> {
+    // Retain the old call shape, but never treat ON CONFLICT as successful registration.
+    // The database clock now owns registration time; caller timestamps are not authority.
+    controlTime.parse(registeredAt);
+    const result = await this.registerPreparedOperation(operationId, bindingDigestSha256);
+    if (!result.registered) throw new Error(result.blockers.join(' '));
+  }
+
+  /** Bootstrap/admin pool only. Registration is immutable data, never a lease or approval. */
+  async registerPreparedOperation(operationId: string, bindingDigestSha256: string, expiresAt?: string): Promise<PreparedOperationRegistrationResult> {
     controlId.parse(operationId);
     z.string().regex(/^[a-f0-9]{64}$/).parse(bindingDigestSha256);
-    controlTime.parse(registeredAt);
+    if (expiresAt !== undefined) controlTime.parse(expiresAt);
     const client = await this.pool.connect();
     try {
-      await client.query(
+      await client.query('BEGIN');
+      if (!await lockAuthority(client)) throw new Error('Authority serialization control row is missing or ambiguous.');
+      const observedAt = await wallClock(client);
+      if (expiresAt !== undefined && Date.parse(expiresAt) <= Date.parse(observedAt)) {
+        const blockers = ['Prepared operation registration deadline expired before the database lock was acquired.'];
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('prepared-operation-registration-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [operationId, bindingDigestSha256, observedAt, JSON.stringify({ blockers })],
+        );
+        await client.query('COMMIT');
+        return { registered: false, already_registered: false, receipt: null, blockers };
+      }
+      const inserted = await client.query(
         `INSERT INTO swarm_authority_prepared_operations
          (operation_id,binding_digest_sha256,registered_at,state) VALUES ($1,$2,$3::timestamptz,'ready')
-         ON CONFLICT (operation_id) DO NOTHING`,
-        [operationId, bindingDigestSha256, registeredAt],
+         ON CONFLICT (operation_id) DO NOTHING RETURNING operation_id`,
+        [operationId, bindingDigestSha256, observedAt],
       );
+      if (inserted.rows.length > 1 || (inserted.rows.length === 1 && inserted.rows[0].operation_id !== operationId)) {
+        throw new Error('Prepared operation insert returned an ambiguous identity.');
+      }
+      const readback = await client.query(
+        `SELECT operation_id,binding_digest_sha256,registered_at,state
+         FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE`, [operationId],
+      );
+      if (readback.rows.length !== 1 || readback.rows[0].operation_id !== operationId) {
+        throw new Error('Prepared operation registration readback is missing or ambiguous.');
+      }
+      const row = readback.rows[0];
+      const blockers: string[] = [];
+      if (row.binding_digest_sha256 !== bindingDigestSha256) blockers.push('Prepared operation binding is immutable and differs from the requested binding.');
+      if (row.state !== 'ready') blockers.push('Prepared operation is cancelled or has an invalid state.');
+      const registeredAt = sqlInstant(row.registered_at);
+      if (Date.parse(registeredAt) > Date.parse(observedAt)) blockers.push('Prepared operation registration is from the future.');
+      if (blockers.length) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('prepared-operation-registration-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [operationId, bindingDigestSha256, observedAt, JSON.stringify({ blockers })],
+        );
+        await client.query('COMMIT');
+        return { registered: false, already_registered: false, receipt: null, blockers };
+      }
+      if (inserted.rows.length === 1) {
+        await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('prepared-operation-registered',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [operationId, bindingDigestSha256, observedAt, JSON.stringify({ registered_at: registeredAt, execution_authority_granted: false })],
+        );
+      }
+      await client.query('COMMIT');
+      return { registered: true, already_registered: inserted.rows.length === 0, blockers: [], receipt: {
+        schema_version: 'starlight.prepared_operation_registration.v1', operation_id: operationId,
+        binding_digest_sha256: bindingDigestSha256, registered_at: registeredAt, observed_at: observedAt,
+        state: 'ready', execution_authority_granted: false,
+      } };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await this.recordIntegrityRefusal(client, operationId, bindingDigestSha256, {
+        action: 'register-prepared-operation', error: 'Prepared operation persistence did not complete.',
+      });
+      throw error;
     } finally { client.release?.(); }
   }
 
