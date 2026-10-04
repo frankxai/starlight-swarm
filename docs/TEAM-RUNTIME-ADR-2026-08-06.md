@@ -1,11 +1,69 @@
 # Starlight Team Runtime ADR
 
 **Date:** 2026-08-06
-**Status:** Proposed, implemented as a dry-run planner; deployment admission blocked
+**Status:** Superseded pending evidence; historical v1 dry-run planner retained, runtime migration and deployment admission blocked
 **Canonical repository:** `frankxai/starlight-swarm`
 **Decision owner:** Starlight Queen with explicit founder gates
 
-## Decision
+## Current durable execution decision, 4 October 2026
+
+The accepted portfolio registry governs new work. Its
+[`architecture_durable_execution_boundary`](https://github.com/frankxai/agentic-ops/blob/68bc808de3a3b8e33043e59ec43979dde5488623/registry/architecture_decisions.yaml)
+chooses the durable owner by workload:
+
+| Workload | Durable owner | Replaceable execution |
+|---|---|---|
+| Agent-centric or cross-service work whose durable identity/state lives in Cloudflare | Cloudflare Workflows, with Cloudflare Agents and SQLite-backed Durable Objects for persistent entity state when needed | Scoped workers or sandboxes admitted for the operation |
+| A job owned by one Vercel application | Vercel Workflows | App-owned steps and Vercel Sandbox where required |
+
+One workflow has one durable orchestrator. Temporal, trigger.dev and n8n are not
+backbones under this decision. Railway can host replaceable workers; it does not
+acquire durable mission authority by hosting them. Queen remains the policy and
+admission owner. The durable engine supplies execution history, waits and retries;
+it does not replace signed, revocable operation-time grants, budgets, leases,
+capability enforcement or independent kill/reconciliation paths. SIS/Postgres
+remains canonical memory and the durable approval/revocation authority where the
+existing contracts assign it that role.
+
+This corrects the Temporal recommendation below. The registry and
+[Starlight Cloud decisions D6/D17](https://github.com/frankxai/agentic-ops/blob/68bc808de3a3b8e33043e59ec43979dde5488623/docs/starlight-cloud/DECISIONS.md)
+are bound to inspected commit `68bc808de3a3b8e33043e59ec43979dde5488623`.
+Registry blob: `60d33d85111734abdf1da4851b0d5aba7bcc588d`.
+Reconsider this choice only after a named workload fails on both accepted engines
+with evidence. Track the correction in
+[Ops issue88](https://github.com/frankxai/agentic-ops/issues/88) and operation-time
+authority/pilot work in [Swarm issue15](https://github.com/frankxai/starlight-swarm/issues/15).
+
+### Implemented state and migration boundary
+
+The current `starlight.runtime_plan.v1` planner, policy, schemas, adapters and
+checked-in generated packs still encode `railway-temporal` and defer
+`cloudflare-agents`. They are historical, non-activating reference artifacts.
+Their presence, hashes and test results do not implement or approve the accepted
+Cloudflare/Vercel routing. Do not use the legacy commands below as a current
+deployment recipe or relabel their generated output as a Cloudflare workflow.
+
+A reviewed versioned migration must reconcile runtime selection, workload
+ownership, policy/plan schemas, provider routes, prepared adapters, compiler
+identity, generated packs and approval bindings together. It must preserve
+export/recovery of prior plans while rejecting stale or cross-engine grants and
+duplicate execution. Fresh transport, health, access, budget, cancellation and
+named pilot evidence remain required before activation. This documentation
+change starts no workflow, worker, schedule, spend or production deployment.
+
+Current provider capability documentation, retrieved 4 October 2026:
+[Cloudflare Workflows](https://developers.cloudflare.com/workflows/),
+[Cloudflare Agents](https://developers.cloudflare.com/agents/), and
+[Vercel Workflows](https://vercel.com/docs/workflows).
+These sources establish provider capabilities; the estate registry chooses the
+owner, and neither is a live runtime receipt.
+
+## Historical decision and v1 implementation evidence
+
+The remainder preserves the August proposal, old observations and verification
+history. Its Temporal adoption and Cloudflare deferral are superseded by the
+current decision above. Dated health, costs and test counts retain their original
+scope and must not be reused as current admission evidence.
 
 Starlight will use a small layered runtime, not a new all-in-one agent platform:
 

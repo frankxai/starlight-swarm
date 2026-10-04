@@ -22,9 +22,7 @@ export async function runPlan(plan, options) {
     await write;
   }
   const now = options.now ?? Date.now();
-  const selections = Object.fromEntries(plan.tasks.map(t => [t.id, selectModel(t.request, catalog, presets, { now })]));
-  const holds = Object.entries(selections).filter(([, s]) => s.status === 'hold');
-  if (holds.length) return { ...receipt, status: 'hold', holds };
+  // Reconcile checkpoint ownership before a fresh capability hold can erase it.
   if (options.checkpoint) {
     const old = options.checkpoint;
     requireValue(old.version === 1 && old.planDigest === planDigest, 'Checkpoint does not match plan and policy');
@@ -32,13 +30,30 @@ export async function runPlan(plan, options) {
     requireValue(Array.isArray(old.events), 'Malformed checkpoint events');
     const unresolved = old.events.filter(event => event.phase === 'dispatch_intent' && !old.results[event.taskId] &&
       !old.events.some(other => other.phase === 'not_started' && other.taskId === event.taskId && other.attempt === event.attempt));
-    requireValue(unresolved.length === 0 && !old.capacityRetained, 'Checkpoint has unresolved execution; reconcile before resume');
+    requireValue(unresolved.length === 0 && !old.capacityRetained && old.status !== 'unknown' && (old.unresolvedTaskIds === undefined || (Array.isArray(old.unresolvedTaskIds) && old.unresolvedTaskIds.length === 0)), 'Checkpoint has unresolved execution; reconcile before resume');
+    for (const [id, result] of Object.entries(old.results)) {
+      requireValue(plan.tasks.some(t => t.id === id) && result?.status === 'verified', 'Checkpoint task is invalid');
+      requireValue(Array.isArray(result.output?.artifacts) && result.output.artifacts.length > 0 && result.output.artifacts.every(a => typeof a === 'string' && a.length), 'Checkpoint must contain artifact references');
+    }
+  }
+  const selections = Object.fromEntries(plan.tasks.map(t => [t.id, selectModel(t.request, catalog, presets, { now })]));
+  const holds = Object.entries(selections).filter(([, s]) => s.status === 'hold');
+  if (holds.length) return { ...receipt,
+    results: options.checkpoint ? structuredClone(options.checkpoint.results) : {},
+    events: options.checkpoint ? structuredClone(options.checkpoint.events) : [],
+    status: 'hold', holds };
+  if (options.checkpoint) {
+    const old = options.checkpoint;
     for (const [id, result] of Object.entries(old.results)) {
       const task = plan.tasks.find(t => t.id === id);
       requireValue(task && result.status === 'verified' && result.selection.model === selections[id].model && result.selection.effort === selections[id].effort && result.selection.provider === selections[id].provider && result.selection.runtime === selections[id].runtime, 'Checkpoint task or selection changed');
-      const checked = await verify(task, result.output, { resumed: true });
+      requireValue(result.output?.model === selections[id].model && result.output.provider === selections[id].provider && result.output.runtime === selections[id].runtime, 'Checkpoint output identity changed');
+      requireValue(Array.isArray(result.output.artifacts) && result.output.artifacts.length > 0 && result.output.artifacts.every(a => typeof a === 'string' && a.length), 'Checkpoint must contain artifact references');
+      signal?.throwIfAborted();
+      const checked = await verify(task, structuredClone(result.output), { resumed: true, signal });
+      signal?.throwIfAborted();
       assertVerified(task, checked, result.output.provider);
-      receipt.results[id] = structuredClone(result);
+      receipt.results[id] = { ...structuredClone(result), verification: structuredClone(checked) };
     }
     for (const task of plan.tasks.filter(t => receipt.results[t.id])) requireValue(task.dependsOn.every(d => receipt.results[d]), 'Checkpoint missing dependency');
     receipt.events = structuredClone(old.events);

@@ -5,7 +5,7 @@ This directory is covered by the repository MIT license. All implementation is
 original; official documents are attributed in `sources.json`, not copied.
 
 ```sh
-node --test src/swarm/orchestration/orchestration.test.mjs
+node --test src/swarm/orchestration/*.test.mjs
 node src/swarm/orchestration/demo.mjs
 ```
 
@@ -55,6 +55,26 @@ and validity through the verifier before skipping work. An unresolved dispatch
 cannot be resumed as a new invocation. Callers persist receipts privately and
 redact them before sharing. Missing usage stays null. Capability failure returns
 hold; execution failure preserves verified work for diagnosis.
+
+Recovery validates checkpoint ownership, unresolved execution and cached task/artifact
+shape before a capability hold can hide them. A valid hold preserves a cloned copy
+of prior results and events; it grants no execution or verification acceptance.
+With a current capability selection, resume checks cached output identity, passes
+the caller's AbortSignal to verification and checks cancellation before and after
+each callback. Verification receives a copy of the cached output, and a successful
+resume records the fresh verification evidence without dispatching completed work.
+If resume rejects, the caller keeps its original checkpoint and capacity state.
+Hosts must bound an uncooperative resumed verifier; this library's task timeout
+does not cancel remote work or impose a deadline on the resume callback.
+
+The eleven recovery regressions and exact runtime repair come from
+[the original private-source task's integration packet](https://github.com/frankxai/starlight-swarm/issues/15#issuecomment-5938322059),
+against base `286b618b0d1124c9798eedcd9f2b0fc46a6fc9bc`.
+The recovered runtime SHA256 is
+`8a5d14bc20d45f8778097608d6b59ec5e5ca4cd62ecb4e09c5d072b165220dbe`.
+These fixture tests establish recovery behavior in this reference library. Durable
+SIS/Postgres authority, operation-time grants, authenticated provider/host receipts,
+external cancellation and a separately approved live pilot remain integration gates.
 
 ## Leadership and adoption
 
