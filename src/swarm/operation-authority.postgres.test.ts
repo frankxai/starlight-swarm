@@ -16,6 +16,9 @@ import {
   type RunnerUsageEvidenceAttestor,
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
+import { CloudflareWorkflowOperationAdmission } from './workflow-operation-admission';
+import { bindCloudflareWorkflowOperation } from './workflow-operation-context';
+import { workflowOperationFixture } from './workflow-operation-test-fixtures';
 import {
   BROKER_DATABASE_ROLE_CONTRACT_SHA256,
   attestUsageEvidenceDatabaseSession,
@@ -620,6 +623,94 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
   };
 
   try {
+    await t.test('competing prepared registrations have one immutable winner and one registration audit', async () => {
+      const id = 'registration-race-one';
+      const results = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+        new PostgresOperationAuthorityStore(authorityPool).registerPreparedOperation(id, (index % 2 ? 'a' : 'b').repeat(64))));
+      assert.equal(results.filter((result) => result.registered && !result.already_registered).length, 1);
+      assert.equal(results.filter((result) => result.registered).length, 4);
+      assert.equal(results.filter((result) => !result.registered).length, 4);
+      const persisted = await pool.query('SELECT * FROM swarm_authority_prepared_operations WHERE operation_id=$1', [id]);
+      for (const result of results) if (result.registered) {
+        assert.equal(result.receipt.binding_digest_sha256, persisted.rows[0].binding_digest_sha256);
+        assert.equal(result.receipt.registered_at, persisted.rows[0].registered_at.toISOString());
+        assert.equal(result.receipt.execution_authority_granted, false);
+      }
+      const audit = await pool.query("SELECT event FROM swarm_authority_audit WHERE operation_id=$1 AND event='prepared-operation-registered'", [id]);
+      assert.equal(audit.rowCount, 1);
+      await assert.rejects(() => store.putPreparedOperation(id, 'c'.repeat(64), new Date().toISOString()), /immutable/i);
+    });
+    await t.test('cancel versus registration retries cannot resurrect a prepared operation', async () => {
+      const id = 'registration-cancel-race'; const digest = 'd'.repeat(64);
+      const first = await store.registerPreparedOperation(id, digest); assert.equal(first.registered, true);
+      await Promise.all([store.cancelPreparedOperation(id), store.registerPreparedOperation(id, digest)]);
+      const after = await store.registerPreparedOperation(id, digest);
+      assert.equal(after.registered, false); assert.match(after.blockers.join(' '), /cancelled/i);
+      const row = await pool.query('SELECT state FROM swarm_authority_prepared_operations WHERE operation_id=$1', [id]);
+      assert.equal(row.rows[0].state, 'cancelled');
+    });
+    await t.test('the authenticated broker database role cannot create or refresh prepared authority', async () => {
+      const brokerStore = new PostgresOperationAuthorityStore(brokerRoleAuthorityPool);
+      await assert.rejects(() => brokerStore.registerPreparedOperation('broker-self-register', 'a'.repeat(64)), /permission denied/i);
+      const rows = await pool.query('SELECT * FROM swarm_authority_prepared_operations WHERE operation_id=$1', ['broker-self-register']);
+      assert.equal(rows.rowCount, 0);
+    });
+    await t.test('a real verified workflow operation registers, admits exactly once and cancels durably', async () => {
+      await prepare();
+      const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const now = new Date(); const issuedAt = now.toISOString();
+        const expiry = new Date(now.getTime() + 60_000).toISOString();
+        const digest = sha256Digest(operation.binding);
+        const config = { schema_version: 'starlight.workflow_operation_admission_bootstrap.v1',
+          operation_id: operation.binding.operation_id, binding_digest_sha256: digest, target: fixture.target, expires_at: expiry };
+        const keys = { approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
+          budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } } };
+        const client = new CloudflareWorkflowOperationAdmission(config, operation, store,
+          new PostgresOperationAuthorityStore(authorityPool), keys);
+        // Constructor snapshots key resolution. Caller mutation cannot rotate or bypass it.
+        keys.approvalIssuers['postgres-approval']['postgres-approval-key'] = 'changed-after-bootstrap-secret-long-enough';
+        const approval = signApprovalReceipt({ schema_version: 'starlight.operation_approval.v1',
+          receipt_id: 'workflow-approval-one', issuer: 'postgres-approval', key_id: 'postgres-approval-key',
+          issued_at: issuedAt, expires_at: expiry, binding_digest_sha256: digest,
+          scope: 'admit-bounded-operation', allowed_capabilities: operation.binding.capabilities }, approvalSecret);
+        const budget = signBudgetReceipt({ schema_version: 'starlight.operation_budget.v1',
+          receipt_id: 'workflow-budget-one', issuer: 'postgres-budget', key_id: 'postgres-budget-key',
+          issued_at: issuedAt, expires_at: expiry, binding_digest_sha256: digest,
+          budget_policy_id: operation.binding.budget_policy_id, hard_limit_usd: 2 }, budgetSecret);
+        const request = { approval_receipt: approval, budget_receipt: budget, reservation_duration_ms: 5 * 60_000 };
+        const missing = await client.admit(request); assert.equal(missing.admitted, false);
+        assert.match(missing.blockers.join(' '), /prepared operation is missing/i);
+        const registered = await client.register(); assert.equal(registered.registered, true);
+        for (const kind of ['policy', 'daily'] as const) await store.registerBudgetWindow({
+          window_id: `workflow-window-${kind}`, policy_id: operation.binding.budget_policy_id, kind,
+          starts_at: new Date(now.getTime() - 60_000).toISOString(), ends_at: new Date(now.getTime() + 5 * 60_000).toISOString(),
+          currency: 'USD', hard_limit_usd: 2,
+        });
+        await store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
+        await store.putHostEvidence({ host_id: operation.binding.host_id, observed_at: issuedAt, status: 'ready',
+          capacity_slots: 1, secret_readiness: true, access_review_expires_at: expiry, allowed_capabilities: operation.binding.capabilities });
+        const staleApproval = signApprovalReceipt({ ...approval, binding_digest_sha256: sha256Digest(fixture.binding) }, approvalSecret);
+        const stale = await client.admit({ ...request, approval_receipt: staleApproval });
+        assert.equal(stale.admitted, false); assert.match(stale.blockers.join(' '), /another operation/);
+        const attempts = await Promise.all(Array.from({ length: 4 }, () => client.admit(request)));
+        assert.equal(attempts.filter((result) => result.admitted).length, 1);
+        const admitted = attempts.find((result) => result.admitted)!;
+        if (!admitted.admitted) assert.fail('Expected a reservation.');
+        assert.equal(admitted.reservation.binding_digest_sha256, digest);
+        assert.ok(Date.parse(admitted.reservation.reservation_expires_at) <= Date.parse(expiry));
+        const held = await pool.query('SELECT reserved_usd FROM swarm_authority_budgets WHERE receipt_id=$1', [budget.receipt_id]);
+        assert.equal(Number(held.rows[0].reserved_usd), 1);
+        await store.cancelPreparedOperation(operation.binding.operation_id);
+        assert.equal((await client.register()).registered, false);
+        assert.equal((await client.admit(request)).admitted, false);
+        const cancelled = await pool.query('SELECT state FROM swarm_authority_reservations WHERE operation_id=$1', [operation.binding.operation_id]);
+        assert.equal(cancelled.rows[0].state, 'cancelled');
+        const released = await pool.query('SELECT reserved_usd FROM swarm_authority_budgets WHERE receipt_id=$1', [budget.receipt_id]);
+        assert.equal(Number(released.rows[0].reserved_usd), 0);
+      } finally { fixture.cleanup(); }
+    });
     await t.test('duplicate consumers observe one durable transition and one receipt', async () => {
       const h = await prepare();
       const results = await Promise.all(Array.from({ length: 8 }, () => h.authority.consume(h.consume)));

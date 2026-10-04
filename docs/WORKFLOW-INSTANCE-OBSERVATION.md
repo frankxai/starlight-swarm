@@ -22,11 +22,55 @@ version or instance substitution therefore changes the binding signed by
 `activation_authority_granted: false`. It cannot register itself, sign its own
 approval, reserve a budget, receive a lease or authorize an effect.
 
-The control plane must register this final binding digest in its existing durable
-prepared-operation registry and issue exact signed approval/budget receipts.
-The existing broker role has read access to prepared operations; a worker cannot
-promote this receipt into a prepared operation. This module does not change those
-database roles, receipt schemas or authority routines.
+## Durable registration and signed admission
+
+`CloudflareWorkflowOperationAdmission` is a server bootstrap capability for one
+externally selected operation. Strict configuration pins its full final binding
+digest, operation ID, exact target and expiry. It requires the issued verified
+binding, actual PostgreSQL store adapters and a private snapshot of the existing
+issuer keyring. Workload requests can supply signed approval/budget receipts and a
+bounded reservation duration. They cannot replace the binding or bootstrap keys.
+The object, pools and keyring must stay in server bootstrap; no production route
+or deployment bootstrap is installed by this library.
+
+`register()` uses the bootstrap/admin database pool. Registration now transacts
+under the existing authority serialization lock, uses database wall time, inserts
+without replacing an existing identity, reads back exactly one matching ready row
+under lock, appends its registration audit and commits before returning. A retry
+preserves the original registration time and emits no duplicate registration
+event. A conflicting binding, cancelled tombstone, invalid/future persisted time,
+expired deadline or failed persistence cannot return a successful registration.
+Registration failures carry no execution authority. The legacy
+`putPreparedOperation(id, digest, callerTime)` call shape remains; caller time is
+validated but database time owns new registration, and collisions now throw.
+
+`admit()` does not register the operation or cache readiness. It delegates to the
+existing `OperationAuthority` with the sealed binding. Its reservation expiry is
+capped by bootstrap and signed-receipt expiry. PostgreSQL checks the prepared row
+again, revocation, fresh host/access/capabilities, durable receipt budget, both
+cumulative windows, capacity and duplicate operation/effect under its authority
+lock. A cancellation between registration and admission therefore still denies.
+Registration never signs its own approval, creates host evidence, registers a
+budget, issues a runner lease or dispatches an effect.
+
+The existing broker role has SELECT access to prepared operations and cannot
+insert, refresh or cancel them. Bootstrap registration requires the existing
+privileged control-plane pool. Admission retains its existing database privilege
+requirements; this slice adds no grants or deployed role configuration. The
+existing migration extends the audit event constraint with the two registration
+events for both fresh and upgraded databases; existing event names and rows remain
+valid. A failed rollback preserves the original persistence error and attempts an
+integrity audit; a disconnected database cannot promise audit persistence. Real
+PostgreSQL CI checks registration races, broker insertion denial, exact signed
+workflow admission, duplicate prevention and pre-start cancellation with release.
+These test inputs are fixtures, not fresh live host or human approval evidence.
+
+Next: trusted deployment bootstrap and exact-ID engine/executor dispatch, durable
+workflow-instance ownership, authenticated runner session/start/stop/usage and
+external-effect reconciliation. A Cloudflare instance is not an OS process.
+Named pilot security acceptance, fresh live access/capacity and explicit human
+approval remain required before a live create call. No live provider operation,
+deployment, worker, spend or schedule is enabled here.
 
 ## Authenticated readback
 
