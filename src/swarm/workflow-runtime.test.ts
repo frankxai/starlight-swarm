@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { test } from 'node:test';
 
-import { assessTeamRuntimeAdmission } from './runtime-admission';
+import { assessTeamRuntimeAdmission, parseRuntimeAdmissionEvidence } from './runtime-admission';
 import { prepareRuntimeBundle, verifyPreparedRuntimeBundle } from './runtime-adapters';
 import { sha256Digest } from './runtime-digest';
 import { parseTeamRuntimePlan } from './runtime-plan-contract';
@@ -162,6 +162,26 @@ test('an actual written and verified pack prepares a bound v2 bundle, not activa
 test('v1 activation authority cannot admit a v2 plan or its copied receipts', () => {
   assert.equal(assessTeamRuntimeAdmission(plan(), {}).admitted, false);
   assert.throws(() => parseTeamRuntimePlan(plan()));
+});
+test('legacy admission refuses the new compiler and workflow health keys with otherwise valid evidence', () => {
+  const binding = {
+    plan_digest_sha256: 'a'.repeat(64), source_profile_digest_sha256: 'b'.repeat(64),
+    source_runtime_policy_digest_sha256: 'c'.repeat(64), pack_digest_sha256: 'd'.repeat(64),
+    compiler_version: 'starlight.team_pack.compiler.v2',
+  };
+  const receipt = { ...binding, receipt_id: 'synthetic-receipt', issuer: 'synthetic-untrusted', expires_at: '2026-10-04T04:00:00.000Z' };
+  const evidence = {
+    observed_at: '2026-10-04T03:00:00.000Z', duplicate_lane_ids: [], available_memory_gib: 16,
+    runtime_health: { 'hermes-local': 'ready' },
+    verified_pack: { ...binding, status: 'verified-human-approval-required', team_id: 'creator-team' },
+    approval_receipt: { ...receipt, scope: 'activate-team-runtime' },
+    budget_receipt: { ...receipt, budget_policy_id: 'synthetic-budget', hard_daily_limit_usd: 20 },
+  };
+  assert.equal(parseRuntimeAdmissionEvidence(evidence).verified_pack.compiler_version, binding.compiler_version);
+  assert.throws(() => parseRuntimeAdmissionEvidence({ ...evidence, verified_pack: { ...evidence.verified_pack, compiler_version: 'starlight.team_pack.compiler.v3' } }), /compiler_version/);
+  for (const runtime of ['cloudflare-workflows', 'vercel-workflow']) {
+    assert.throws(() => parseRuntimeAdmissionEvidence({ ...evidence, runtime_health: { [runtime]: 'ready' } }), /runtime_health/);
+  }
 });
 test('legacy v1 JSON remains readable and compiler bytes stay unchanged', () => {
   const legacy = JSON.parse(readFileSync('runtime/generated/starlight-platform-pilot.plan.json', 'utf8'));

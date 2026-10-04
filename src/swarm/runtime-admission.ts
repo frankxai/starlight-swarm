@@ -9,7 +9,8 @@ export interface PackBinding {
   source_profile_digest_sha256: string;
   source_runtime_policy_digest_sha256: string;
   pack_digest_sha256: string;
-  compiler_version: 'starlight.team_pack.compiler.v2' | 'starlight.team_pack.compiler.v3';
+  // This report-only v1 assessor cannot accept v2 workflow packs or grants.
+  compiler_version: 'starlight.team_pack.compiler.v2';
 }
 
 export interface ApprovalReceipt extends PackBinding {
