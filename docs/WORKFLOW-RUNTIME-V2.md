@@ -41,6 +41,9 @@ instance/deployment identities; executor lanes reference their one bound owner.
 JSON Schemas are structural exports. Ownership, profile, role, policy and budget
 checks run in the semantic parser and canonical verifier. An imported descriptor
 must equal the bundle derived from the exact plan and issued pack receipt.
+Planning USD ceilings use exact integer microdollar arithmetic, with up to six
+decimal places and a safe integer limit. This does not implement cumulative live
+budget reservations or settle the pilot's actual billing currency.
 
 ## Reproduce the preparation path
 

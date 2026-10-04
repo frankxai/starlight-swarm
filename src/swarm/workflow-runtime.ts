@@ -12,6 +12,21 @@ const id = z.string().regex(/^[a-z0-9][a-z0-9._-]*$/);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const unique = <T extends z.ZodType>(schema: T, minimum = 0) => z.array(schema).min(minimum).refine((values) => new Set(values).size === values.length, 'Entries must be unique.');
 
+// Planning ceilings are exact decimal USD, with at most six fractional digits.
+// Convert from the decimal spelling, not value * 1e6, which reintroduces float error.
+function microUSD(value: number): bigint {
+  const [mantissa, exponent = '0'] = String(value).split('e');
+  const fraction = mantissa.split('.')[1]?.length ?? 0;
+  const scale = 6 + Number(exponent) - fraction;
+  if (!Number.isFinite(value) || value <= 0 || scale < 0 || scale > 22) throw new Error('USD planning caps require positive finite values with at most six decimal places.');
+  const units = BigInt(mantissa.replace('.', '')) * (BigInt(10) ** BigInt(scale));
+  if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('USD planning cap exceeds the safe microdollar range.');
+  return units;
+}
+const usdCap = z.number().positive().finite().refine((value) => {
+  try { microUSD(value); return true; } catch { return false; }
+}, 'USD caps require at most six decimal places within the safe microdollar range.');
+
 const ownershipEntry = z.object({
   workflow_id: id,
   workload_scope: z.enum(['agent-centric', 'cross-service', 'app-local']),
@@ -27,7 +42,7 @@ export const workflowOwnershipSchema = z.array(ownershipEntry).min(1).max(5).ref
 
 export const workflowPlanningPolicySchema = z.object({
   schema_version: z.literal('starlight.runtime_planning_policy.v2'),
-  policy_id: id, budget_policy_id: id, max_daily_cost_usd: z.number().positive().finite(),
+  policy_id: id, budget_policy_id: id, max_daily_cost_usd: usdCap,
   team_profile_source: teamProfileSourceSchema,
   eve_allowlisted_workload_ids: z.tuple([]),
   allowed_runtimes: unique(z.enum(workflowRuntimeIds), 1),
@@ -75,7 +90,7 @@ const laneSchema = z.object({
   runtime: z.enum(workflowRuntimeIds), mission_authority: z.enum(durableEngines),
   provider_route: z.enum(['direct-provider', 'vercel-ai-gateway', 'hermes-profile', 'none']),
   model_route: z.enum(['economy', 'balanced', 'frontier', 'checker-independent']),
-  budget: z.object({ daily_token_cap: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), daily_cost_cap_usd: z.number().positive().finite() }).strict(),
+  budget: z.object({ daily_token_cap: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), daily_cost_cap_usd: usdCap }).strict(),
   mode: z.literal('dry-run'), independent_verifier: z.boolean(),
   reason_codes: unique(z.string().min(1), 1), warnings: unique(z.string().min(1)),
 }).strict();
@@ -103,7 +118,7 @@ export const workflowRuntimePlanSchema = z.object({
   authority: z.object({ mission: z.literal('per-workflow'), model_policy: z.literal('queen-model-policy'), observability: z.literal('langfuse'), integration: z.literal('n8n'), operator: z.literal('hermes') }).strict(),
   routing_policy: z.object({ policy_id: id, policy_digest_sha256: digest, eve_allowlisted_workload_ids: z.tuple([]), allowed_runtimes: unique(z.enum(workflowRuntimeIds), 1) }).strict(),
   workflow_ownership: workflowOwnershipSchema, human_gate_actions: unique(z.string().min(1), 1),
-  budget: z.object({ policy_id: id, max_daily_cost_usd: z.number().positive().finite(), planned_daily_cost_usd: z.number().positive().finite() }).strict(),
+  budget: z.object({ policy_id: id, max_daily_cost_usd: usdCap, planned_daily_cost_usd: usdCap }).strict(),
   lanes: z.array(laneSchema).min(3).max(5),
 }).strict().superRefine((plan, context) => {
   for (const field of ['id', 'role_id'] as const) if (new Set(plan.lanes.map((lane) => lane[field])).size !== plan.lanes.length) context.addIssue({ code: 'custom', message: `Lane ${field} assignments must be unique.` });
@@ -122,8 +137,10 @@ export const workflowRuntimePlanSchema = z.object({
     if (!plan.routing_policy.allowed_runtimes.includes(lane.runtime) || lane.provider_route !== providerFor(lane.runtime)) context.addIssue({ code: 'custom', message: `Lane ${lane.id} runtime/provider does not match its policy.` });
     if (lane.independent_verifier !== (lane.model_route === 'checker-independent')) context.addIssue({ code: 'custom', message: 'Only the independent verifier can use checker-independent routing.' });
   }
-  const cost = plan.lanes.reduce((total, lane) => total + lane.budget.daily_cost_cap_usd, 0);
-  if (!Number.isFinite(cost) || Math.abs(cost - plan.budget.planned_daily_cost_usd) > 1e-9 || cost > plan.budget.max_daily_cost_usd) context.addIssue({ code: 'custom', message: 'Lane cost caps must sum to the exact planned cost within the team budget.' });
+  try {
+    const cost = plan.lanes.reduce((total, lane) => total + microUSD(lane.budget.daily_cost_cap_usd), BigInt(0));
+    if (cost !== microUSD(plan.budget.planned_daily_cost_usd) || cost > microUSD(plan.budget.max_daily_cost_usd)) context.addIssue({ code: 'custom', message: 'Lane cost caps must sum to the exact planned cost within the team budget.' });
+  } catch (error) { context.addIssue({ code: 'custom', message: error instanceof Error ? error.message : 'Invalid monetary cap.' }); }
 });
 export type WorkflowRuntimePlan = z.infer<typeof workflowRuntimePlanSchema>;
 export type GovernedRuntimePlan = TeamRuntimePlan | WorkflowRuntimePlan;
@@ -136,6 +153,8 @@ export function planWorkflowRuntime(teamInput: unknown, workloadInput: unknown, 
   const workloads = parseWorkflowWorkloads(workloadInput);
   const roleIds = new Set(workloads.map((workload) => workload.role_id));
   if (roleIds.size !== workloads.length || team.routing.required_roles.some((role) => !roleIds.has(role)) || !roleIds.has(team.team.coordinator_role_id) || !roleIds.has(team.team.verifier_role_id) || workloads.some((workload) => !team.roles.some((role) => role.id === workload.role_id))) throw new Error('All required team roles must have unique, known workload lanes.');
+  const totalMicroUSD = workloads.reduce((total, workload) => total + microUSD(workload.daily_cost_cap_usd), BigInt(0));
+  if (totalMicroUSD > microUSD(resolved.source.max_daily_cost_usd)) throw new Error('Daily cost caps exceed the exact team budget.');
   const result: WorkflowRuntimePlan = {
     schema_version: 'starlight.team_runtime_plan.v2', team_id: team.team.id,
     source_profile: { schema_version: team.schema_version, version: team.ownership.version, review_date: team.ownership.review_date, sha256: sha256Digest(team), ...resolved.source.team_profile_source },
@@ -143,7 +162,7 @@ export function planWorkflowRuntime(teamInput: unknown, workloadInput: unknown, 
     authority: { mission: 'per-workflow', model_policy: 'queen-model-policy', observability: 'langfuse', integration: 'n8n', operator: 'hermes' },
     routing_policy: resolved.routing_policy, workflow_ownership: resolved.source.workflow_ownership,
     human_gate_actions: [...team.permissions.human_gate_actions],
-    budget: { policy_id: resolved.source.budget_policy_id, max_daily_cost_usd: resolved.source.max_daily_cost_usd, planned_daily_cost_usd: workloads.reduce((total, workload) => total + workload.daily_cost_cap_usd, 0) },
+    budget: { policy_id: resolved.source.budget_policy_id, max_daily_cost_usd: resolved.source.max_daily_cost_usd, planned_daily_cost_usd: Number(totalMicroUSD) / 1_000_000 },
     lanes: workloads.map((workload) => {
       const owner = resolved.source.workflow_ownership.find((entry) => entry.workflow_id === workload.workflow_id);
       if (!owner) throw new Error(`No exact workflow owner for ${workload.id}.`);

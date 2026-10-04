@@ -36,6 +36,12 @@ authority/pilot work in [Swarm issue15](https://github.com/frankxai/starlight-sw
 
 ### Implemented state and migration boundary
 
+The [v2 preparation migration](WORKFLOW-RUNTIME-V2.md) implements explicit
+workflow owners in planning, compiler-v3 packs, canonical verification and
+prepared bundles. It preserves the legacy exports described below. Neither
+path starts a workflow or provides operation-time activation authority; current
+engine bindings, authenticated transport and the named pilot remain unproven.
+
 The current `starlight.team_runtime_plan.v1` planner, policy, schemas, adapters and
 checked-in generated packs still encode `railway-temporal` and defer
 `cloudflare-agents`. They are historical, non-activating reference artifacts.

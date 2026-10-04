@@ -96,6 +96,12 @@ admit a plan. They are not a current deployment recipe. Runtime migration and th
 named, separately approved pilot remain open in
 [Swarm issue15](https://github.com/frankxai/starlight-swarm/issues/15).
 
+The explicit [v2 preparation path](docs/WORKFLOW-RUNTIME-V2.md) now binds workflow
+ownership through its policy, plan, compiler-v3 pack verifier and prepared bundle.
+It keeps the v1 exports unchanged, rejects engine/policy substitutions and uses
+exact microdollar planning ceilings. Use the v2 examples for current preparation;
+authenticated operation-time adapters and the named live pilot remain open.
+
 ```bash
 npm run runtime:plan -- \
   ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \

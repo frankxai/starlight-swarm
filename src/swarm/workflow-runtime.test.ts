@@ -105,6 +105,19 @@ test('the bound policy cannot remove the required executor', () => {
   const source = policy(); source.allowed_runtimes = ['cloudflare-workflows'];
   assert.throws(() => plan(source), /runtime|executor/i);
 });
+test('fractional USD ceilings sum exactly, without float tolerances', () => {
+  const source = policy(); source.max_daily_cost_usd = 0.3;
+  const inputs = workloads(); inputs.forEach((item) => { item.daily_cost_cap_usd = 0.1; });
+  assert.equal(plan(source, inputs).budget.planned_daily_cost_usd, 0.3);
+  inputs[2].daily_cost_cap_usd = 0.100001;
+  assert.throws(() => plan(source, inputs), /budget|cost/i);
+});
+test('sub-microdollar and unsafe ceilings cannot be rounded into accepted budgets', () => {
+  const source = policy(); source.max_daily_cost_usd = 0.3000000001;
+  assert.throws(() => plan(source), /decimal|microdollar|USD/i);
+  const second = policy(); second.max_daily_cost_usd = Number.MAX_SAFE_INTEGER;
+  assert.throws(() => plan(second), /microdollar|USD/i);
+});
 test('imported plans cannot move a lane to another engine or bypass code placement', () => {
   const imported = plan(); imported.lanes[1].mission_authority = 'vercel-workflow';
   assert.throws(() => parseWorkflowRuntimePlan(imported), /owner|engine|authority/i);
