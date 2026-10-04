@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "starlight.runtime_planning_policy.v2"
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "budget_policy_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "max_daily_cost_usd": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "team_profile_source": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$"
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^(?!0{40}$)[a-f0-9]{40}$"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!.*(?:^|\\/)\\.\\.(?:\\/|$))[A-Za-z0-9._-]+(?:\\/[A-Za-z0-9._-]+)*$"
+        }
+      },
+      "required": [
+        "repository",
+        "commit_sha",
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "eve_allowlisted_workload_ids": {
+      "type": "array",
+      "items": false,
+      "maxItems": 0
+    },
+    "allowed_runtimes": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "cloudflare-workflows",
+          "vercel-workflow",
+          "railway-worker",
+          "hermes-local",
+          "n8n-integration"
+        ]
+      }
+    },
+    "deferred_runtimes": {
+      "minItems": 0,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "cloudflare-workflows",
+          "vercel-workflow",
+          "railway-worker",
+          "hermes-local",
+          "n8n-integration"
+        ]
+      }
+    },
+    "activation_mode": {
+      "type": "string",
+      "const": "dry-run-only"
+    },
+    "review_date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+    },
+    "workflow_ownership": {
+      "minItems": 1,
+      "maxItems": 5,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "workflow_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "workload_scope": {
+            "type": "string",
+            "enum": [
+              "agent-centric",
+              "cross-service",
+              "app-local"
+            ]
+          },
+          "identity_state_owner": {
+            "type": "string",
+            "enum": [
+              "cloudflare",
+              "vercel"
+            ]
+          },
+          "durable_engine": {
+            "type": "string",
+            "enum": [
+              "cloudflare-workflows",
+              "vercel-workflow"
+            ]
+          }
+        },
+        "required": [
+          "workflow_id",
+          "workload_scope",
+          "identity_state_owner",
+          "durable_engine"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "workload_scope": {
+                    "enum": [
+                      "agent-centric",
+                      "cross-service"
+                    ]
+                  },
+                  "identity_state_owner": {
+                    "const": "cloudflare"
+                  },
+                  "durable_engine": {
+                    "const": "cloudflare-workflows"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "workload_scope": {
+                    "const": "app-local"
+                  },
+                  "identity_state_owner": {
+                    "const": "vercel"
+                  },
+                  "durable_engine": {
+                    "const": "vercel-workflow"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "schema_version",
+    "policy_id",
+    "budget_policy_id",
+    "max_daily_cost_usd",
+    "team_profile_source",
+    "eve_allowlisted_workload_ids",
+    "allowed_runtimes",
+    "deferred_runtimes",
+    "activation_mode",
+    "review_date",
+    "workflow_ownership"
+  ],
+  "additionalProperties": false,
+  "$id": "https://starlight.local/schemas/starlight.runtime_planning_policy.v2.schema.json",
+  "$comment": "STRUCTURAL EXPORT ONLY. Exact ownership, source, role, budget and compiler bindings require the runtime parser and canonical verifier. This export grants no operation authority. Expressible ownership/privacy and exact-object duplicate rules are included; keyed-ID uniqueness, cross-references, exact budget sums and provenance still require the canonical runtime parser/verifier.",
+  "x-starlight-validation-authority": "export-only-runtime-parser-required"
+}

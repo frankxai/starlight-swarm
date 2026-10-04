@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { prepareRuntimeBundle } from '../src/swarm/runtime-adapters';
 import { resolveGeneratedOutput } from '../src/swarm/runtime-output';
 import { assertGitJsonSourceProvenance } from '../src/swarm/runtime-provenance';
-import { parseRuntimePlanningPolicy } from '../src/swarm/runtime-policy';
+import { parseGovernedRuntimePlanningPolicy } from '../src/swarm/workflow-runtime';
 import { verifyTeamPackDirectory } from '../src/swarm/team-pack-verifier';
 
 function usage(): never {
@@ -35,7 +35,7 @@ const readJson = (path: string): unknown => JSON.parse(readFileSync(resolve(path
 const plan = readJson(planPath);
 const profile = readJson(profilePath);
 const policy = readJson(policyPath);
-const parsedPolicy = parseRuntimePlanningPolicy(policy);
+const parsedPolicy = parseGovernedRuntimePlanningPolicy(policy);
 assertGitJsonSourceProvenance(
   resolve(profilePath),
   parsedPolicy.source.team_profile_source,

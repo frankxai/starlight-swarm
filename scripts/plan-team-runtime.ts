@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { parseWorkloadRequirements } from '../src/swarm/runtime-input';
 import { resolveGeneratedOutput } from '../src/swarm/runtime-output';
 import { planTeamRuntime } from '../src/swarm/runtime-planner';
+import { parseGovernedRuntimePlanningPolicy, planWorkflowRuntime, parseWorkflowPlanningPolicy } from '../src/swarm/workflow-runtime';
 import { parseRuntimePlanningPolicy } from '../src/swarm/runtime-policy';
 import { assertGitJsonSourceProvenance } from '../src/swarm/runtime-provenance';
 
@@ -67,13 +68,15 @@ function readJson(path: string): unknown {
 function main(): void {
   const args = parseArguments(process.argv.slice(2));
   const team = readJson(args.teamPath);
-  const workloads = parseWorkloadRequirements(readJson(args.workloadsPath));
-  const policy = parseRuntimePlanningPolicy(readJson(args.policyPath));
+  const workloadInput = readJson(args.workloadsPath);
+  const policy = parseGovernedRuntimePlanningPolicy(readJson(args.policyPath));
   assertGitJsonSourceProvenance(args.teamPath, policy.source.team_profile_source);
-  const plan = planTeamRuntime(team, workloads, args.generatedAt, {
+  const plan = policy.source.schema_version === 'starlight.runtime_planning_policy.v2'
+    ? planWorkflowRuntime(team, workloadInput, args.generatedAt, parseWorkflowPlanningPolicy(policy.source))
+    : planTeamRuntime(team, parseWorkloadRequirements(workloadInput), args.generatedAt, {
     max_daily_cost_usd: policy.source.max_daily_cost_usd,
     policy_id: policy.source.budget_policy_id,
-    routing_policy: policy.routing_policy,
+    routing_policy: parseRuntimePlanningPolicy(policy.source).routing_policy,
     source_profile: policy.source.team_profile_source,
   });
   const output = `${JSON.stringify(plan, null, 2)}\n`;

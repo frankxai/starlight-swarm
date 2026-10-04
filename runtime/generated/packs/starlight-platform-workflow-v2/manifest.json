@@ -1,0 +1,93 @@
+{
+  "schema_version": "starlight.team_pack.v2",
+  "compiler_version": "starlight.team_pack.compiler.v3",
+  "team_id": "starlight-platform-team",
+  "team_profile_version": "2.0.1",
+  "generated_at": "2026-10-04T03:00:00Z",
+  "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
+  "source_profile_repository": "frankxai/starlight-agent-config",
+  "source_profile_commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+  "source_profile_path": "core/teams/starlight-platform-team.team-profile.json",
+  "runtime_policy_id": "queen-workflow-policy-v2",
+  "source_runtime_policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
+  "plan_digest_sha256": "ecb6f9d5698f9511c0bbd4e306169022dd6dca0020d860e70760ebb8ee7fb734",
+  "activation_status": "planned-human-approval-required",
+  "files": [
+    {
+      "path": "CAPABILITIES.md",
+      "sha256": "5748485035724cf145f09ce455cf4e4ddfa9877add41c17103c59093e84974fa",
+      "bytes": 1260
+    },
+    {
+      "path": "GUARDRAILS.md",
+      "sha256": "4a526e7a6301916e8d9fc344eecd07057849e327f520a2f699f43a3c37d03803",
+      "bytes": 2134
+    },
+    {
+      "path": "ICP-AGENT.md",
+      "sha256": "08bf49cdfbe5d66215acaad33a2c6f8a8d20156bc81eb1b5fc0b287b250b31e2",
+      "bytes": 1087
+    },
+    {
+      "path": "MEMORY.md",
+      "sha256": "84ed4ec673eaf83b2d461e89059095c2b0bba1f85ce2edf9a2d01e971a212762",
+      "bytes": 937
+    },
+    {
+      "path": "MODEL-ROUTING.md",
+      "sha256": "b11082f75a1d8b3061e1737c29c766d02b05ab2bd3d41ab0b430844b4d988885",
+      "bytes": 836
+    },
+    {
+      "path": "QUALITY.md",
+      "sha256": "60499cc31976adc9d51cd93fb70db5bbfab8fc59b42324494b2ba559ab000176",
+      "bytes": 1360
+    },
+    {
+      "path": "README.md",
+      "sha256": "d7fb463c5e9299553cde40f72d0639e08abd84529740256fb8ee73b0ffa5ab8d",
+      "bytes": 359
+    },
+    {
+      "path": "RUNTIME-POLICY.json",
+      "sha256": "9cf9e2592f13ebac7aa86637a4c2efa152d086d641153a747bb1bf6b9afe8ff0",
+      "bytes": 904
+    },
+    {
+      "path": "SYSTEM.md",
+      "sha256": "f88a225b35fe5dcf13571f90eaa6f5e28e56748f175f7d48b2e52818dc281e84",
+      "bytes": 1075
+    },
+    {
+      "path": "TASTE.md",
+      "sha256": "52ccaee8313ad37a7164ff59b80bb69305a3488642e2ccf77d19bb8dd9c7f85b",
+      "bytes": 963
+    },
+    {
+      "path": "WORKFLOW-OWNERSHIP.json",
+      "sha256": "ee7c50fbf70eeffdfdc00047b2f60b0f8d5b1d118052634c1c747d517ccedf74",
+      "bytes": 891
+    },
+    {
+      "path": "WORKFLOWS.md",
+      "sha256": "ece1ac81ce15783c5a4d4d29a9fb5fc9f4cc35c237245493f04d659737c5d925",
+      "bytes": 1072
+    },
+    {
+      "path": "roles/backend-data-engineer.md",
+      "sha256": "c477d8dcd80f55d9eac02bfafd9143cc4eab804b9caaa67332bb0a208b0429e8",
+      "bytes": 1904
+    },
+    {
+      "path": "roles/coordinator.md",
+      "sha256": "1c8d9f26e624daeca6d2daa8ab8a0d6745a31d8bf6aaebf649da95135182d82e",
+      "bytes": 1871
+    },
+    {
+      "path": "roles/qa-release-sre-verifier.md",
+      "sha256": "fbb75bdb469ee53ccb970fc2ad12e3d00c0609f5aa32634efe4e399783b17777",
+      "bytes": 1968
+    }
+  ],
+  "pack_digest_sha256": "a572ade31d099ac36e0bfdd813ec9a4c8d2125ec6d5bb2f0c0ba8560fbff6d65"
+}

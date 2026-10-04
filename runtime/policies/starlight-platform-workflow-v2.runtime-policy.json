@@ -1,0 +1,30 @@
+{
+  "schema_version": "starlight.runtime_planning_policy.v2",
+  "policy_id": "queen-workflow-policy-v2",
+  "budget_policy_id": "starlight-platform-pilot-budget-v1",
+  "max_daily_cost_usd": 25,
+  "team_profile_source": {
+    "repository": "frankxai/starlight-agent-config",
+    "commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+    "path": "core/teams/starlight-platform-team.team-profile.json"
+  },
+  "eve_allowlisted_workload_ids": [],
+  "allowed_runtimes": [
+    "cloudflare-workflows",
+    "vercel-workflow",
+    "railway-worker",
+    "hermes-local",
+    "n8n-integration"
+  ],
+  "deferred_runtimes": [],
+  "activation_mode": "dry-run-only",
+  "review_date": "2026-10-04",
+  "workflow_ownership": [
+    {
+      "workflow_id": "creator-engineering",
+      "workload_scope": "agent-centric",
+      "identity_state_owner": "cloudflare",
+      "durable_engine": "cloudflare-workflows"
+    }
+  ]
+}

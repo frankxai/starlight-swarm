@@ -9,6 +9,7 @@ export interface PackBinding {
   source_profile_digest_sha256: string;
   source_runtime_policy_digest_sha256: string;
   pack_digest_sha256: string;
+  // This report-only v1 assessor cannot accept v2 workflow packs or grants.
   compiler_version: 'starlight.team_pack.compiler.v2';
 }
 
@@ -107,7 +108,7 @@ export function parseRuntimeAdmissionEvidence(input: unknown): RuntimeAdmissionE
   return result.data as RuntimeAdmissionEvidence;
 }
 
-export function computePlanDigest(plan: TeamRuntimePlan): string {
+export function computePlanDigest(plan: TeamRuntimePlan | import('./workflow-runtime').WorkflowRuntimePlan): string {
   return sha256Digest(plan);
 }
 
