@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import dns from 'node:dns';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 
 import { Pool, type PoolClient } from 'pg';
 
@@ -17,7 +21,8 @@ import {
 } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
 import { CloudflareWorkflowOperationAdmission } from './workflow-operation-admission';
-import { bindCloudflareWorkflowOperation } from './workflow-operation-context';
+import { bindCloudflareWorkflowOperation, cloudflareWorkflowOperationEnvelope } from './workflow-operation-context';
+import { CloudflareWorkflowObserver } from './cloudflare-workflow-observer';
 import { workflowOperationFixture } from './workflow-operation-test-fixtures';
 import { deriveWorkflowInstanceOwnership, parseWorkflowInstanceOwnership } from './workflow-instance-ownership';
 import {
@@ -790,9 +795,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         assert.equal(recovered.found, true);
       } finally { fixture.cleanup(); }
     });
-    await t.test('a real verified workflow operation registers, admits exactly once and cancels durably', async () => {
+    await t.test('a real verified workflow operation registers, verifies deployment, admits exactly once and cancels durably', async (t) => {
       await prepare();
       const fixture = workflowOperationFixture();
+      const previousToken = process.env.STARLIGHT_CLOUDFLARE_OBSERVER_TOKEN;
       try {
         const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
         const now = new Date(); const issuedAt = now.toISOString();
@@ -802,8 +808,34 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
           operation_id: operation.binding.operation_id, binding_digest_sha256: digest, target: fixture.target, expires_at: expiry };
         const keys = { approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
           budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } } };
+        let observedVersion = fixture.target.version_id;
+        let observedStatus = 'running';
+        process.env.STARLIGHT_CLOUDFLARE_OBSERVER_TOKEN = 'test-postgres-deployment-observer-only';
+        const observer = new CloudflareWorkflowObserver({ target: fixture.target, credential_ref: 'postgres-observer',
+          access_review_expires_at: expiry, timeout_ms: 1000 });
+        t.mock.method(dns, 'lookup', (...args: unknown[]) => {
+          const callback = args[args.length - 1] as Function;
+          queueMicrotask(() => callback(null, [{ address: '8.8.8.8', family: 4 }]));
+        });
+        t.mock.method(https, 'request', (config: https.RequestOptions, callback: Function) => {
+          const req = new EventEmitter() as EventEmitter & { end(): void; destroy(): void };
+          req.destroy = () => {};
+          req.end = () => {
+            const result = config.path?.includes('/instances/')
+              ? { status: observedStatus, versionId: observedVersion, params: cloudflareWorkflowOperationEnvelope(operation),
+                queued: issuedAt, start: issuedAt, end: null }
+              : { id: fixture.target.workflow_uuid, name: fixture.target.workflow_name, script_deleted: false };
+            const response = Readable.from([Buffer.from(JSON.stringify({ success: true, errors: [], result }))]) as Readable & {
+              statusCode: number; headers: object; socket: object; complete: boolean;
+            };
+            response.statusCode = 200; response.headers = { 'content-type': 'application/json' };
+            response.socket = { encrypted: true, authorized: true, remoteAddress: '8.8.8.8' }; response.complete = true;
+            queueMicrotask(() => callback(response));
+          };
+          return req;
+        });
         const client = new CloudflareWorkflowOperationAdmission(config, operation, store,
-          new PostgresOperationAuthorityStore(authorityPool), keys);
+          new PostgresOperationAuthorityStore(authorityPool), keys, observer);
         // Constructor snapshots key resolution. Caller mutation cannot rotate or bypass it.
         keys.approvalIssuers['postgres-approval']['postgres-approval-key'] = 'changed-after-bootstrap-secret-long-enough';
         const approval = signApprovalReceipt({ schema_version: 'starlight.operation_approval.v1',
@@ -826,6 +858,18 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         await store.registerBudget(budget.receipt_id, budget.hard_limit_usd);
         await store.putHostEvidence({ host_id: operation.binding.host_id, observed_at: issuedAt, status: 'ready',
           capacity_slots: 1, secret_readiness: true, access_review_expires_at: expiry, allowed_capabilities: operation.binding.capabilities });
+        const unobserved = new CloudflareWorkflowOperationAdmission(config, operation, store,
+          new PostgresOperationAuthorityStore(authorityPool), { approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
+            budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } } });
+        assert.match((await unobserved.admit(request)).blockers.join(' '), /observer.*configured/i);
+        observedVersion = '33333333-3333-4333-8333-333333333333';
+        const wrongVersion = await client.admit(request);
+        assert.equal(wrongVersion.admitted, false); assert.match(wrongVersion.blockers.join(' '), /version/i);
+        observedVersion = fixture.target.version_id; observedStatus = 'paused';
+        const paused = await client.admit(request);
+        assert.equal(paused.admitted, false); assert.match(paused.blockers.join(' '), /running/i);
+        observedStatus = 'running';
+        assert.equal((await pool.query('SELECT * FROM swarm_authority_reservations WHERE operation_id=$1', [operation.binding.operation_id])).rowCount, 0);
         const staleApproval = signApprovalReceipt({ ...approval, binding_digest_sha256: sha256Digest(fixture.binding) }, approvalSecret);
         const stale = await client.admit({ ...request, approval_receipt: staleApproval });
         assert.equal(stale.admitted, false); assert.match(stale.blockers.join(' '), /another operation/);
@@ -870,7 +914,11 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         assert.equal(cancelled.rows[0].state, 'cancelled');
         const released = await pool.query('SELECT reserved_usd FROM swarm_authority_budgets WHERE receipt_id=$1', [budget.receipt_id]);
         assert.equal(Number(released.rows[0].reserved_usd), 0);
-      } finally { fixture.cleanup(); }
+      } finally {
+        fixture.cleanup();
+        if (previousToken === undefined) delete process.env.STARLIGHT_CLOUDFLARE_OBSERVER_TOKEN;
+        else process.env.STARLIGHT_CLOUDFLARE_OBSERVER_TOKEN = previousToken;
+      }
     });
     await t.test('duplicate consumers observe one durable transition and one receipt', async () => {
       const h = await prepare();

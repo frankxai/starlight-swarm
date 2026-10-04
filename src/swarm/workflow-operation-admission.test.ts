@@ -156,14 +156,14 @@ test('expired bootstrap cannot register or admit and denial is audited', async (
   assert.equal(h.queries.some((sql) => sql.startsWith('INSERT INTO swarm_authority_prepared_operations')), false);
   assert.ok(h.queries.some((sql) => sql.includes('INSERT INTO swarm_authority_audit')));
 });
-test('invalid signatures cannot reserve and workload fields cannot replace the sealed operation', async () => {
+test('unobserved deployment cannot reserve and workload fields cannot replace the sealed operation', async () => {
   const operation = bound(); const ownership = deriveWorkflowInstanceOwnership(operation);
   const h = sqlFixture({ operation_id: operation.binding.operation_id, binding_digest_sha256: ownership.binding_digest_sha256,
     registered_at: now, state: 'ready' }, undefined, false, ownership);
   const client = new CloudflareWorkflowOperationAdmission(config(operation), operation, h.store, h.store, keyring);
   const result = await client.admit({ approval_receipt: {}, budget_receipt: {}, reservation_duration_ms: 1000 });
   assert.equal(result.admitted, false);
-  assert.match(result.blockers.join(' '), /approval|budget|receipt/i);
+  assert.match(result.blockers.join(' '), /observer.*configured/i);
   const injected = await client.admit({ binding: { ...operation.binding, host_id: 'other-host' }, approval_receipt: {}, budget_receipt: {}, reservation_duration_ms: 1000 });
   assert.equal(injected.admitted, false);
   assert.match(injected.blockers.join(' '), /invalid/i);
