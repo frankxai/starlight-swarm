@@ -53,20 +53,67 @@ lock. A cancellation between registration and admission therefore still denies.
 Registration never signs its own approval, creates host evidence, registers a
 budget, issues a runner lease or dispatches an effect.
 
+## Durable instance ownership and recovery
+
+Workflow registration also persists `starlight.workflow_instance_ownership.v1`
+in the same transaction. It derives this data from the issued verified operation;
+copied receipts and caller-authored ownership JSON cannot register. The stored
+record contains the final binding digest, complete non-secret workflow context,
+exact target and correlation-envelope digest. Strict recovery parsing checks the
+context, target and envelope against their hashes. It returns immutable data with
+execution authority explicitly false.
+
+The database uniquely owns `(account_id, workflow_name, instance_id)`, the actual
+Cloudflare API identity. Workflow UUID and version are part of the approved
+binding, but changing them cannot reuse that API identity. An operation cannot
+rebind to another instance. Cancellation retains the original ownership as a
+permanent tombstone. No ownership deletion or reuse API is provided.
+
+Prepared registration and ownership use the existing authority lock. A savepoint
+after that lock rolls back candidate rows on a target conflict while retaining
+the lock for the denial audit. The ownership row has a composite foreign key to
+the exact prepared binding, generated target columns and a unique API identity.
+Registration marks the prepared row as requiring ownership and checks that the
+mark was persisted before committing. Existing generic prepared rows remain
+compatible. An exact legacy parent can acquire ownership; `already_registered`
+then describes the existing parent, rather than prior instance ownership.
+
+`ownership()` reads the authenticated control-plane database after bootstrap
+expiry or cancellation. It recovers the original target without refreshing
+approval, registration or admission. If a commit response is lost, the caller
+receives no registration receipt. A fresh store can read the committed identity
+and retry the exact registration without duplicating ownership or its audit.
+Database loss, invalid persisted data and a missing parent fail closed.
+
+Before signed admission, the bootstrap reads back its exact ownership. The SQL
+reservation transaction independently rechecks required ownership and compares
+its recomputed context digest with the signed operation context. A self-consistent
+record for another target cannot pass that comparison. The existing broker role
+receives no new access to the ownership table. Real PostgreSQL tests exercise
+competing owners, orphan prevention, cancelled tombstones, lost commit responses,
+legacy upgrades, repeated migration, role permissions and reservation-time
+identity corruption. Local transport-fault tests do not establish SQL behavior.
+
+This is durable identity recovery. Durable create intent, authenticated dispatch,
+uncertain provider-create reconciliation and executor effect deduplication remain
+required. Ownership alone cannot prove that a provider instance was created or
+prevent every duplicate external effect.
+
 The existing broker role has SELECT access to prepared operations and cannot
 insert, refresh or cancel them. Bootstrap registration requires the existing
 privileged control-plane pool. Admission retains its existing database privilege
 requirements; this slice adds no grants or deployed role configuration. The
-existing migration extends the audit event constraint with the two registration
-events for both fresh and upgraded databases; existing event names and rows remain
+existing migration extends the audit event constraint with prepared registration,
+registration denial and workflow ownership events for both fresh and upgraded
+databases; existing event names and rows remain
 valid. A failed rollback preserves the original persistence error and attempts an
 integrity audit; a disconnected database cannot promise audit persistence. Real
 PostgreSQL CI checks registration races, broker insertion denial, exact signed
 workflow admission, duplicate prevention and pre-start cancellation with release.
 These test inputs are fixtures, not fresh live host or human approval evidence.
 
-Next: trusted deployment bootstrap and exact-ID engine/executor dispatch, durable
-workflow-instance ownership, authenticated runner session/start/stop/usage and
+Next: trusted deployment bootstrap and exact-ID engine/executor dispatch,
+authenticated runner session/start/stop/usage and
 external-effect reconciliation. A Cloudflare instance is not an OS process.
 Named pilot security acceptance, fresh live access/capacity and explicit human
 approval remain required before a live create call. No live provider operation,
@@ -132,3 +179,14 @@ Creation accepts JSON-encoded `params` and an explicit `instance_id`; its return
 `version_id` differs in spelling from readback's `versionId`. The prepared
 instance prefix is a correlation hint, not evidence of a provider-owned instance.
 No restart, delete, scheduling or termination endpoint is implemented here.
+
+Neither the documented REST create body nor Workers
+`WorkflowInstanceCreateOptions` provides a version selector. Creation starts the
+instance and returns its version afterwards. We therefore cannot use a response
+version check to guarantee that only the approved version ran. Before executor
+effects, a trusted workflow entrypoint and authenticated executor must enforce the
+approved deployment identity. No undocumented `version_id` request field is used.
+
+SQL references: [generated columns](https://www.postgresql.org/docs/17/ddl-generated-columns.html),
+[constraints](https://www.postgresql.org/docs/17/ddl-constraints.html) and
+[savepoint lock behavior](https://www.postgresql.org/docs/17/explicit-locking.html).

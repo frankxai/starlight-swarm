@@ -14,6 +14,7 @@ import {
   startRedemptionInputSchema,
 } from './operation-authority';
 import { sha256Digest } from './runtime-digest';
+import { deriveWorkflowInstanceOwnership, parseWorkflowInstanceOwnership, type WorkflowInstanceOwnership, type WorkflowInstanceOwnershipReadResult } from './workflow-instance-ownership';
 import { USAGE_AUTHORITY_ROUTINE_SQL } from './usage-authority-routines';
 import { REMOTE_STOP_AUTHORITY_ROUTINE_SQL } from './remote-stop-authority-routines';
 import { REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256 } from './remote-stop-authority-routines';
@@ -96,6 +97,7 @@ export type PreparedOperationRegistrationResult =
     operation_id: string; binding_digest_sha256: string;
     registered_at: string; observed_at: string; state: 'ready';
     execution_authority_granted: false;
+    workflow_ownership?: WorkflowInstanceOwnership;
   } }
   | { registered: false; already_registered: false; receipt: null; blockers: string[] };
 const revocationRefsSchema = z.array(z.string().min(5).max(500)).min(1).max(12);
@@ -409,6 +411,26 @@ CREATE TABLE IF NOT EXISTS swarm_authority_prepared_operations (
   operation_id TEXT PRIMARY KEY, binding_digest_sha256 CHAR(64) NOT NULL,
   registered_at TIMESTAMPTZ NOT NULL, state TEXT NOT NULL CHECK (state IN ('ready','cancelled'))
 );
+ALTER TABLE swarm_authority_prepared_operations
+  ADD COLUMN IF NOT EXISTS workflow_ownership_required BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS swarm_authority_prepared_binding_key
+  ON swarm_authority_prepared_operations (operation_id,binding_digest_sha256);
+CREATE TABLE IF NOT EXISTS swarm_authority_workflow_instances (
+  operation_id TEXT PRIMARY KEY, binding_digest_sha256 CHAR(64) NOT NULL,
+  ownership JSONB NOT NULL, registered_at TIMESTAMPTZ NOT NULL,
+  account_id TEXT GENERATED ALWAYS AS (ownership->'target'->>'account_id') STORED NOT NULL,
+  workflow_name TEXT GENERATED ALWAYS AS (ownership->'target'->>'workflow_name') STORED NOT NULL,
+  instance_id TEXT GENERATED ALWAYS AS (ownership->'target'->>'instance_id') STORED NOT NULL,
+  UNIQUE (account_id,workflow_name,instance_id),
+  FOREIGN KEY (operation_id,binding_digest_sha256)
+    REFERENCES swarm_authority_prepared_operations (operation_id,binding_digest_sha256),
+  CHECK ((ownership->>'schema_version'='starlight.workflow_instance_ownership.v1') IS TRUE),
+  CHECK ((ownership->>'operation_id'=operation_id AND ownership->>'binding_digest_sha256'=binding_digest_sha256) IS TRUE),
+  CHECK ((ownership->'activation_authority_granted'='false'::jsonb) IS TRUE),
+  CHECK (account_id ~ '^[a-f0-9]{32}$'),
+  CHECK (workflow_name ~ '^[a-z0-9][a-z0-9._-]{0,63}$'),
+  CHECK (instance_id ~ '^[a-z0-9][a-z0-9._-]{0,99}$')
+);
 CREATE TABLE IF NOT EXISTS swarm_authority_broker_principals (
   database_role TEXT NOT NULL, database_name TEXT NOT NULL,
   broker_execution_identity TEXT NOT NULL UNIQUE, broker_identity_evidence_ref TEXT NOT NULL UNIQUE,
@@ -584,7 +606,7 @@ BEGIN
 END
 $usage_cost_precision_migration$;
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied','workflow-instance-ownership-registered')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -1440,7 +1462,7 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
   CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied','workflow-instance-ownership-registered'));
 ${USAGE_AUTHORITY_ROUTINE_SQL}
 ${REMOTE_STOP_AUTHORITY_ROUTINE_SQL}
 `;
@@ -1997,6 +2019,16 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
 
   /** Bootstrap/admin pool only. Registration is immutable data, never a lease or approval. */
   async registerPreparedOperation(operationId: string, bindingDigestSha256: string, expiresAt?: string): Promise<PreparedOperationRegistrationResult> {
+    return this.registerPreparedOperationCore(operationId, bindingDigestSha256, expiresAt);
+  }
+
+  async registerPreparedWorkflowOperation(operation: unknown, expiresAt: string): Promise<PreparedOperationRegistrationResult> {
+    const ownership = deriveWorkflowInstanceOwnership(operation);
+    return this.registerPreparedOperationCore(ownership.operation_id, ownership.binding_digest_sha256, expiresAt, ownership);
+  }
+
+  private async registerPreparedOperationCore(operationId: string, bindingDigestSha256: string, expiresAt?: string,
+    ownership?: WorkflowInstanceOwnership): Promise<PreparedOperationRegistrationResult> {
     controlId.parse(operationId);
     z.string().regex(/^[a-f0-9]{64}$/).parse(bindingDigestSha256);
     if (expiresAt !== undefined) controlTime.parse(expiresAt);
@@ -2015,6 +2047,9 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         await client.query('COMMIT');
         return { registered: false, already_registered: false, receipt: null, blockers };
       }
+      // Keep the authority lock outside the savepoint. A target conflict rolls back all candidate
+      // rows while its denial still commits under that lock; retries cannot leave an orphan ready row.
+      if (ownership) await client.query('SAVEPOINT workflow_registration');
       const inserted = await client.query(
         `INSERT INTO swarm_authority_prepared_operations
          (operation_id,binding_digest_sha256,registered_at,state) VALUES ($1,$2,$3::timestamptz,'ready')
@@ -2038,6 +2073,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       const registeredAt = sqlInstant(row.registered_at);
       if (Date.parse(registeredAt) > Date.parse(observedAt)) blockers.push('Prepared operation registration is from the future.');
       if (blockers.length) {
+        if (ownership) await client.query('ROLLBACK TO SAVEPOINT workflow_registration');
         await client.query(
           `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
            VALUES ('prepared-operation-registration-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
@@ -2045,6 +2081,53 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         );
         await client.query('COMMIT');
         return { registered: false, already_registered: false, receipt: null, blockers };
+      }
+      if (ownership) {
+        const target = ownership.target;
+        const owned = await client.query(
+          `INSERT INTO swarm_authority_workflow_instances (operation_id,binding_digest_sha256,ownership,registered_at)
+           VALUES ($1,$2,$3::jsonb,$4::timestamptz) ON CONFLICT DO NOTHING RETURNING operation_id`,
+          [operationId, bindingDigestSha256, JSON.stringify(ownership), observedAt],
+        );
+        if (owned.rows.length > 1 || (owned.rows.length === 1 && owned.rows[0].operation_id !== operationId)) {
+          throw new Error('Workflow instance insert returned an ambiguous identity.');
+        }
+        const read = await client.query(
+          `SELECT operation_id,binding_digest_sha256,ownership,registered_at,account_id,workflow_name,instance_id
+           FROM swarm_authority_workflow_instances
+           WHERE operation_id=$1 OR (account_id=$2 AND workflow_name=$3 AND instance_id=$4) FOR UPDATE`,
+          [operationId, target.account_id, target.workflow_name, target.instance_id],
+        );
+        let persisted: WorkflowInstanceOwnership | undefined;
+        if (read.rows.length === 1) persisted = parseWorkflowInstanceOwnership(read.rows[0].ownership);
+        const row = read.rows[0];
+        if (!persisted || sha256Digest(persisted) !== sha256Digest(ownership)
+          || row.operation_id !== operationId || row.binding_digest_sha256 !== bindingDigestSha256
+          || row.account_id !== target.account_id || row.workflow_name !== target.workflow_name || row.instance_id !== target.instance_id
+          || Date.parse(sqlInstant(row.registered_at)) > Date.parse(observedAt)) {
+          await client.query('ROLLBACK TO SAVEPOINT workflow_registration');
+          const blockers = ['Workflow instance has another immutable owner or its persisted identity differs.'];
+          await client.query(
+            `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+             VALUES ('prepared-operation-registration-denied',$1,$2,$3::timestamptz,$4::jsonb)`,
+            [operationId, bindingDigestSha256, observedAt, JSON.stringify({ blockers })],
+          );
+          await client.query('COMMIT');
+          return { registered: false, already_registered: false, receipt: null, blockers };
+        }
+        if (owned.rows.length === 1) await client.query(
+          `INSERT INTO swarm_authority_audit (event,operation_id,binding_digest_sha256,at,detail)
+           VALUES ('workflow-instance-ownership-registered',$1,$2,$3::timestamptz,$4::jsonb)`,
+          [operationId, bindingDigestSha256, observedAt, JSON.stringify({ target_digest_sha256: ownership.target_digest_sha256,
+            envelope_digest_sha256: ownership.envelope_digest_sha256, execution_authority_granted: false })],
+        );
+        const required = await client.query(
+          `UPDATE swarm_authority_prepared_operations SET workflow_ownership_required=TRUE
+           WHERE operation_id=$1 AND binding_digest_sha256=$2
+           RETURNING operation_id,workflow_ownership_required`, [operationId, bindingDigestSha256],
+        );
+        if (required.rows.length !== 1 || required.rows[0].operation_id !== operationId
+          || required.rows[0].workflow_ownership_required !== true) throw new Error('Workflow ownership requirement was not persisted.');
       }
       if (inserted.rows.length === 1) {
         await client.query(
@@ -2058,6 +2141,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         schema_version: 'starlight.prepared_operation_registration.v1', operation_id: operationId,
         binding_digest_sha256: bindingDigestSha256, registered_at: registeredAt, observed_at: observedAt,
         state: 'ready', execution_authority_granted: false,
+        ...(ownership ? { workflow_ownership: ownership } : {}),
       } };
     } catch (error) {
       try { await client.query('ROLLBACK'); } catch { /* Preserve the original unknown persistence outcome. */ }
@@ -2065,6 +2149,33 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         action: 'register-prepared-operation', error: 'Prepared operation persistence did not complete.',
       });
       throw error;
+    } finally { client.release?.(); }
+  }
+
+  /** Authenticated control-plane pool read. Returns canonical identity even after cancellation. */
+  async readWorkflowInstanceOwnership(operationId: string, bindingDigestSha256: string): Promise<WorkflowInstanceOwnershipReadResult> {
+    controlId.parse(operationId); z.string().regex(/^[a-f0-9]{64}$/).parse(bindingDigestSha256);
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(
+        `SELECT w.operation_id,w.binding_digest_sha256,w.ownership,w.registered_at,w.account_id,w.workflow_name,w.instance_id,
+                p.binding_digest_sha256 AS prepared_digest,p.state AS prepared_state,
+                p.workflow_ownership_required,clock_timestamp() AS observed_at
+         FROM swarm_authority_workflow_instances w JOIN swarm_authority_prepared_operations p ON p.operation_id=w.operation_id
+         WHERE w.operation_id=$1`, [operationId],
+      );
+      if (result.rows.length !== 1) return { found: false, ownership: null, execution_authority_granted: false,
+        blockers: ['Workflow instance ownership is missing or ambiguous.'] };
+      const row = result.rows[0]; const ownership = parseWorkflowInstanceOwnership(row.ownership);
+      if (ownership.operation_id !== operationId || ownership.binding_digest_sha256 !== bindingDigestSha256
+        || row.operation_id !== operationId || row.binding_digest_sha256 !== bindingDigestSha256 || row.prepared_digest !== bindingDigestSha256
+        || row.account_id !== ownership.target.account_id || row.workflow_name !== ownership.target.workflow_name || row.instance_id !== ownership.target.instance_id
+        || row.workflow_ownership_required !== true || !['ready', 'cancelled'].includes(String(row.prepared_state))
+        || Date.parse(sqlInstant(row.registered_at)) > Date.parse(sqlInstant(row.observed_at))) {
+        return { found: false, ownership: null, execution_authority_granted: false, blockers: ['Persisted workflow instance ownership differs from the expected binding.'] };
+      }
+      return { found: true, ownership, registered_at: sqlInstant(row.registered_at),
+        prepared_state: row.prepared_state as 'ready' | 'cancelled', execution_authority_granted: false, blockers: [] };
     } finally { client.release?.(); }
   }
 
@@ -5379,13 +5490,29 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
       if (Date.parse(request.reservation_expires_at) <= transactionNowMs) return await deny('Reservation expiry elapsed before it could be issued.');
 
       const preparedRow = await client.query(
-        'SELECT binding_digest_sha256,state FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
+        'SELECT binding_digest_sha256,state,workflow_ownership_required FROM swarm_authority_prepared_operations WHERE operation_id=$1 FOR UPDATE',
         [request.binding.operation_id],
       );
       if (!preparedRow.rows[0]) return await deny('Server-owned prepared operation is missing.');
       if (preparedRow.rows[0].state !== 'ready') return await deny('Server-owned prepared operation is cancelled.');
       if (preparedRow.rows[0].binding_digest_sha256 !== request.binding_digest_sha256) {
         return await deny('Prepared operation digest does not match the signed operation binding.');
+      }
+
+      if (preparedRow.rows[0].workflow_ownership_required === true) {
+        const workflow = await client.query(
+          `SELECT operation_id,binding_digest_sha256,ownership,registered_at,account_id,workflow_name,instance_id
+           FROM swarm_authority_workflow_instances WHERE operation_id=$1`, [request.binding.operation_id],
+        );
+        if (workflow.rows.length !== 1) return await deny('Required workflow instance ownership is missing or ambiguous.');
+        const row = workflow.rows[0]; const ownership = parseWorkflowInstanceOwnership(row.ownership);
+        if (ownership.operation_id !== request.binding.operation_id || ownership.binding_digest_sha256 !== request.binding_digest_sha256
+          || ownership.workflow_context_digest_sha256 !== request.binding.context_digest_sha256
+          || row.operation_id !== ownership.operation_id || row.binding_digest_sha256 !== ownership.binding_digest_sha256
+          || row.account_id !== ownership.target.account_id || row.workflow_name !== ownership.target.workflow_name || row.instance_id !== ownership.target.instance_id
+          || Date.parse(sqlInstant(row.registered_at)) > transactionNowMs) {
+          return await deny('Required workflow instance identity differs from the signed operation context.');
+        }
       }
 
       const hostRow = await client.query(
