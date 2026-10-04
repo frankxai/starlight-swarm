@@ -584,7 +584,7 @@ BEGIN
 END
 $usage_cost_precision_migration$;
 CREATE TABLE IF NOT EXISTS swarm_authority_audit (
-  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled')),
+  seq BIGSERIAL PRIMARY KEY, event TEXT NOT NULL CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied')),
   operation_id TEXT NOT NULL, binding_digest_sha256 CHAR(64) NOT NULL,
   at TIMESTAMPTZ NOT NULL, detail JSONB NOT NULL
 );
@@ -1440,7 +1440,7 @@ ALTER TABLE swarm_authority_reservations ADD CONSTRAINT swarm_authority_reservat
   CHECK (state IN ('reserved-not-started','consumed-not-started','leased-not-started','start-authorized-not-observed','runner-claimed-not-started','runner-start-observed','stop-requested','runner-never-started-observed','runner-terminal-observed','cancelled','expired'));
 ALTER TABLE swarm_authority_audit DROP CONSTRAINT IF EXISTS swarm_authority_audit_event_check;
 ALTER TABLE swarm_authority_audit ADD CONSTRAINT swarm_authority_audit_event_check
-  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled'));
+  CHECK (event IN ('admitted','reserved','denied','revoked','cancelled','consumed','consume-denied','start-lease-issued','start-lease-denied','start-authority-redeemed','start-redemption-denied','runner-claim-accepted','runner-claim-denied','runner-heartbeat-accepted','runner-heartbeat-denied','runner-start-observed','runner-start-denied','runner-outcome-observed','runner-outcome-denied','runner-usage-evidence-observed','runner-usage-evidence-denied','runner-usage-budget-breach','runner-remote-stop-acknowledged','runner-remote-stop-acknowledgement-denied','host-capacity-released','stop-requested','reservation-cancelled','expired','budget-window-registered','budget-window-denied','broker-principal-registered','broker-principal-disabled','remote-stop-principal-registered','remote-stop-principal-disabled','prepared-operation-registered','prepared-operation-registration-denied'));
 ${USAGE_AUTHORITY_ROUTINE_SQL}
 ${REMOTE_STOP_AUTHORITY_ROUTINE_SQL}
 `;
@@ -2060,7 +2060,7 @@ export class PostgresOperationAuthorityStore implements OperationAuthorityStore 
         state: 'ready', execution_authority_granted: false,
       } };
     } catch (error) {
-      await client.query('ROLLBACK');
+      try { await client.query('ROLLBACK'); } catch { /* Preserve the original unknown persistence outcome. */ }
       await this.recordIntegrityRefusal(client, operationId, bindingDigestSha256, {
         action: 'register-prepared-operation', error: 'Prepared operation persistence did not complete.',
       });

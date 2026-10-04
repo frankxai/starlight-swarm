@@ -1313,7 +1313,7 @@ test('consumes once, returns an idempotent receipt, and never persists or audits
     const audit = await h.pool.rows('SELECT event,detail FROM swarm_authority_audit ORDER BY seq');
     assert.deepEqual(audit.map((row) => row.event), [
       'broker-principal-registered', 'budget-window-registered', 'budget-window-registered',
-      'reserved', 'consume-denied', 'consumed',
+      'prepared-operation-registered', 'reserved', 'consume-denied', 'consumed',
     ]);
     assert.doesNotMatch(JSON.stringify(audit), new RegExp(reservation.consume_token));
   } finally { await h.pool.close(); }

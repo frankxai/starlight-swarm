@@ -56,7 +56,11 @@ budget, issues a runner lease or dispatches an effect.
 The existing broker role has SELECT access to prepared operations and cannot
 insert, refresh or cancel them. Bootstrap registration requires the existing
 privileged control-plane pool. Admission retains its existing database privilege
-requirements; this slice adds no grants or deployed role configuration. Real
+requirements; this slice adds no grants or deployed role configuration. The
+existing migration extends the audit event constraint with the two registration
+events for both fresh and upgraded databases; existing event names and rows remain
+valid. A failed rollback preserves the original persistence error and attempts an
+integrity audit; a disconnected database cannot promise audit persistence. Real
 PostgreSQL CI checks registration races, broker insertion denial, exact signed
 workflow admission, duplicate prevention and pre-start cancellation with release.
 These test inputs are fixtures, not fresh live host or human approval evidence.

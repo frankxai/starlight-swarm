@@ -9,12 +9,13 @@ import { sha256Digest } from './runtime-digest';
 const digest = 'a'.repeat(64);
 const now = new Date().toISOString();
 // Fault-injected transport only. Real SQL races/privileges/admission run in PostgreSQL CI.
-function sqlFixture(existing?: Record<string, unknown>, failAt?: string) {
+function sqlFixture(existing?: Record<string, unknown>, failAt?: string, breakRollback = false) {
   const queries: string[] = [];
   let row = existing;
   const pool: AuthoritySqlPool = { connect: async () => ({
     query: async (sql, values) => {
       queries.push(sql);
+      if (breakRollback && sql === 'ROLLBACK') throw new Error('rollback transport failed');
       if (failAt && sql.includes(failAt)) throw new Error('injected persistence failure');
       if (sql.includes('starlight_authority_lock()')) return { rows: [{ locked: true }] };
       if (sql.includes('clock_timestamp()')) return { rows: [{ now }] };
@@ -29,6 +30,11 @@ function sqlFixture(existing?: Record<string, unknown>, failAt?: string) {
   }) };
   return { store: new PostgresOperationAuthorityStore(pool), queries, row: () => row };
 }
+test('rollback transport failure preserves the original unknown commit failure', async () => {
+  const h = sqlFixture(undefined, 'COMMIT', true);
+  await assert.rejects(() => h.store.registerPreparedOperation('operation-one', digest), /injected persistence failure/);
+  assert.equal(h.queries.at(-1), 'RELEASE');
+});
 
 test('legacy registration cannot silently accept a different immutable binding', async () => {
   const h = sqlFixture({ operation_id: 'operation-one', binding_digest_sha256: 'b'.repeat(64), registered_at: now, state: 'ready' });
