@@ -97,8 +97,44 @@
           "instance_id_prefix",
           "binding"
         ],
-        "additionalProperties": false
-      }
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "workload_scope": {
+                    "enum": [
+                      "agent-centric",
+                      "cross-service"
+                    ]
+                  },
+                  "identity_state_owner": {
+                    "const": "cloudflare"
+                  },
+                  "durable_engine": {
+                    "const": "cloudflare-workflows"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "workload_scope": {
+                    "const": "app-local"
+                  },
+                  "identity_state_owner": {
+                    "const": "vercel"
+                  },
+                  "durable_engine": {
+                    "const": "vercel-workflow"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "uniqueItems": true
     },
     "lanes": {
       "minItems": 3,
@@ -328,7 +364,8 @@
           "runtime_config"
         ],
         "additionalProperties": false
-      }
+      },
+      "uniqueItems": true
     },
     "blockers": {
       "type": "array",
@@ -363,6 +400,6 @@
   ],
   "additionalProperties": false,
   "$id": "https://starlight.local/schemas/starlight.prepared_runtime_bundle.v2.schema.json",
-  "$comment": "STRUCTURAL EXPORT ONLY. Exact ownership, source, role, budget and compiler bindings require the runtime parser and canonical verifier. This export grants no operation authority.",
+  "$comment": "STRUCTURAL EXPORT ONLY. Exact ownership, source, role, budget and compiler bindings require the runtime parser and canonical verifier. This export grants no operation authority. Expressible ownership/privacy and exact-object duplicate rules are included; keyed-ID uniqueness, cross-references, exact budget sums and provenance still require the canonical runtime parser/verifier.",
   "x-starlight-validation-authority": "export-only-runtime-parser-required"
 }
