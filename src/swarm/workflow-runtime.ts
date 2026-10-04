@@ -19,7 +19,8 @@ function microUSD(value: number): bigint {
   const fraction = mantissa.split('.')[1]?.length ?? 0;
   const scale = 6 + Number(exponent) - fraction;
   if (!Number.isFinite(value) || value <= 0 || scale < 0 || scale > 22) throw new Error('USD planning caps require positive finite values with at most six decimal places.');
-  const units = BigInt(mantissa.replace('.', '')) * (BigInt(10) ** BigInt(scale));
+  let units = BigInt(mantissa.replace('.', ''));
+  for (let place = 0; place < scale; place += 1) units *= BigInt(10);
   if (units > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('USD planning cap exceeds the safe microdollar range.');
   return units;
 }
