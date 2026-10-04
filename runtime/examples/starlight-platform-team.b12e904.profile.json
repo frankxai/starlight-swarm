@@ -1,0 +1,311 @@
+{
+  "schema_version": "starlight.team_profile.v2",
+  "team": {
+    "id": "starlight-platform-team",
+    "display_name": "Starlight Platform and Tooling",
+    "operating_unit": "starlight-platform",
+    "coordinator_role_id": "coordinator",
+    "verifier_role_id": "qa-release-sre-verifier",
+    "default_team_size": 3,
+    "description": "Control plane, schemas, infrastructure, tooling, MCP, and agent governance."
+  },
+  "roles": [
+    {
+      "id": "coordinator",
+      "profile_ref": "chief-product-operator",
+      "capabilities": [
+        "intake",
+        "product-direction",
+        "routing",
+        "ledger",
+        "integration"
+      ],
+      "write_scopes": [
+        "coordination/**",
+        "docs/decisions/**",
+        ".starlight/**"
+      ],
+      "tools": [
+        "git",
+        "queen",
+        "work-ledger"
+      ],
+      "stop_conditions": [
+        "Conflicting ownership, missing authority, or a human gate is reached."
+      ],
+      "expected_outputs": [
+        "Bounded Queen contract",
+        "Integrated decision and handoff"
+      ]
+    },
+    {
+      "id": "frontend-experience-engineer",
+      "profile_ref": "frontend-experience-engineer",
+      "capabilities": [
+        "frontend",
+        "accessibility",
+        "performance",
+        "interaction"
+      ],
+      "write_scopes": [
+        "app/**",
+        "pages/**",
+        "components/**",
+        "public/**",
+        "styles/**"
+      ],
+      "tools": [
+        "node",
+        "playwright",
+        "vercel"
+      ],
+      "stop_conditions": [
+        "The change requires unapproved identity, claims, credentials, or production-risk expansion."
+      ],
+      "expected_outputs": [
+        "Responsive implementation",
+        "Browser and accessibility evidence"
+      ]
+    },
+    {
+      "id": "backend-data-engineer",
+      "profile_ref": "backend-data-engineer",
+      "capabilities": [
+        "api",
+        "data",
+        "webhooks",
+        "entitlements",
+        "observability"
+      ],
+      "write_scopes": [
+        "api/**",
+        "server/**",
+        "lib/**",
+        "supabase/**",
+        "migrations/**"
+      ],
+      "tools": [
+        "node",
+        "python",
+        "bruno",
+        "sentry"
+      ],
+      "stop_conditions": [
+        "A migration, secret, billing behavior, or restricted data change lacks named approval."
+      ],
+      "expected_outputs": [
+        "Typed adapter implementation",
+        "Idempotency and recovery evidence"
+      ]
+    },
+    {
+      "id": "ai-evaluation-engineer",
+      "profile_ref": "ai-evaluation-engineer",
+      "capabilities": [
+        "ai-engineering",
+        "prompt-evals",
+        "model-routing",
+        "cost-observability"
+      ],
+      "write_scopes": [
+        "ai/**",
+        "prompts/**",
+        "evals/**",
+        "skills/**"
+      ],
+      "tools": [
+        "litellm",
+        "langfuse",
+        "promptfoo"
+      ],
+      "stop_conditions": [
+        "Safety, privacy, cost, or model-quality thresholds cannot be verified."
+      ],
+      "expected_outputs": [
+        "Regression suite",
+        "Trace and cost evidence"
+      ]
+    },
+    {
+      "id": "ux-design-motion-specialist",
+      "profile_ref": "ux-design-motion-specialist",
+      "capabilities": [
+        "ux",
+        "visual-design",
+        "motion",
+        "asset-provenance"
+      ],
+      "write_scopes": [
+        "design/**",
+        "assets/**",
+        "components/**",
+        "design-loop-evidence.json"
+      ],
+      "tools": [
+        "premium-web-os",
+        "visual-intelligence",
+        "motion-design-studio"
+      ],
+      "stop_conditions": [
+        "Asset provenance, reduced-motion behavior, or the premium quality threshold is missing."
+      ],
+      "expected_outputs": [
+        "Page or scene brief",
+        "Inspected exports and quality score"
+      ]
+    },
+    {
+      "id": "qa-release-sre-verifier",
+      "profile_ref": "qa-release-sre",
+      "capabilities": [
+        "qa",
+        "release",
+        "sre",
+        "rollback",
+        "evidence"
+      ],
+      "write_scopes": [
+        "reports/verification/**",
+        "receipts/**"
+      ],
+      "tools": [
+        "git",
+        "playwright",
+        "vercel",
+        "sentry"
+      ],
+      "stop_conditions": [
+        "Any required gate fails, is skipped without reason, or lacks independent evidence."
+      ],
+      "expected_outputs": [
+        "Independent verdict",
+        "Release receipt",
+        "Rollback confirmation"
+      ]
+    },
+    {
+      "id": "security-privacy-reviewer",
+      "profile_ref": "security-privacy-reviewer",
+      "capabilities": [
+        "security",
+        "privacy",
+        "threat-review",
+        "data-classification"
+      ],
+      "write_scopes": [
+        "reports/security/**",
+        "SECURITY.md"
+      ],
+      "tools": [
+        "gitleaks",
+        "osv-scanner",
+        "repo-security-scan"
+      ],
+      "stop_conditions": [
+        "A credential, private-memory leak, untrusted executable, or restricted-data exposure is found."
+      ],
+      "expected_outputs": [
+        "Security verdict",
+        "Required containment actions"
+      ]
+    },
+    {
+      "id": "gtm-analytics-operator",
+      "profile_ref": "gtm-analytics-operator",
+      "capabilities": [
+        "gtm",
+        "analytics",
+        "funnel",
+        "experiments",
+        "support-loop"
+      ],
+      "write_scopes": [
+        "GTM.md",
+        "analytics/**",
+        "experiments/**",
+        "content/drafts/**"
+      ],
+      "tools": [
+        "posthog",
+        "vercel-analytics"
+      ],
+      "stop_conditions": [
+        "A public send, tracking change, spend, legal claim, or customer promise lacks approval."
+      ],
+      "expected_outputs": [
+        "Instrumented funnel",
+        "Experiment and learning packet"
+      ]
+    }
+  ],
+  "routing": {
+    "required_roles": [
+      "coordinator",
+      "backend-data-engineer",
+      "qa-release-sre-verifier"
+    ],
+    "optional_roles": [
+      "ai-evaluation-engineer",
+      "security-privacy-reviewer",
+      "frontend-experience-engineer"
+    ],
+    "handoff_rules": [
+      "Select only the smallest 3-5 role team needed for the bounded job.",
+      "The worker that changes a release surface cannot be its independent verifier.",
+      "Stop and request named approval when any human-gated action is required."
+    ]
+  },
+  "permissions": {
+    "allowed_actions": [
+      "read",
+      "edit-owned-paths",
+      "test",
+      "draft-pr",
+      "low-risk-green-promotion"
+    ],
+    "human_gate_actions": [
+      "production_high_risk",
+      "dns_change",
+      "secret_change",
+      "billing_change",
+      "spend",
+      "data_migration",
+      "destructive",
+      "external_send",
+      "legal_ip",
+      "brand_identity",
+      "permission_change"
+    ],
+    "default_write_scope": [
+      "assigned-repo/**"
+    ]
+  },
+  "bindings": {
+    "skills": [
+      "starlight-work-ledger",
+      "starlight-agent-ledger",
+      "starlight-swarm-orchestration",
+      "repo-harness"
+    ],
+    "plugins": [
+      "starlight-control-plane"
+    ],
+    "tools": [
+      "git",
+      "python",
+      "powershell",
+      "github",
+      "vercel"
+    ]
+  },
+  "eval_suite": [
+    "repo-contract-integrity",
+    "release-evidence-integrity"
+  ],
+  "ownership": {
+    "owner": "starlight-substrate-ops",
+    "version": "2.0.0",
+    "review_date": "2026-08-10"
+  },
+  "extensions": {}
+}

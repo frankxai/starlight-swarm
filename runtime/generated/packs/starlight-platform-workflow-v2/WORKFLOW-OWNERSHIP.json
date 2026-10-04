@@ -1,0 +1,33 @@
+{
+  "workflow_ownership": [
+    {
+      "workflow_id": "creator-engineering",
+      "workload_scope": "agent-centric",
+      "identity_state_owner": "cloudflare",
+      "durable_engine": "cloudflare-workflows"
+    }
+  ],
+  "lanes": [
+    {
+      "id": "operator-intelligence",
+      "role_id": "coordinator",
+      "workflow_id": "creator-engineering",
+      "mission_authority": "cloudflare-workflows",
+      "runtime": "cloudflare-workflows"
+    },
+    {
+      "id": "durable-builder",
+      "role_id": "backend-data-engineer",
+      "workflow_id": "creator-engineering",
+      "mission_authority": "cloudflare-workflows",
+      "runtime": "railway-worker"
+    },
+    {
+      "id": "independent-verifier",
+      "role_id": "qa-release-sre-verifier",
+      "workflow_id": "creator-engineering",
+      "mission_authority": "cloudflare-workflows",
+      "runtime": "hermes-local"
+    }
+  ]
+}

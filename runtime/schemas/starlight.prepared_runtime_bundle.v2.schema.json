@@ -1,0 +1,368 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "starlight.prepared_runtime_bundle.v2"
+    },
+    "compiler_version": {
+      "type": "string",
+      "const": "starlight.team_pack.compiler.v3"
+    },
+    "team_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+    },
+    "status": {
+      "type": "string",
+      "const": "prepared-human-approval-required"
+    },
+    "plan_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_profile_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_runtime_policy_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "pack_digest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "workflows": {
+      "minItems": 1,
+      "maxItems": 5,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "workflow_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "workload_scope": {
+            "type": "string",
+            "enum": [
+              "agent-centric",
+              "cross-service",
+              "app-local"
+            ]
+          },
+          "identity_state_owner": {
+            "type": "string",
+            "enum": [
+              "cloudflare",
+              "vercel"
+            ]
+          },
+          "durable_engine": {
+            "type": "string",
+            "enum": [
+              "cloudflare-workflows",
+              "vercel-workflow"
+            ]
+          },
+          "deployment_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "instance_id_prefix": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "binding": {
+            "type": "string",
+            "enum": [
+              "STARLIGHT_WORKFLOW",
+              "starlight-mission"
+            ]
+          }
+        },
+        "required": [
+          "workflow_id",
+          "workload_scope",
+          "identity_state_owner",
+          "durable_engine",
+          "deployment_id",
+          "instance_id_prefix",
+          "binding"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "lanes": {
+      "minItems": 3,
+      "maxItems": 5,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "starlight.prepared_runtime_lane.v2"
+          },
+          "deployment_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "team_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "lane_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "role_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "workflow_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "mission_authority": {
+            "type": "string",
+            "enum": [
+              "cloudflare-workflows",
+              "vercel-workflow"
+            ]
+          },
+          "runtime": {
+            "type": "string",
+            "enum": [
+              "cloudflare-workflows",
+              "vercel-workflow",
+              "railway-worker",
+              "hermes-local",
+              "n8n-integration"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "const": "prepared-human-approval-required"
+          },
+          "plan_digest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "pack_digest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "runtime_policy_digest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "max_concurrency": {
+            "type": "number",
+            "const": 1
+          },
+          "lease_ttl_seconds": {
+            "type": "number",
+            "const": 900
+          },
+          "heartbeat_timeout_seconds": {
+            "type": "number",
+            "const": 120
+          },
+          "kill_switch": {
+            "type": "string",
+            "pattern": "^STARLIGHT_KILL_[A-F0-9]{32}$"
+          },
+          "activation_authority": {
+            "type": "string",
+            "const": "trusted-workflow-engine-authority-not-implemented"
+          },
+          "required_secret_names": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Z0-9_]+$"
+            }
+          },
+          "runtime_config": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "cloudflare-workflows",
+                      "vercel-workflow"
+                    ]
+                  },
+                  "deployment_target": {
+                    "type": "string",
+                    "const": "bound-workflow-engine"
+                  },
+                  "workflow_deployment_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "deployment_target",
+                  "workflow_deployment_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "railway-worker"
+                  },
+                  "deployment_target": {
+                    "type": "string",
+                    "const": "existing-railway-service"
+                  },
+                  "queue": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  },
+                  "workflow_deployment_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "deployment_target",
+                  "queue",
+                  "workflow_deployment_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "hermes-local"
+                  },
+                  "deployment_target": {
+                    "type": "string",
+                    "const": "isolated-hermes-profile"
+                  },
+                  "profile": {
+                    "type": "string",
+                    "const": "starlight-team-worker"
+                  },
+                  "workflow_deployment_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "deployment_target",
+                  "profile",
+                  "workflow_deployment_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "n8n-integration"
+                  },
+                  "deployment_target": {
+                    "type": "string",
+                    "const": "existing-n8n-service"
+                  },
+                  "workflow_tag": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  },
+                  "workflow_deployment_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "deployment_target",
+                  "workflow_tag",
+                  "workflow_deployment_id"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "deployment_id",
+          "team_id",
+          "lane_id",
+          "role_id",
+          "workflow_id",
+          "mission_authority",
+          "runtime",
+          "status",
+          "plan_digest_sha256",
+          "pack_digest_sha256",
+          "runtime_policy_digest_sha256",
+          "max_concurrency",
+          "lease_ttl_seconds",
+          "heartbeat_timeout_seconds",
+          "kill_switch",
+          "activation_authority",
+          "required_secret_names",
+          "runtime_config"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "string",
+          "const": "Workflow-engine operation-time authority and authenticated executor transport are not implemented."
+        },
+        {
+          "type": "string",
+          "const": "Fresh owner binding, access, health, capacity, cumulative budget and named human approval are required."
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    }
+  },
+  "required": [
+    "schema_version",
+    "compiler_version",
+    "team_id",
+    "generated_at",
+    "status",
+    "plan_digest_sha256",
+    "source_profile_digest_sha256",
+    "source_runtime_policy_digest_sha256",
+    "pack_digest_sha256",
+    "workflows",
+    "lanes",
+    "blockers"
+  ],
+  "additionalProperties": false,
+  "$id": "https://starlight.local/schemas/starlight.prepared_runtime_bundle.v2.schema.json",
+  "$comment": "STRUCTURAL EXPORT ONLY. Exact ownership, source, role, budget and compiler bindings require the runtime parser and canonical verifier. This export grants no operation authority.",
+  "x-starlight-validation-authority": "export-only-runtime-parser-required"
+}

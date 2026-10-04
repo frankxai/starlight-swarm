@@ -9,7 +9,7 @@ export interface PackBinding {
   source_profile_digest_sha256: string;
   source_runtime_policy_digest_sha256: string;
   pack_digest_sha256: string;
-  compiler_version: 'starlight.team_pack.compiler.v2';
+  compiler_version: 'starlight.team_pack.compiler.v2' | 'starlight.team_pack.compiler.v3';
 }
 
 export interface ApprovalReceipt extends PackBinding {
@@ -107,7 +107,7 @@ export function parseRuntimeAdmissionEvidence(input: unknown): RuntimeAdmissionE
   return result.data as RuntimeAdmissionEvidence;
 }
 
-export function computePlanDigest(plan: TeamRuntimePlan): string {
+export function computePlanDigest(plan: TeamRuntimePlan | import('./workflow-runtime').WorkflowRuntimePlan): string {
   return sha256Digest(plan);
 }
 

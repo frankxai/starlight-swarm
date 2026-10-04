@@ -3,8 +3,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 
 import { sha256Digest } from './runtime-digest';
-import { parseTeamRuntimePlan } from './runtime-plan-contract';
-import { parseRuntimePlanningPolicy } from './runtime-policy';
+import { parseGovernedRuntimePlan, parseGovernedRuntimePlanningPolicy } from './workflow-runtime';
 import { parseTeamProfile } from './runtime-planner';
 import { compileTeamPack } from './team-pack';
 
@@ -12,8 +11,8 @@ const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const issuedVerificationResults = new WeakSet<object>();
 const manifestSchema = z
   .object({
-    schema_version: z.literal('starlight.team_pack.v1'),
-    compiler_version: z.literal('starlight.team_pack.compiler.v2'),
+    schema_version: z.enum(['starlight.team_pack.v1', 'starlight.team_pack.v2']),
+    compiler_version: z.enum(['starlight.team_pack.compiler.v2', 'starlight.team_pack.compiler.v3']),
     team_id: z.string().min(1),
     team_profile_version: z.string().min(1),
     generated_at: z.string().datetime({ offset: true }),
@@ -78,7 +77,7 @@ export interface TeamPackVerificationResult {
   source_profile_digest_sha256: string;
   source_runtime_policy_digest_sha256: string;
   pack_digest_sha256: string;
-  compiler_version: 'starlight.team_pack.compiler.v2';
+  compiler_version: 'starlight.team_pack.compiler.v2' | 'starlight.team_pack.compiler.v3';
   files_verified: number;
 }
 
@@ -94,9 +93,9 @@ export function verifyTeamPackDirectory(
   untrustedProfile: unknown,
   untrustedRuntimePolicy: unknown,
 ): TeamPackVerificationResult {
-  const plan = parseTeamRuntimePlan(untrustedPlan);
+  const plan = parseGovernedRuntimePlan(untrustedPlan);
   const profile = parseTeamProfile(untrustedProfile);
-  const runtimePolicy = parseRuntimePlanningPolicy(untrustedRuntimePolicy);
+  const runtimePolicy = parseGovernedRuntimePlanningPolicy(untrustedRuntimePolicy);
   const canonicalPlanDigest = sha256Digest(plan);
   const canonicalProfileDigest = sha256Digest(profile);
   const root = resolve(directory);
@@ -173,7 +172,7 @@ export function verifyTeamPackDirectory(
   if (!declared.has('RUNTIME-POLICY.json')) {
     throw new Error('Team pack must declare its exact runtime policy source.');
   }
-  const packagedPolicy = parseRuntimePlanningPolicy(
+  const packagedPolicy = parseGovernedRuntimePlanningPolicy(
     JSON.parse(readFileSync(resolveDeclaredFile(root, 'RUNTIME-POLICY.json'), 'utf8')),
   );
   if (packagedPolicy.source_digest_sha256 !== runtimePolicy.source_digest_sha256) {

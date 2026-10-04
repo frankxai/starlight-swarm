@@ -4,6 +4,8 @@ import { computePlanDigest } from './runtime-admission';
 import { sha256Digest } from './runtime-digest';
 import { parseTeamRuntimePlan } from './runtime-plan-contract';
 import type { RuntimeId, TeamRuntimePlan } from './runtime-planner';
+import { parseGovernedRuntimePlan } from './workflow-runtime';
+import { parsePreparedWorkflowBundle, prepareWorkflowBundle, type PreparedWorkflowBundle } from './workflow-runtime-adapters';
 import {
   isIssuedTeamPackVerificationResult,
   type TeamPackVerificationResult,
@@ -304,11 +306,13 @@ function prepareLane(
 export function prepareRuntimeBundle(
   untrustedPlan: unknown,
   verification: TeamPackVerificationResult,
-): PreparedRuntimeBundle {
+): PreparedRuntimeBundle | PreparedWorkflowBundle {
   if (!isIssuedTeamPackVerificationResult(verification)) {
     throw new Error('Pack verification receipt was not issued by the team-pack verifier.');
   }
-  const plan = parseTeamRuntimePlan(untrustedPlan);
+  const governedPlan = parseGovernedRuntimePlan(untrustedPlan);
+  if (governedPlan.schema_version === 'starlight.team_runtime_plan.v2') return prepareWorkflowBundle(governedPlan, verification);
+  const plan = parseTeamRuntimePlan(governedPlan);
   const planDigest = computePlanDigest(plan);
   if (
     verification.team_id !== plan.team_id ||
@@ -337,7 +341,8 @@ export function prepareRuntimeBundle(
   };
 }
 
-export function parsePreparedRuntimeBundle(input: unknown): PreparedRuntimeBundle {
+export function parsePreparedRuntimeBundle(input: unknown): PreparedRuntimeBundle | PreparedWorkflowBundle {
+  if (input && typeof input === 'object' && (input as Record<string, unknown>).schema_version === 'starlight.prepared_runtime_bundle.v2') return parsePreparedWorkflowBundle(input);
   const result = preparedRuntimeBundleSchema.safeParse(input);
   if (!result.success) {
     throw new Error(`Invalid prepared runtime bundle: ${result.error.message}`);
@@ -349,7 +354,7 @@ export function verifyPreparedRuntimeBundle(
   input: unknown,
   untrustedPlan: unknown,
   verification: TeamPackVerificationResult,
-): PreparedRuntimeBundle {
+): PreparedRuntimeBundle | PreparedWorkflowBundle {
   const parsed = parsePreparedRuntimeBundle(input);
   const canonical = prepareRuntimeBundle(untrustedPlan, verification);
   if (sha256Digest(parsed) !== sha256Digest(canonical)) {
