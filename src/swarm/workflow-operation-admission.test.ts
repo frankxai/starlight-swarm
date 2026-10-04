@@ -6,20 +6,38 @@ import { bindCloudflareWorkflowOperation } from './workflow-operation-context';
 import { workflowOperationFixture } from './workflow-operation-test-fixtures';
 import { sha256Digest } from './runtime-digest';
 import type { AtomicAdmissionRequest } from './operation-authority';
+import { deriveWorkflowInstanceOwnership, type WorkflowInstanceOwnership } from './workflow-instance-ownership';
 
 const digest = 'a'.repeat(64);
 const now = new Date().toISOString();
 // Fault-injected transport only. Real SQL races/privileges/admission run in PostgreSQL CI.
-function sqlFixture(existing?: Record<string, unknown>, failAt?: string, breakRollback = false) {
+function sqlFixture(existing?: Record<string, unknown>, failAt?: string, breakRollback = false,
+  existingOwnership?: WorkflowInstanceOwnership) {
   const queries: string[] = [];
   let row = existing;
+  let ownership = existingOwnership;
   const pool: AuthoritySqlPool = { connect: async () => ({
     query: async (sql, values) => {
       queries.push(sql);
       if (breakRollback && sql === 'ROLLBACK') throw new Error('rollback transport failed');
       if (failAt && sql.includes(failAt)) throw new Error('injected persistence failure');
       if (sql.includes('starlight_authority_lock()')) return { rows: [{ locked: true }] };
-      if (sql.includes('clock_timestamp()')) return { rows: [{ now }] };
+      if (sql === 'SELECT clock_timestamp() AS now') return { rows: [{ now }] };
+      if (sql.startsWith('INSERT INTO swarm_authority_workflow_instances')) {
+        const inserted = !ownership;
+        ownership ??= JSON.parse(String(values![2]));
+        return { rows: inserted ? [{ operation_id: values![0] }] : [] };
+      }
+      if (sql.includes('FROM swarm_authority_workflow_instances')) return { rows: ownership ? [{
+        operation_id: ownership.operation_id, binding_digest_sha256: ownership.binding_digest_sha256,
+        ownership, registered_at: now, account_id: ownership.target.account_id,
+        workflow_name: ownership.target.workflow_name, instance_id: ownership.target.instance_id,
+        prepared_digest: row?.binding_digest_sha256, prepared_state: row?.state,
+        workflow_ownership_required: true, observed_at: now,
+      }] : [] };
+      if (sql.startsWith('UPDATE swarm_authority_prepared_operations SET workflow_ownership_required')) {
+        return { rows: [{ operation_id: values![0], workflow_ownership_required: true }] };
+      }
       if (sql.startsWith('INSERT INTO swarm_authority_prepared_operations')) {
         const inserted = !row;
         row ??= { operation_id: values![0], binding_digest_sha256: values![1], registered_at: values![2], state: 'ready' };
@@ -139,10 +157,13 @@ test('expired bootstrap cannot register or admit and denial is audited', async (
   assert.ok(h.queries.some((sql) => sql.includes('INSERT INTO swarm_authority_audit')));
 });
 test('invalid signatures cannot reserve and workload fields cannot replace the sealed operation', async () => {
-  const operation = bound(); const h = sqlFixture();
+  const operation = bound(); const ownership = deriveWorkflowInstanceOwnership(operation);
+  const h = sqlFixture({ operation_id: operation.binding.operation_id, binding_digest_sha256: ownership.binding_digest_sha256,
+    registered_at: now, state: 'ready' }, undefined, false, ownership);
   const client = new CloudflareWorkflowOperationAdmission(config(operation), operation, h.store, h.store, keyring);
   const result = await client.admit({ approval_receipt: {}, budget_receipt: {}, reservation_duration_ms: 1000 });
   assert.equal(result.admitted, false);
+  assert.match(result.blockers.join(' '), /approval|budget|receipt/i);
   const injected = await client.admit({ binding: { ...operation.binding, host_id: 'other-host' }, approval_receipt: {}, budget_receipt: {}, reservation_duration_ms: 1000 });
   assert.equal(injected.admitted, false);
   assert.match(injected.blockers.join(' '), /invalid/i);
@@ -150,3 +171,35 @@ test('invalid signatures cannot reserve and workload fields cannot replace the s
   assert.equal(Object.isFrozen(client), true);
   assert.deepEqual(Object.keys(client), []);
 });
+
+test('missing workflow ownership cannot fall back to legacy prepared admission', async () => {
+  const operation = bound(); const h = sqlFixture({ operation_id: operation.binding.operation_id,
+    binding_digest_sha256: sha256Digest(operation.binding), registered_at: now, state: 'ready' });
+  const client = new CloudflareWorkflowOperationAdmission(config(operation), operation, h.store, h.store, keyring);
+  const denied = await client.admit({ approval_receipt: {}, budget_receipt: {}, reservation_duration_ms: 1000 });
+  assert.equal(denied.admitted, false); assert.match(denied.blockers.join(' '), /ownership.*missing/i);
+  assert.equal(h.queries.some((sql) => sql.includes('swarm_authority_reservations')), false);
+});
+
+test('expired bootstrap can recover cancelled ownership without refreshing registration or admission', async () => {
+  const operation = bound(); const ownership = deriveWorkflowInstanceOwnership(operation);
+  const h = sqlFixture({ operation_id: operation.binding.operation_id, binding_digest_sha256: ownership.binding_digest_sha256,
+    registered_at: now, state: 'cancelled' }, undefined, false, ownership);
+  const client = new CloudflareWorkflowOperationAdmission({ ...config(operation), expires_at: '2020-01-01T00:00:00Z' }, operation, h.store, h.store, keyring);
+  const recovered = await client.ownership();
+  assert.equal(recovered.found, true);
+  if (!recovered.found) assert.fail('Expected recoverable ownership.');
+  assert.deepEqual(recovered.ownership, ownership); assert.equal(recovered.prepared_state, 'cancelled');
+  assert.equal(recovered.execution_authority_granted, false);
+  assert.equal(h.queries.some((sql) => /INSERT|UPDATE|COMMIT/.test(sql)), false);
+  assert.equal((await client.register()).registered, false);
+});
+
+for (const failAt of ['INSERT INTO swarm_authority_workflow_instances', 'FROM swarm_authority_workflow_instances',
+  "VALUES ('workflow-instance-ownership-registered'", 'SET workflow_ownership_required', 'COMMIT']) {
+  test(`workflow persistence failure at ${failAt} cannot return a registration capability`, async () => {
+    const h = sqlFixture(undefined, failAt, true);
+    await assert.rejects(() => h.store.registerPreparedWorkflowOperation(bound(), config().expires_at), /injected persistence failure/);
+    assert.ok(h.queries.includes('ROLLBACK')); assert.equal(h.queries.at(-1), 'RELEASE');
+  });
+}

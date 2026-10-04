@@ -19,6 +19,7 @@ import { sha256Digest } from './runtime-digest';
 import { CloudflareWorkflowOperationAdmission } from './workflow-operation-admission';
 import { bindCloudflareWorkflowOperation } from './workflow-operation-context';
 import { workflowOperationFixture } from './workflow-operation-test-fixtures';
+import { deriveWorkflowInstanceOwnership, parseWorkflowInstanceOwnership } from './workflow-instance-ownership';
 import {
   BROKER_DATABASE_ROLE_CONTRACT_SHA256,
   attestUsageEvidenceDatabaseSession,
@@ -231,7 +232,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
     currentUsageEvidence = undefined;
     currentRemoteStopAcknowledgement = undefined;
     await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
-      swarm_authority_budgets,swarm_authority_prepared_operations,
+      swarm_authority_budgets,swarm_authority_workflow_instances,swarm_authority_prepared_operations,
       swarm_authority_budget_holds,swarm_authority_budget_windows,
       swarm_authority_remote_stop_acknowledgements,swarm_authority_remote_stop_principals,
       swarm_authority_usage_evidence,swarm_authority_usage_tokens,swarm_authority_heartbeat_tokens,
@@ -655,6 +656,140 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
       const rows = await pool.query('SELECT * FROM swarm_authority_prepared_operations WHERE operation_id=$1', ['broker-self-register']);
       assert.equal(rows.rowCount, 0);
     });
+    await t.test('competing operations cannot own the same Cloudflare API instance or leave orphan prepared rows', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const expires = new Date(Date.now() + 60_000).toISOString();
+        const operations = Array.from({ length: 8 }, (_, index) => bindCloudflareWorkflowOperation(
+          fixture.plan, fixture.profile, fixture.verification,
+          { ...fixture.binding, operation_id: `workflow-owner-${index}` }, fixture.target));
+        const results = await Promise.all(operations.map((operation) =>
+          new PostgresOperationAuthorityStore(authorityPool).registerPreparedWorkflowOperation(operation, expires)));
+        assert.equal(results.filter((result) => result.registered).length, 1);
+        assert.equal(results.filter((result) => !result.registered).length, 7);
+        const winner = results.findIndex((result) => result.registered);
+        const ownership = await store.readWorkflowInstanceOwnership(operations[winner].binding.operation_id, sha256Digest(operations[winner].binding));
+        assert.equal(ownership.found, true);
+        if (!ownership.found) assert.fail('Expected durable ownership.');
+        assert.deepEqual(ownership.ownership, deriveWorkflowInstanceOwnership(operations[winner]));
+        const parents = await pool.query("SELECT operation_id,workflow_ownership_required FROM swarm_authority_prepared_operations WHERE operation_id LIKE 'workflow-owner-%'");
+        assert.deepEqual(parents.rows, [{ operation_id: operations[winner].binding.operation_id, workflow_ownership_required: true }]);
+        const audits = await pool.query("SELECT event,count(*)::int AS count FROM swarm_authority_audit WHERE operation_id LIKE 'workflow-owner-%' GROUP BY event");
+        const counts = Object.fromEntries(audits.rows.map((row) => [row.event, row.count]));
+        assert.deepEqual(counts, { 'prepared-operation-registered': 1, 'workflow-instance-ownership-registered': 1, 'prepared-operation-registration-denied': 7 });
+      } finally { fixture.cleanup(); }
+    });
+    await t.test('a cancelled owner keeps its exact target and blocks reuse across workflow UUID and version changes', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const expires = new Date(Date.now() + 60_000).toISOString();
+        assert.equal((await store.registerPreparedWorkflowOperation(operation, expires)).registered, true);
+        await store.cancelPreparedOperation(operation.binding.operation_id);
+        const recovered = await new PostgresOperationAuthorityStore(authorityPool).readWorkflowInstanceOwnership(operation.binding.operation_id, sha256Digest(operation.binding));
+        assert.equal(recovered.found, true);
+        if (!recovered.found) assert.fail('Expected durable ownership.');
+        assert.equal(recovered.prepared_state, 'cancelled'); assert.equal(recovered.execution_authority_granted, false);
+        assert.deepEqual(recovered.ownership.target, fixture.target);
+        assert.equal((await store.registerPreparedWorkflowOperation(operation, expires)).registered, false);
+        const changes = [{ workflow_uuid: '33333333-3333-4333-8333-333333333333' },
+          { version_id: '44444444-4444-4444-8444-444444444444' }];
+        for (let index = 0; index < changes.length; index += 1) {
+          const another = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification,
+            { ...fixture.binding, operation_id: `workflow-reuse-${index}` }, { ...fixture.target, ...changes[index] });
+          const denied = await store.registerPreparedWorkflowOperation(another, expires);
+          assert.equal(denied.registered, false); assert.match(denied.blockers.join(' '), /immutable owner/i);
+        }
+        const rows = await pool.query("SELECT operation_id FROM swarm_authority_prepared_operations WHERE operation_id LIKE 'workflow-reuse-%'");
+        assert.equal(rows.rowCount, 0);
+        assert.equal((await pool.query('SELECT * FROM swarm_authority_workflow_instances')).rowCount, 1);
+      } finally { fixture.cleanup(); }
+    });
+    await t.test('ownership cannot rebind an operation to a different instance and wrong recovery digests fail closed', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const expires = new Date(Date.now() + 60_000).toISOString();
+        const first = await store.registerPreparedWorkflowOperation(operation, expires);
+        assert.equal(first.registered, true);
+        const changed = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification,
+          fixture.binding, { ...fixture.target, instance_id: 'other-instance' });
+        assert.equal((await store.registerPreparedWorkflowOperation(changed, expires)).registered, false);
+        assert.equal((await store.readWorkflowInstanceOwnership(operation.binding.operation_id, 'f'.repeat(64))).found, false);
+        const recovered = await store.readWorkflowInstanceOwnership(operation.binding.operation_id, sha256Digest(operation.binding));
+        assert.equal(recovered.found, true);
+        if (!recovered.found) assert.fail('Expected durable ownership.');
+        assert.equal(recovered.ownership.target.instance_id, fixture.target.instance_id);
+        assert.equal((await pool.query('SELECT * FROM swarm_authority_workflow_instances')).rowCount, 1);
+      } finally { fixture.cleanup(); }
+    });
+    await t.test('committed ownership survives lost commit acknowledgement and reconstructed-store retry emits no duplicate audit', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const expires = new Date(Date.now() + 60_000).toISOString(); let loseAcknowledgement = true;
+        const faultPool: AuthoritySqlPool = { connect: async () => {
+          const client = await authorityPool.connect();
+          return { query: async (sql, values) => {
+            const result = await client.query(sql, values);
+            if (sql === 'COMMIT' && loseAcknowledgement) { loseAcknowledgement = false; throw new Error('commit acknowledgement lost after persistence'); }
+            return result;
+          }, release: () => client.release?.() };
+        } };
+        await assert.rejects(() => new PostgresOperationAuthorityStore(faultPool).registerPreparedWorkflowOperation(operation, expires), /acknowledgement lost/);
+        const recovered = await new PostgresOperationAuthorityStore(authorityPool).readWorkflowInstanceOwnership(operation.binding.operation_id, sha256Digest(operation.binding));
+        assert.equal(recovered.found, true);
+        if (!recovered.found) assert.fail('Expected durable ownership.');
+        const retry = await new PostgresOperationAuthorityStore(authorityPool).registerPreparedWorkflowOperation(operation, expires);
+        assert.equal(retry.registered, true);
+        if (!retry.registered) assert.fail('Expected idempotent registration retry.');
+        assert.equal(retry.already_registered, true); assert.equal(retry.receipt.registered_at, recovered.registered_at);
+        assert.deepEqual(retry.receipt.workflow_ownership, recovered.ownership);
+        const audits = await pool.query("SELECT event FROM swarm_authority_audit WHERE operation_id=$1 AND event IN ('workflow-instance-ownership-registered','prepared-operation-registered')", [operation.binding.operation_id]);
+        assert.equal(audits.rowCount, 2);
+      } finally { fixture.cleanup(); }
+    });
+    await t.test('legacy prepared rows upgrade only for their exact binding and repeated migration preserves ownership', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const digest = sha256Digest(operation.binding); const expires = new Date(Date.now() + 60_000).toISOString();
+        const legacy = await store.registerPreparedOperation(operation.binding.operation_id, digest);
+        assert.equal(legacy.registered, true);
+        assert.equal((await store.readWorkflowInstanceOwnership(operation.binding.operation_id, digest)).found, false);
+        const upgrade = await store.registerPreparedWorkflowOperation(operation, expires);
+        assert.equal(upgrade.registered, true);
+        if (!upgrade.registered) assert.fail('Expected exact prepared-parent upgrade.');
+        assert.equal(upgrade.already_registered, true); // This field refers to the prepared parent.
+        await bootstrapStore.initialize();
+        const recovered = await store.readWorkflowInstanceOwnership(operation.binding.operation_id, digest);
+        assert.equal(recovered.found, true);
+        if (!recovered.found) assert.fail('Expected durable ownership.');
+        assert.deepEqual(recovered.ownership, deriveWorkflowInstanceOwnership(operation));
+        const wrong = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification,
+          { ...fixture.binding, operation_id: 'workflow-wrong-legacy' }, { ...fixture.target, instance_id: 'wrong-legacy-instance' });
+        await store.registerPreparedOperation(wrong.binding.operation_id, 'f'.repeat(64));
+        assert.equal((await store.registerPreparedWorkflowOperation(wrong, expires)).registered, false);
+        assert.equal((await pool.query('SELECT * FROM swarm_authority_workflow_instances')).rowCount, 1);
+      } finally { fixture.cleanup(); }
+    });
+    await t.test('broker role cannot read, create, rebind or delete workflow ownership and SQL rejects missing ownership keys', async () => {
+      await prepare(); const fixture = workflowOperationFixture();
+      try {
+        const operation = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding, fixture.target);
+        const ownership = deriveWorkflowInstanceOwnership(operation);
+        assert.equal((await store.registerPreparedWorkflowOperation(operation, new Date(Date.now() + 60_000).toISOString())).registered, true);
+        for (const sql of ['SELECT * FROM swarm_authority_workflow_instances',
+          "INSERT INTO swarm_authority_workflow_instances (operation_id,binding_digest_sha256,ownership,registered_at) SELECT operation_id,binding_digest_sha256,ownership,registered_at FROM swarm_authority_workflow_instances",
+          "UPDATE swarm_authority_workflow_instances SET ownership='{}'::jsonb", 'DELETE FROM swarm_authority_workflow_instances']) {
+          await assert.rejects(() => brokerRolePool.query(sql), /permission denied/i);
+        }
+        await assert.rejects(() => pool.query("UPDATE swarm_authority_workflow_instances SET ownership=ownership-'activation_authority_granted'"), /check constraint/i);
+        await assert.rejects(() => pool.query("UPDATE swarm_authority_workflow_instances SET binding_digest_sha256=$1", ['f'.repeat(64)]), /check constraint|foreign key/i);
+        const recovered = await store.readWorkflowInstanceOwnership(operation.binding.operation_id, ownership.binding_digest_sha256);
+        assert.equal(recovered.found, true);
+      } finally { fixture.cleanup(); }
+    });
     await t.test('a real verified workflow operation registers, admits exactly once and cancels durably', async () => {
       await prepare();
       const fixture = workflowOperationFixture();
@@ -681,7 +816,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
           budget_policy_id: operation.binding.budget_policy_id, hard_limit_usd: 2 }, budgetSecret);
         const request = { approval_receipt: approval, budget_receipt: budget, reservation_duration_ms: 5 * 60_000 };
         const missing = await client.admit(request); assert.equal(missing.admitted, false);
-        assert.match(missing.blockers.join(' '), /prepared operation is missing/i);
+        assert.match(missing.blockers.join(' '), /ownership is missing/i);
         const registered = await client.register(); assert.equal(registered.registered, true);
         for (const kind of ['policy', 'daily'] as const) await store.registerBudgetWindow({
           window_id: `workflow-window-${kind}`, policy_id: operation.binding.budget_policy_id, kind,
@@ -694,6 +829,28 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         const staleApproval = signApprovalReceipt({ ...approval, binding_digest_sha256: sha256Digest(fixture.binding) }, approvalSecret);
         const stale = await client.admit({ ...request, approval_receipt: staleApproval });
         assert.equal(stale.admitted, false); assert.match(stale.blockers.join(' '), /another operation/);
+        // A generic authority must also check the workflow identity inside its reservation
+        // transaction. A prior control-plane read cannot substitute for this check.
+        const direct = new OperationAuthority(store, { approvalIssuers: { 'postgres-approval': { 'postgres-approval-key': approvalSecret } },
+          budgetIssuers: { 'postgres-budget': { 'postgres-budget-key': budgetSecret } } });
+        const exactOwnership = deriveWorkflowInstanceOwnership(operation);
+        const changed = bindCloudflareWorkflowOperation(fixture.plan, fixture.profile, fixture.verification, fixture.binding,
+          { ...fixture.target, instance_id: 'corrupt-persisted-instance' });
+        const changedOwnership = deriveWorkflowInstanceOwnership(changed);
+        const selfConsistentWrongTarget = parseWorkflowInstanceOwnership({ ...changedOwnership, binding_digest_sha256: digest,
+          envelope_digest_sha256: sha256Digest({ schema_version: 'starlight.workflow_operation_envelope.v1',
+            operation_binding_digest_sha256: digest, workflow_context_digest_sha256: changedOwnership.workflow_context_digest_sha256,
+            workflow_target: changedOwnership.target }) });
+        await pool.query('UPDATE swarm_authority_workflow_instances SET ownership=$1::jsonb WHERE operation_id=$2',
+          [JSON.stringify(selfConsistentWrongTarget), operation.binding.operation_id]);
+        const corrupt = await direct.admit({ ...request, binding: operation.binding });
+        assert.equal(corrupt.admitted, false); assert.match(corrupt.blockers.join(' '), /signed operation context/i);
+        await pool.query('DELETE FROM swarm_authority_workflow_instances WHERE operation_id=$1', [operation.binding.operation_id]);
+        const missingRequired = await direct.admit({ ...request, binding: operation.binding });
+        assert.equal(missingRequired.admitted, false); assert.match(missingRequired.blockers.join(' '), /ownership is missing/i);
+        await pool.query('INSERT INTO swarm_authority_workflow_instances (operation_id,binding_digest_sha256,ownership,registered_at) VALUES ($1,$2,$3::jsonb,$4)',
+          [operation.binding.operation_id, digest, JSON.stringify(exactOwnership), registered.registered ? registered.receipt.registered_at : issuedAt]);
+        assert.equal((await pool.query('SELECT * FROM swarm_authority_reservations WHERE operation_id=$1', [operation.binding.operation_id])).rowCount, 0);
         const attempts = await Promise.all(Array.from({ length: 4 }, () => client.admit(request)));
         assert.equal(attempts.filter((result) => result.admitted).length, 1);
         const admitted = attempts.find((result) => result.admitted)!;
@@ -703,6 +860,10 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
         const held = await pool.query('SELECT reserved_usd FROM swarm_authority_budgets WHERE receipt_id=$1', [budget.receipt_id]);
         assert.equal(Number(held.rows[0].reserved_usd), 1);
         await store.cancelPreparedOperation(operation.binding.operation_id);
+        const ownershipAfterCancel = await client.ownership();
+        assert.equal(ownershipAfterCancel.found, true);
+        if (!ownershipAfterCancel.found) assert.fail('Expected cancelled ownership to remain readable.');
+        assert.equal(ownershipAfterCancel.prepared_state, 'cancelled');
         assert.equal((await client.register()).registered, false);
         assert.equal((await client.admit(request)).admitted, false);
         const cancelled = await pool.query('SELECT state FROM swarm_authority_reservations WHERE operation_id=$1', [operation.binding.operation_id]);
@@ -1969,7 +2130,7 @@ test('real PostgreSQL serializes consume, cancel and revoke races without duplic
 
     await t.test('independent authorities cannot oversubscribe shared policy and daily windows', async () => {
       await pool.query(`TRUNCATE swarm_authority_revocations,swarm_authority_hosts,
-        swarm_authority_budgets,swarm_authority_prepared_operations,
+        swarm_authority_budgets,swarm_authority_workflow_instances,swarm_authority_prepared_operations,
         swarm_authority_budget_holds,swarm_authority_budget_windows,
         swarm_authority_usage_evidence,swarm_authority_usage_tokens,swarm_authority_heartbeat_tokens,
         swarm_authority_reservations,swarm_authority_audit RESTART IDENTITY`);

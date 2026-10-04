@@ -3,6 +3,8 @@ import { OperationAuthority, type AdmissionResult, type AuthorityKeyring } from 
 import { PostgresOperationAuthorityStore, type PreparedOperationRegistrationResult } from './postgres-operation-authority';
 import { sha256Digest } from './runtime-digest';
 import { cloudflareWorkflowTargetSchema, isIssuedCloudflareWorkflowOperation, type BoundCloudflareWorkflowOperation } from './workflow-operation-context';
+import type { WorkflowInstanceOwnershipReadResult } from './workflow-instance-ownership';
+import { deriveWorkflowInstanceOwnership } from './workflow-instance-ownership';
 
 const bootstrapSchema = z.object({
   schema_version: z.literal('starlight.workflow_operation_admission_bootstrap.v1'),
@@ -59,7 +61,14 @@ export class CloudflareWorkflowOperationAdmission {
       await s.registry.recordDenial(s.config.binding_digest_sha256, s.config.operation_id, new Date().toISOString(), blockers);
       return { registered: false, already_registered: false, receipt: null, blockers };
     }
-    return s.registry.registerPreparedOperation(s.config.operation_id, s.config.binding_digest_sha256, s.config.expires_at);
+    return s.registry.registerPreparedWorkflowOperation(s.operation, s.config.expires_at);
+  }
+
+  /** Recovery remains readable after bootstrap expiry; this never refreshes admission authority. */
+  async ownership(): Promise<WorkflowInstanceOwnershipReadResult> {
+    const s = state.get(this);
+    if (!s) throw new Error('Workflow admission bootstrap was not constructed.');
+    return s.registry.readWorkflowInstanceOwnership(s.config.operation_id, s.config.binding_digest_sha256);
   }
 
   async admit(input: unknown): Promise<AdmissionResult> {
@@ -75,6 +84,12 @@ export class CloudflareWorkflowOperationAdmission {
     }
     // No cached registration/readiness boolean: reserve rechecks the exact durable row, revocation,
     // fresh host/access/capabilities, both cumulative windows and idempotency under the SQL lock.
+    const ownership = await s.registry.readWorkflowInstanceOwnership(s.config.operation_id, s.config.binding_digest_sha256);
+    if (!ownership.found || sha256Digest(ownership.ownership) !== sha256Digest(deriveWorkflowInstanceOwnership(s.operation))) {
+      const blockers = ['Exact durable workflow instance ownership is missing or differs.'];
+      await s.admissionStore.recordDenial(s.config.binding_digest_sha256, s.config.operation_id, at, blockers);
+      return { admitted: false, reservation: null, blockers };
+    }
     const authority = new OperationAuthority(s.admissionStore, s.keys, undefined, () => at);
     return authority.admit({ ...parsed.data, binding: s.operation.binding,
       reservation_duration_ms: Math.min(parsed.data.reservation_duration_ms, remaining) });
