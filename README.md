@@ -81,11 +81,20 @@ This hardens the model; it does **not** make the swarm autonomously act.
 
 ## Governed team runtime planner
 
-The dry-run team planner compiles existing `starlight.team_profile.v2` definitions into
-bounded runtime plans across Railway Temporal, Vercel Eve, local Hermes, n8n, and the
-deferred Cloudflare edge route. Plans include independent verification, provider routing,
-token/cost ceilings, human gates, and a separate fail-closed admission assessment. The CLI
-is report-only: it cannot admit a plan because it has no trusted approval/budget verifier.
+The accepted durable execution rule uses Cloudflare Workflows for agent-centric
+or cross-service work whose durable identity/state lives in Cloudflare, and
+Vercel Workflows for app-local jobs. One workflow has one durable owner. Temporal,
+trigger.dev and n8n are not backbones. See the
+[current decision and migration boundary](docs/TEAM-RUNTIME-ADR-2026-08-06.md#current-durable-execution-decision-4-october-2026).
+
+The existing v1 dry-run planner still compiles `starlight.team_profile.v2` into
+historical Railway Temporal, Vercel Eve, local Hermes and n8n descriptors, with
+Cloudflare deferred. Its code, schemas and generated packs have not been migrated
+to the accepted rule. These report-only reference commands preserve independent
+verification, provider routing, token/cost ceilings and human gates; they cannot
+admit a plan. They are not a current deployment recipe. Runtime migration and the
+named, separately approved pilot remain open in
+[Swarm issue15](https://github.com/frankxai/starlight-swarm/issues/15).
 
 ```bash
 npm run runtime:plan -- \
