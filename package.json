@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start -p 3007",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts && npm run orchestration:test",
+    "test": "tsc --noEmit && node --test --import tsx src/swarm/*.test.ts && npm run orchestration:test && npm run runtime:managed:test",
     "swarm:dry-run": "tsx src/swarm/index.ts",
     "hand:pilot": "tsx src/swarm/pilot-cli.ts",
     "runtime:plan": "tsx scripts/plan-team-runtime.ts",
@@ -16,10 +16,15 @@
     "runtime:pack:verify": "tsx scripts/verify-team-pack.ts",
     "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts",
     "orchestration:test": "node --test src/swarm/orchestration/*.test.mjs",
-    "orchestration:demo": "node src/swarm/orchestration/demo.mjs"
+    "orchestration:demo": "node src/swarm/orchestration/demo.mjs",
+    "runtime:managed:test": "node --test --import tsx src/managed-runtime/*.test.ts",
+    "runtime:managed:dry-run": "tsx src/managed-runtime/index.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.132.1",
+    "@google/genai": "^2.28.0",
     "@modelcontextprotocol/sdk": "latest",
+    "@openai/agents": "^0.19.0",
     "next": "^14.2.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
