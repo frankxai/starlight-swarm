@@ -206,7 +206,7 @@ export const REVENUE_STREAMS: readonly RevenueStreamInput[] = Object.freeze([
     workloads: ['research-scan', 'classification'],
     stage: 'dry-run',
     promotionGate: 'Affiliate queen at Pilot.',
-    killCriterion: 'Payout below the stream cap for two quarters.',
+    killCriterion: 'Payout below an owner-set minimum floor (dated, in targets) for two consecutive quarters.',
     owner: 'general-cmo',
   },
   {
