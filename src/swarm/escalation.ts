@@ -202,3 +202,39 @@ function overCap(action: Action): boolean {
 export function requiresHuman(action: Action): boolean {
   return classify(action).decision === 'human-gate';
 }
+
+/* ------------------------------------------------------------------ *
+ * Risk-tier compatibility with the Starlight Intelligence System Queen
+ * (src/orchestration/starlight-queen.ts: ActionRiskTier). That module ranks
+ * an action low / medium / high; this one ranks who decides. The two are
+ * one ladder read at different resolutions, so a receipt or a gate written
+ * against either vocabulary can be read by the other. Mapping is monotone:
+ * a higher Decision never maps to a lower risk tier, and the reverse maps
+ * each risk tier to the LEAST permissive Decision it may stand for, so a
+ * round trip can only tighten.
+ * ------------------------------------------------------------------ */
+
+export type ActionRiskTier = 'low_autonomous' | 'medium_review' | 'high_irreversible_gate';
+
+const DECISION_RANK: Record<Decision, number> = { autonomous: 0, 'queen-gate': 1, 'founder-board': 2, 'human-gate': 3 };
+
+/** Decision → SIS risk tier. autonomous→low, queen-gate→medium, founder-board and human-gate→high. */
+export function riskTierOf(decision: Decision): ActionRiskTier {
+  const rank = DECISION_RANK[decision];
+  if (rank === undefined || rank >= 2) return 'high_irreversible_gate'; // unknown fails closed
+  return rank === 0 ? 'low_autonomous' : 'medium_review';
+}
+
+/** SIS risk tier → the Decision it must at least clear. high maps to the human gate, never the board. */
+export function decisionFromRiskTier(tier: ActionRiskTier): Decision {
+  switch (tier) {
+    case 'low_autonomous':
+      return 'autonomous';
+    case 'medium_review':
+      return 'queen-gate';
+    case 'high_irreversible_gate':
+      return 'human-gate';
+    default:
+      return 'human-gate';
+  }
+}
