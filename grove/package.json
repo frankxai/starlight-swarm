@@ -1,0 +1,11 @@
+{
+  "name": "starlight-grove-infra",
+  "private": true,
+  "description": "Railway IaC for the Grove Hub. Install only to run railway config plan/apply.",
+  "devDependencies": {
+    "railway": "3.13.0"
+  },
+  "scripts": {
+    "check:sh": "sh -n hub/entrypoint.sh && sh -n broker/bootstrap-broker.sh && sh -n smoke/smoke-test.sh"
+  }
+}
