@@ -28,8 +28,9 @@ logged_in=0
 cleanup() {
   status=$?
   rm -f "$tokfile"
-  if [ "$logged_in" = 1 ]; then
-    scion hub auth logout >/dev/null 2>&1 || echo "WARNING: sign-out failed; run 'scion hub auth logout' now." >&2
+  if [ "$logged_in" = 1 ] && ! scion hub auth logout >/dev/null 2>&1; then
+    echo "ERROR: sign-out failed, so your user login is still on this broker. Run 'scion hub auth logout' now." >&2
+    [ "$status" -ne 0 ] || status=1
   fi
   exit "$status"
 }

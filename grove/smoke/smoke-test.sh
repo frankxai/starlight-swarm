@@ -71,51 +71,69 @@ agents_phase() {
   [ -n "$SCION_HUB_TOKEN" ] || { echo "No token given." >&2; return 1; }
   export SCION_HUB_TOKEN
 
+  # Try both agents even if one fails, then confirm neither is still listed as running.
   cleanup_agents() {
+    bad=0
     for a in "$maker" "$checker"; do
-      scion stop "$a" >> "$OUT/cleanup.log" 2>&1
-      scion delete "$a" >> "$OUT/cleanup.log" 2>&1 || { echo "cleanup failed for $a" >> "$OUT/cleanup.log"; return 1; }
+      scion stop "$a" >> "$OUT/cleanup.log" 2>&1 || true
+      scion delete "$a" >> "$OUT/cleanup.log" 2>&1 || { echo "delete failed for $a" >> "$OUT/cleanup.log"; bad=1; }
     done
+    scion list > "$OUT/list-after-cleanup.txt" 2>&1 || bad=1
+    if grep -E "$maker|$checker" "$OUT/list-after-cleanup.txt" | grep -qiE 'running|starting|creating'; then bad=1; fi
+    return "$bad"
+  }
+  finish_agents() {
+    if cleanup_agents; then record cleanup 0; else record cleanup 1; fails=$((fails + 1)); fi
+    trap - INT TERM
+    unset SCION_HUB_TOKEN
   }
   trap 'cleanup_agents; exit 130' INT TERM
 
+  # wait_terminal <agent> <label>: the agent's row must exist and leave every active state
+  # before the deadline. A missing row or a timeout is a failure, never a pass.
+  wait_terminal() {
+    while :; do
+      scion list > "$OUT/list.txt" 2>&1
+      row="$(grep -F "$1" "$OUT/list.txt" || true)"
+      if [ -n "$row" ] && ! printf '%s\n' "$row" | grep -qiE 'running|starting|creating|stopping'; then
+        printf '%s\n' "$row" > "$OUT/$2-final-row.txt"; return 0
+      fi
+      [ "$(date +%s)" -lt "$deadline" ] || { echo "no terminal row for $1 before the deadline" > "$OUT/$2-timeout.txt"; return 1; }
+      sleep 15
+    done
+  }
+
   scion start --help > "$OUT/scion-start-help.txt" 2>&1 || true
+  before="$fails"
   check use-project   scion use "$project"
   check maker-start   scion start "$maker" \
     "Create SMOKE.md containing exactly one line: $expected. Commit it on your branch, then stop." \
     --type "${GROVE_MAKER_TEMPLATE:-claude}" --broker "$BROKER" --wait-timeout 10m
-
+  if [ "$fails" -ne "$before" ]; then
+    echo "Agent phase stopped: project selection or maker start failed." >&2
+    finish_agents; return 1
+  fi
   podman ps --all --format '{{.ID}} {{.Names}} {{.Image}}' > "$OUT/containers-after-maker.txt" 2>&1
 
-  # Wait for the maker to finish before the checker reviews its branch.
-  until scion list > "$OUT/list.txt" 2>&1 && ! grep "$maker" "$OUT/list.txt" | grep -qiE 'running|starting|creating'; do
-    [ "$(date +%s)" -lt "$deadline" ] || { echo "maker did not finish before the deadline" >> "$OUT/maker-wait.log"; break; }
-    sleep 15
-  done
-  check maker-terminal sh -c "! grep '$maker' '$OUT/list.txt' | grep -qiE 'running|starting|creating'"
+  check maker-terminal wait_terminal "$maker" maker
 
   check checker-start scion start "$checker" \
-    "Review the branch of agent $maker. Reply with exactly one line: PASS if SMOKE.md contains exactly '$expected', otherwise FAIL and the reason." \
+    "Review the branch of agent $maker. Your final message must be exactly one line: the word PASS if SMOKE.md contains exactly '$expected', otherwise FAIL followed by the reason." \
     --type "${GROVE_CHECKER_TEMPLATE:-codex}" --broker "$BROKER" --wait-timeout 10m
   podman ps --all --format '{{.ID}} {{.Names}} {{.Image}}' > "$OUT/containers-after-checker.txt" 2>&1
-
-  until scion list > "$OUT/list.txt" 2>&1 && ! grep "$checker" "$OUT/list.txt" | grep -qiE 'running|starting|creating'; do
-    [ "$(date +%s)" -lt "$deadline" ] || { echo "checker did not finish before the deadline" >> "$OUT/checker-wait.log"; break; }
-    sleep 15
-  done
+  check checker-terminal wait_terminal "$checker" checker
 
   scion logs "$maker" > "$OUT/maker.log" 2>&1
   scion logs "$checker" > "$OUT/checker.log" 2>&1
 
-  # Evidence, not exit codes.
+  # Evidence, not exit codes. The checker's verdict is its last non-empty log line, and it must
+  # be exactly PASS, so an echoed copy of the instructions cannot count.
   check distinct-containers sh -c "[ \"\$(grep -cE 'smoke-(maker|checker)' '$OUT/containers-after-checker.txt')\" -ge 2 ]"
   find "$HOME" -maxdepth 8 -type d -path '*/.scion/agents/*/workspace' > "$OUT/worktrees.txt" 2>/dev/null
   check smoke-file    smoke_file_ok "$maker" "$expected"
-  check checker-pass  grep -qE '(^|[^A-Z])PASS([^A-Z]|$)' "$OUT/checker.log"
+  check checker-pass  sh -c "grep -v '^[[:space:]]*\$' '$OUT/checker.log' | tail -n 1 | tr -d '[:space:]' | grep -qx PASS"
 
-  if cleanup_agents; then record cleanup 0; else record cleanup 1; fails=$((fails + 1)); fi
-  trap - INT TERM
-  unset SCION_HUB_TOKEN
+  finish_agents
 }
 
 if [ "${GROVE_RUN_AGENTS:-0}" = "1" ]; then
