@@ -2,27 +2,27 @@
   "schema_version": "starlight.prepared_runtime_bundle.v2",
   "compiler_version": "starlight.team_pack.compiler.v3",
   "team_id": "starlight-platform-team",
-  "generated_at": "2026-10-04T03:00:00Z",
+  "generated_at": "2026-10-23T04:04:16.396Z",
   "status": "prepared-human-approval-required",
-  "plan_digest_sha256": "ecb6f9d5698f9511c0bbd4e306169022dd6dca0020d860e70760ebb8ee7fb734",
-  "source_profile_digest_sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417",
-  "source_runtime_policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
-  "pack_digest_sha256": "a572ade31d099ac36e0bfdd813ec9a4c8d2125ec6d5bb2f0c0ba8560fbff6d65",
+  "plan_digest_sha256": "9808fc5db704176836527a687c908fb5d0b4b1c8161acdccd21c1c83f471282a",
+  "source_profile_digest_sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa",
+  "source_runtime_policy_digest_sha256": "3174271b2bb3964eb2e36d2bc7ec230aa1b6ed4b6c3e92523e086cc5af20c3c8",
+  "pack_digest_sha256": "32510a212bbf18d25ab6a9c8b7c3db911d3a409e08d71379378f32611a5e2835",
   "workflows": [
     {
       "workflow_id": "creator-engineering",
       "workload_scope": "agent-centric",
       "identity_state_owner": "cloudflare",
       "durable_engine": "cloudflare-workflows",
-      "deployment_id": "starlight-workflow-1b393e0832125b5db8a624d34898324a",
-      "instance_id_prefix": "starlight-instance-1b393e0832125b5db8a624d34898324a",
+      "deployment_id": "starlight-workflow-ea24c2ef6103651d7364539c6af4e532",
+      "instance_id_prefix": "starlight-instance-ea24c2ef6103651d7364539c6af4e532",
       "binding": "STARLIGHT_WORKFLOW"
     }
   ],
   "lanes": [
     {
       "schema_version": "starlight.prepared_runtime_lane.v2",
-      "deployment_id": "starlight-lane-4999a444cf4d4363b3a6cb9a66f36ef1",
+      "deployment_id": "starlight-lane-86bd94d7e835d240a2a14cd27c231439",
       "team_id": "starlight-platform-team",
       "lane_id": "operator-intelligence",
       "role_id": "coordinator",
@@ -30,13 +30,13 @@
       "mission_authority": "cloudflare-workflows",
       "runtime": "cloudflare-workflows",
       "status": "prepared-human-approval-required",
-      "plan_digest_sha256": "ecb6f9d5698f9511c0bbd4e306169022dd6dca0020d860e70760ebb8ee7fb734",
-      "pack_digest_sha256": "a572ade31d099ac36e0bfdd813ec9a4c8d2125ec6d5bb2f0c0ba8560fbff6d65",
-      "runtime_policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
+      "plan_digest_sha256": "9808fc5db704176836527a687c908fb5d0b4b1c8161acdccd21c1c83f471282a",
+      "pack_digest_sha256": "32510a212bbf18d25ab6a9c8b7c3db911d3a409e08d71379378f32611a5e2835",
+      "runtime_policy_digest_sha256": "3174271b2bb3964eb2e36d2bc7ec230aa1b6ed4b6c3e92523e086cc5af20c3c8",
       "max_concurrency": 1,
       "lease_ttl_seconds": 900,
       "heartbeat_timeout_seconds": 120,
-      "kill_switch": "STARLIGHT_KILL_6EF7EFDDDDA7D2AB7D6D4EF47D172D8C",
+      "kill_switch": "STARLIGHT_KILL_CE677E8461634061AEDCBC9870EB04EE",
       "activation_authority": "trusted-workflow-engine-authority-not-implemented",
       "required_secret_names": [
         "STARLIGHT_AUTHORITY_URL",
@@ -45,12 +45,12 @@
       "runtime_config": {
         "kind": "cloudflare-workflows",
         "deployment_target": "bound-workflow-engine",
-        "workflow_deployment_id": "starlight-workflow-1b393e0832125b5db8a624d34898324a"
+        "workflow_deployment_id": "starlight-workflow-ea24c2ef6103651d7364539c6af4e532"
       }
     },
     {
       "schema_version": "starlight.prepared_runtime_lane.v2",
-      "deployment_id": "starlight-lane-dc6416de9f23e428807d43b72d1a0046",
+      "deployment_id": "starlight-lane-9dfbfa8c31c9cc9e4226ede4d8d4fb64",
       "team_id": "starlight-platform-team",
       "lane_id": "durable-builder",
       "role_id": "backend-data-engineer",
@@ -58,13 +58,13 @@
       "mission_authority": "cloudflare-workflows",
       "runtime": "railway-worker",
       "status": "prepared-human-approval-required",
-      "plan_digest_sha256": "ecb6f9d5698f9511c0bbd4e306169022dd6dca0020d860e70760ebb8ee7fb734",
-      "pack_digest_sha256": "a572ade31d099ac36e0bfdd813ec9a4c8d2125ec6d5bb2f0c0ba8560fbff6d65",
-      "runtime_policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
+      "plan_digest_sha256": "9808fc5db704176836527a687c908fb5d0b4b1c8161acdccd21c1c83f471282a",
+      "pack_digest_sha256": "32510a212bbf18d25ab6a9c8b7c3db911d3a409e08d71379378f32611a5e2835",
+      "runtime_policy_digest_sha256": "3174271b2bb3964eb2e36d2bc7ec230aa1b6ed4b6c3e92523e086cc5af20c3c8",
       "max_concurrency": 1,
       "lease_ttl_seconds": 900,
       "heartbeat_timeout_seconds": 120,
-      "kill_switch": "STARLIGHT_KILL_833B05E2F9776DF8DCA693009543A5D9",
+      "kill_switch": "STARLIGHT_KILL_C7FD5A1155DE8FC9C022C7FEE1E88C8D",
       "activation_authority": "trusted-workflow-engine-authority-not-implemented",
       "required_secret_names": [
         "STARLIGHT_AUTHORITY_URL",
@@ -73,13 +73,13 @@
       "runtime_config": {
         "kind": "railway-worker",
         "deployment_target": "existing-railway-service",
-        "queue": "starlight-executor-dc6416de9f23e428807d43b72d1a0046",
-        "workflow_deployment_id": "starlight-workflow-1b393e0832125b5db8a624d34898324a"
+        "queue": "starlight-executor-9dfbfa8c31c9cc9e4226ede4d8d4fb64",
+        "workflow_deployment_id": "starlight-workflow-ea24c2ef6103651d7364539c6af4e532"
       }
     },
     {
       "schema_version": "starlight.prepared_runtime_lane.v2",
-      "deployment_id": "starlight-lane-f5402a7de91dc8f2a0695cd516e80c49",
+      "deployment_id": "starlight-lane-657cc91b9a073f761a281e3bb4916303",
       "team_id": "starlight-platform-team",
       "lane_id": "independent-verifier",
       "role_id": "qa-release-sre-verifier",
@@ -87,13 +87,13 @@
       "mission_authority": "cloudflare-workflows",
       "runtime": "hermes-local",
       "status": "prepared-human-approval-required",
-      "plan_digest_sha256": "ecb6f9d5698f9511c0bbd4e306169022dd6dca0020d860e70760ebb8ee7fb734",
-      "pack_digest_sha256": "a572ade31d099ac36e0bfdd813ec9a4c8d2125ec6d5bb2f0c0ba8560fbff6d65",
-      "runtime_policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
+      "plan_digest_sha256": "9808fc5db704176836527a687c908fb5d0b4b1c8161acdccd21c1c83f471282a",
+      "pack_digest_sha256": "32510a212bbf18d25ab6a9c8b7c3db911d3a409e08d71379378f32611a5e2835",
+      "runtime_policy_digest_sha256": "3174271b2bb3964eb2e36d2bc7ec230aa1b6ed4b6c3e92523e086cc5af20c3c8",
       "max_concurrency": 1,
       "lease_ttl_seconds": 900,
       "heartbeat_timeout_seconds": 120,
-      "kill_switch": "STARLIGHT_KILL_BAAF586AEB11B5B26968E656A31C7E22",
+      "kill_switch": "STARLIGHT_KILL_9CBF3E7887417A5DC2F26547D0E85937",
       "activation_authority": "trusted-workflow-engine-authority-not-implemented",
       "required_secret_names": [
         "STARLIGHT_AUTHORITY_URL",
@@ -103,7 +103,7 @@
         "kind": "hermes-local",
         "deployment_target": "isolated-hermes-profile",
         "profile": "starlight-team-worker",
-        "workflow_deployment_id": "starlight-workflow-1b393e0832125b5db8a624d34898324a"
+        "workflow_deployment_id": "starlight-workflow-ea24c2ef6103651d7364539c6af4e532"
       }
     }
   ],

@@ -2,15 +2,15 @@
   "schema_version": "starlight.team_runtime_plan.v2",
   "team_id": "starlight-platform-team",
   "source_profile": {
-    "repository": "frankxai/starlight-agent-config",
-    "commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
-    "path": "core/teams/starlight-platform-team.team-profile.json",
+    "repository": "frankxai/starlight-swarm",
+    "commit_sha": "f7aa7f8cefd2c42bf91c97de89fcb09fcae8621c",
+    "path": "runtime/examples/starlight-platform-team.b12e904.profile.json",
     "schema_version": "starlight.team_profile.v2",
-    "version": "2.0.1",
-    "review_date": "2026-08-09",
-    "sha256": "7bcbafc58eb96adbb36de295c2aec01f2d4f6985039eebeed14ab195517d2417"
+    "version": "2.0.0",
+    "review_date": "2026-08-10",
+    "sha256": "d71aebdba947cad6db2a8b8295eead2a6896d54b99de5ba619cb6dd2876a6baa"
   },
-  "generated_at": "2026-10-04T03:00:00Z",
+  "generated_at": "2026-10-23T04:04:16.396Z",
   "activation_status": "planned-human-approval-required",
   "authority": {
     "mission": "per-workflow",
@@ -21,7 +21,7 @@
   },
   "routing_policy": {
     "policy_id": "queen-workflow-policy-v2",
-    "policy_digest_sha256": "3b5f335cb751ff0a9368ed1a0cb8de2deebc879bd194a5ed6349049f9c7467e9",
+    "policy_digest_sha256": "3174271b2bb3964eb2e36d2bc7ec230aa1b6ed4b6c3e92523e086cc5af20c3c8",
     "eve_allowlisted_workload_ids": [],
     "allowed_runtimes": [
       "cloudflare-workflows",
