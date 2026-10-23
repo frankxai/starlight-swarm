@@ -135,7 +135,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse<RepoAu
     }
 
     res.status(200).json(auditResults);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 }
