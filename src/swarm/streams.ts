@@ -157,7 +157,7 @@ export const STREAMS: StreamSpec[] = [
 ];
 
 /** Lookup a stream spec by id. */
-export function getStream(id: StreamId): StreamSpec | undefined {
+function getStream(id: StreamId): StreamSpec | undefined {
   return STREAMS.find((s) => s.id === id);
 }
 
