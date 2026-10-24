@@ -42,8 +42,8 @@ export default function Home() {
       } else {
         addLog('Error: Failed to fetch repository audit records.');
       }
-    } catch (e: any) {
-      addLog(`Error during audit: ${e.message}`);
+    } catch (e: unknown) {
+      addLog(`Error during audit: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoadingAudit(false);
     }
@@ -65,8 +65,8 @@ export default function Home() {
       } else {
         addLog('Error: Recovery playbook execution failed.');
       }
-    } catch (e: any) {
-      addLog(`Error executing recovery: ${e.message}`);
+    } catch (e: unknown) {
+      addLog(`Error executing recovery: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setRecovering(false);
     }
