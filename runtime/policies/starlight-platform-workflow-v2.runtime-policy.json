@@ -4,9 +4,9 @@
   "budget_policy_id": "starlight-platform-pilot-budget-v1",
   "max_daily_cost_usd": 25,
   "team_profile_source": {
-    "repository": "frankxai/starlight-swarm",
-    "commit_sha": "f7aa7f8cefd2c42bf91c97de89fcb09fcae8621c",
-    "path": "runtime/examples/starlight-platform-team.b12e904.profile.json"
+    "repository": "frankxai/starlight-agent-config",
+    "commit_sha": "b878eca0eb1367debfa6e52ead75c4f1213259a2",
+    "path": "core/teams/starlight-platform-team.team-profile.json"
   },
   "eve_allowlisted_workload_ids": [],
   "allowed_runtimes": [
