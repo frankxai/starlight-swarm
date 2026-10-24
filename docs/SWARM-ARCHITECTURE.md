@@ -66,7 +66,7 @@ The four streams (mirrors `AGENT-STACK.md`):
 | Affiliate Queen | Recurring affiliate revenue | catalog-auditor · link-binder · disclosure-checker · ranker | audit → join → bind → measure → re-rank |
 | Products Queen | Digital products / templates / courses | product-architect · packager · pricer · launch-coordinator | gap-scan → build → price → launch → retro |
 | Content Queen | Traffic → trust → routing | researcher · writer · hook-engineer · distributor | top-queries → draft → gate → publish → learn |
-| Payments Queen | Authorization + settlement | mandate-verifier · spend-cap-enforcer · settlement-auditor · fraud-sentinel | propose-charge → verify → check cap → settle → audit |
+| Payments Queen | Authorization (verify-only, never settles) | mandate-verifier · spend-cap-enforcer · settlement-auditor · fraud-sentinel | propose-charge → verify → check cap → audit → verdict to a human |
 
 ---
 
@@ -81,7 +81,8 @@ later, more permissive rule.
 |---|---|---|
 | Worker task within stream (draft, audit, research) | Worker → Queen | queen review |
 | Bind a link, schedule a post, build a page | Queen | brand/claims gate (`@integrity-guard`, `@claims-guard`) |
-| Any payment / settlement | Payments Queen | **AP2 mandate verified + spend-cap check + audit entry** (Payments MCP, fail-closed) |
+| Authorize a payment (verdict only) | Payments Queen | **AP2 mandate verified + spend-cap check + audit entry** (Payments MCP, fail-closed) |
+| Settle a payment on any rail | Founder | **human approval, always**; the swarm holds no rail credential |
 | Spend above cap, new rail, new vendor | Founder | `/starlight-board` pressure-test + **human approval** |
 | Irreversible (delete, rename live URL, rotate key, send blast, move funds) | Founder | **human approval, always** |
 
@@ -120,8 +121,9 @@ none exists, by design.
 - `verify_mandate` — was THIS purchase for THIS amount authorized? (AP2)
 - `check_spend_cap` — per-transaction / per-day / per-stream caps; over cap →
   escalate, never auto-approve.
-- `record_audit_entry` — every settlement writes to the L1 audit log first; if the
-  write fails, the action fails.
+- `record_audit_entry` — every payment verdict is written to the L1 audit log before it
+  is acted on; if the write fails, the action fails. The Payments Queen sequences this;
+  the MCP does not require a prior audit entry.
 - `require_human_approval` — hand off to the L7 human gate. Never auto-approves.
 
 ---
