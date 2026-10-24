@@ -4,7 +4,7 @@
  *
  * The runtime references but does NOT hard-require these at runtime. Real wiring
  * lands in a later version. Per agentic-ops-hub/docs/MCP-STRATEGY.md, the income
- * swarm's MCP stack is:  SIS Vault · Payments (verify only) · claude-flow · Slack.
+ * swarm's MCP stack is:  SIS Vault · Payments (verify only) · Slack.
  *
  * Nothing here executes a real call, moves money, or writes to a real vault.
  */
