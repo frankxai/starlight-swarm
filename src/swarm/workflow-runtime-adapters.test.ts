@@ -3,7 +3,6 @@ import * as assert from 'node:assert/strict';
 
 import { parsePreparedWorkflowBundle, prepareWorkflowBundle } from './workflow-runtime-adapters';
 import { workflowOperationFixture } from './workflow-operation-test-fixtures';
-import { verifyTeamPackDirectory } from './team-pack-verifier';
 
 describe('workflow-runtime-adapters', () => {
   const fixture = workflowOperationFixture();
@@ -25,11 +24,7 @@ describe('workflow-runtime-adapters', () => {
   });
 
   it('fails when verification team_id does not match the generated plan', () => {
-    // We cannot just clone and change verification because `isIssuedTeamPackVerificationResult` checks object identity.
-    // Instead we clone the plan, change team_id on the plan, and pass it with original verification
     const invalidPlan = { ...fixture.plan, team_id: 'tampered-team-id' };
-
-    // We expect a different error message now if it fails the match check
     assert.throws(
       () => prepareWorkflowBundle(invalidPlan as any, fixture.verification),
       /Verified pack receipt does not bind the exact v2 plan, profile, policy and compiler./
