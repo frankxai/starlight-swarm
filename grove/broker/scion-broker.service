@@ -1,0 +1,17 @@
+[Unit]
+Description=Grove runtime broker (Google Scion)
+Documentation=https://github.com/frankxai/starlight-swarm/tree/main/grove
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/grove/broker.env
+ExecStart=/usr/local/bin/scion runtime-broker start --foreground
+Restart=on-failure
+RestartSec=10
+# No NoNewPrivileges here: rootless Podman needs the setuid newuidmap/newgidmap helpers
+# to set up user namespaces for agent containers.
+
+[Install]
+WantedBy=default.target
