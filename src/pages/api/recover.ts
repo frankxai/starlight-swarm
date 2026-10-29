@@ -8,7 +8,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse<{ stat
       status: 'nominal',
       timestamp: new Date().toISOString()
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     res.status(500).json({ status: 'error', timestamp: new Date().toISOString() });
   }
 }
