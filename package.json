@@ -1,7 +1,20 @@
 {
-  "name": "starlight-swarm",
+  "name": "@starlight-intelligence/queen",
+  "description": "Starlight Queen open kernel: briefs, fail-closed escalation, model routing with reported fallback, re-run verification, signed dispatch receipts. Runs nothing by itself.",
+  "license": "MIT",
   "version": "1.0.0",
   "private": true,
+  "bin": {
+    "starlight-queen": "bin/starlight-queen.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/swarm/",
+    "docs/SWARM-ARCHITECTURE.md",
+    "docs/QUEEN-CHARTER.md",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "next dev -p 3007",
     "build": "next build",
@@ -16,13 +29,15 @@
     "runtime:pack:verify": "tsx scripts/verify-team-pack.ts",
     "runtime:prepare": "tsx scripts/prepare-runtime-bundle.ts",
     "orchestration:test": "node --test src/swarm/orchestration/*.test.mjs",
-    "orchestration:demo": "node src/swarm/orchestration/demo.mjs"
+    "orchestration:demo": "node src/swarm/orchestration/demo.mjs",
+    "queen": "node bin/starlight-queen.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "next": "^15.5.28",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -32,7 +47,6 @@
     "@types/react": "^18.2.79",
     "@types/react-dom": "^18.2.25",
     "pg": "^8.23.0",
-    "tsx": "^4.19.2",
     "typescript": "^5.4.5"
   }
 }

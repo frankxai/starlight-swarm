@@ -14,7 +14,7 @@
 
 import type { StreamId } from './escalation';
 
-/** A worker seat inside a stream. Reuses the `worker-specialist` harness. */
+/** A worker seat inside a stream. Stateless, one skill, append-only memory. */
 export interface WorkerSpec {
   /** Worker role name, per AGENT-STACK.md "Workers" column. */
   name: string;
@@ -24,11 +24,15 @@ export interface WorkerSpec {
   does: string;
 }
 
-/** A queen seat. Reuses `queen-coordinator` + `hierarchical-coordinator`. */
+/** A queen seat: one Starlight Queen identity, one governance mode (generals.ts). */
 export interface QueenSpec {
   /** Queen role name, per AGENT-STACK.md. */
   name: string;
-  /** The harness patterns this queen reuses (claude-flow). */
+  /**
+   * Coordination patterns this queen applies, by name. The first entry is the
+   * queen identity (`starlight-queen`), the rest are governance modes from
+   * generals.ts. Kept as `string[]` for compatibility with existing packs.
+   */
   harness: string[];
   /** Ordered steps of the stream's self-improving loop. */
   selfImprovingLoop: string[];
@@ -87,7 +91,7 @@ export const STREAMS: StreamSpec[] = [
     purpose: 'Recurring affiliate revenue (agenticincome hub + agenticpassiveincome spoke).',
     queen: {
       name: 'Affiliate Queen',
-      harness: ['queen-coordinator', 'hierarchical-coordinator'],
+      harness: ['starlight-queen', 'hierarchical'],
       selfImprovingLoop: ['audit', 'join programs', 'bind links', 'measure', 're-rank'],
     },
     workers: [
@@ -104,7 +108,7 @@ export const STREAMS: StreamSpec[] = [
     purpose: 'Digital products, templates, courses.',
     queen: {
       name: 'Products Queen',
-      harness: ['queen-coordinator', 'hierarchical-coordinator'],
+      harness: ['starlight-queen', 'hierarchical'],
       selfImprovingLoop: ['gap-scan', 'build', 'price', 'launch', 'retro'],
     },
     workers: [
@@ -121,7 +125,7 @@ export const STREAMS: StreamSpec[] = [
     purpose: 'Traffic → trust → routing.',
     queen: {
       name: 'Content Queen',
-      harness: ['queen-coordinator', 'hierarchical-coordinator'],
+      harness: ['starlight-queen', 'hierarchical'],
       selfImprovingLoop: ['top-queries', 'draft', 'gate', 'publish', 'learn'],
     },
     workers: [
@@ -138,7 +142,7 @@ export const STREAMS: StreamSpec[] = [
     purpose: 'Authorization + settlement governance (the money control surface).',
     queen: {
       name: 'Payments Queen',
-      harness: ['queen-coordinator', 'hierarchical-coordinator'],
+      harness: ['starlight-queen', 'hierarchical'],
       selfImprovingLoop: ['propose-charge', 'verify mandate', 'check cap', 'settle', 'audit'],
     },
     workers: [
