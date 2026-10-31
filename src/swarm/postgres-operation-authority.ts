@@ -1496,8 +1496,8 @@ export interface PostgresOperationAuthorityOptions {
 // These ceilings are also enforced inside the function-only usage authority.
 // Allowing a looser database routine than the configured store would let a
 // direct routine caller bypass the public API's freshness policy.
-const BROKER_EVIDENCE_MAX_AGE_MS = 5 * 60_000;
-const RUNNER_EVIDENCE_MAX_AGE_MS = 60_000;
+export const BROKER_EVIDENCE_MAX_AGE_MS = 5 * 60_000;
+export const RUNNER_EVIDENCE_MAX_AGE_MS = 60_000;
 
 function denial(blocker: string): AdmissionResult {
   return { admitted: false, reservation: null, blockers: [blocker] };
