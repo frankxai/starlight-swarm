@@ -117,7 +117,7 @@ const hostEvidenceSchema = z.object({
 
 const databaseRole = z.string().min(3).max(63).regex(/^[a-z][a-z0-9_]*$/);
 const databaseName = z.string().min(1).max(63).regex(/^[A-Za-z0-9_.-]+$/);
-export const brokerPrincipalEvidenceSchema = z.object({
+const brokerPrincipalEvidenceSchema = z.object({
   schema_version: z.literal('starlight.broker_principal_evidence.v1'),
   database_role: databaseRole,
   database_name: databaseName,
@@ -173,7 +173,7 @@ const denyUnconfiguredRunnerSession: RunnerSessionAttestor = async () => ({
   blockers: ['Runner transport attestor is not configured.'],
 });
 
-export const runnerStartEvidenceSchema = z.object({
+const runnerStartEvidenceSchema = z.object({
   schema_version: z.literal('starlight.runner_start_evidence.v1'),
   reservation_id: z.uuid(),
   claim_id: z.uuid(),
@@ -243,7 +243,7 @@ const runnerOutcomeCommon = {
   remote_stop_confirmed: z.boolean(),
 };
 
-export const runnerOutcomeEvidenceSchema = z.discriminatedUnion('outcome_kind', [
+const runnerOutcomeEvidenceSchema = z.discriminatedUnion('outcome_kind', [
   z.object({
     ...runnerOutcomeCommon,
     outcome_kind: z.literal('never-started'),
