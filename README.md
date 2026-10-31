@@ -104,7 +104,7 @@ authenticated operation-time adapters and the named live pilot remain open.
 
 ```bash
 npm run runtime:plan -- \
-  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/examples/starlight-platform-team.b12e904.profile.json \
   runtime/examples/starlight-platform-pilot.workloads.json \
   runtime/policies/starlight-platform-pilot.runtime-policy.json \
   --output runtime/generated/starlight-platform-pilot.plan.json \
@@ -117,20 +117,20 @@ npm run runtime:assess -- \
   --force
 
 npm run runtime:pack -- \
-  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/examples/starlight-platform-team.b12e904.profile.json \
   runtime/generated/starlight-platform-pilot.plan.json \
   runtime/policies/starlight-platform-pilot.runtime-policy.json
 
 npm run runtime:pack:verify -- \
   runtime/generated/packs/<content-addressed-pack-directory> \
   runtime/generated/starlight-platform-pilot.plan.json \
-  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/examples/starlight-platform-team.b12e904.profile.json \
   runtime/policies/starlight-platform-pilot.runtime-policy.json
 
 npm run runtime:prepare -- \
   runtime/generated/packs/<content-addressed-pack-directory> \
   runtime/generated/starlight-platform-pilot.plan.json \
-  ../starlight-agent-config/core/teams/starlight-platform-team.team-profile.json \
+  runtime/examples/starlight-platform-team.b12e904.profile.json \
   runtime/policies/starlight-platform-pilot.runtime-policy.json \
   --output runtime/generated/starlight-platform-pilot.prepared-runtime.json \
   --force
