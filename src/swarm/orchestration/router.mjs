@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { runtimeEligible, selectByEvidence } from './evidence-routing.mjs';
 
 export const taskClasses = ['extraction', 'debugging', 'feature', 'architecture', 'security', 'research'];
 export const patterns = ['single', 'sequential', 'parallel', 'manager', 'refinement'];
@@ -12,7 +13,8 @@ export function fresh(date, now, maxAgeMs = 86_400_000) {
 }
 
 // Availability is supplied by a harness probe, never inferred from a model name.
-export function selectModel(request, catalog, presets, { now = Date.now() } = {}) {
+export function selectModel(request, catalog, presets, { now = Date.now(), evaluations = [], risk = 'consequential' } = {}) {
+  requireValue(Number.isFinite(now), 'A valid selection time is required');
   requireValue(taskClasses.includes(request.taskClass), 'Unknown task class');
   requireValue(typeof request.runtime === 'string', 'Runtime is required');
   requireValue(Array.isArray(request.tools), 'Required tools must be explicit');
@@ -23,22 +25,27 @@ export function selectModel(request, catalog, presets, { now = Date.now() } = {}
   const effort = request.effort ?? preset.effort;
   // A caller-selected model is binding. Fallbacks are an explicit ordered policy.
   const candidates = request.allowFallback === true ? [wanted, ...(request.fallbacks ?? [])] : [wanted];
+  const eligible = [];
   for (const model of [...new Set(candidates)]) {
     const matches = catalog.filter(c => c.model === model && c.runtime === request.runtime);
     requireValue(matches.length <= 1, 'Ambiguous capability identity');
     const c = matches[0];
     if (!c || c.available !== true || !fresh(c.verifiedAt, now)) continue;
+    if (!runtimeEligible(c, now)) continue;
     if (!Array.isArray(c.efforts) || !c.efforts.includes(effort)) continue;
     if (!Array.isArray(c.tools) || !request.tools.every(t => c.tools.includes(t))) continue;
     if (typeof c.provider !== 'string' || !c.provider || !c.evidenceRef) continue;
     if (request.independentOf && c.provider === request.independentOf) continue;
-    return {
+    const selected = {
       status: 'selected', model, effort, provider: c.provider, runtime: c.runtime,
       wasFallback: model !== wanted, reason: model === wanted ? 'Requested candidate is available' : 'Explicit fallback policy',
       evidenceStatus: 'provisional-unranked', capabilityEvidence: c.evidenceRef,
       capabilityVerifiedAt: c.verifiedAt, policyVersion: presets.version,
     };
+    if (request.selectionPolicy === undefined) return selected;
+    eligible.push(selected);
   }
+  if (request.selectionPolicy !== undefined) return selectByEvidence(eligible, request, evaluations, { now, risk });
   return { status: 'hold', reason: 'No fresh, available model satisfies the requested runtime, effort, tools and reviewer independence', requestedModel: wanted, effort };
 }
 

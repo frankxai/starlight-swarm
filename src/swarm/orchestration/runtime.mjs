@@ -36,7 +36,7 @@ export async function runPlan(plan, options) {
       requireValue(Array.isArray(result.output?.artifacts) && result.output.artifacts.length > 0 && result.output.artifacts.every(a => typeof a === 'string' && a.length), 'Checkpoint must contain artifact references');
     }
   }
-  const selections = Object.fromEntries(plan.tasks.map(t => [t.id, selectModel(t.request, catalog, presets, { now })]));
+  const selections = Object.fromEntries(plan.tasks.map(t => [t.id, selectModel(t.request, catalog, presets, { now, evaluations: options.evaluations ?? [], risk: t.risk })]));
   const holds = Object.entries(selections).filter(([, s]) => s.status === 'hold');
   if (holds.length) return { ...receipt,
     results: options.checkpoint ? structuredClone(options.checkpoint.results) : {},
