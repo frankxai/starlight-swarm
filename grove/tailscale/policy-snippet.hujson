@@ -1,0 +1,31 @@
+// Merge into your tailnet policy file (Tailscale admin console > Access controls).
+// Permissions in a tailnet policy are additive: if an existing rule already lets everyone
+// reach everything, these grants restrict nothing. Check for a broad rule before merging.
+{
+  "groups": {
+    // Replace with the login you use in Tailscale.
+    "group:grove-operators": ["<your-tailscale-login>"]
+  },
+  "tagOwners": {
+    "tag:grove-hub":    ["group:grove-operators"],
+    "tag:grove-broker": ["group:grove-operators"]
+  },
+  "grants": [
+    // Operators, from laptop and phone, to the Hub dashboard and API.
+    { "src": ["group:grove-operators"], "dst": ["tag:grove-hub"], "ip": ["tcp:443"] },
+    // The broker, and the agent containers behind it, to the Hub.
+    { "src": ["tag:grove-broker"], "dst": ["tag:grove-hub"], "ip": ["tcp:443"] },
+    // Operators to the broker over Tailscale SSH.
+    { "src": ["group:grove-operators"], "dst": ["tag:grove-broker"], "ip": ["tcp:22"] }
+  ],
+  "ssh": [
+    // Only the unprivileged grove user. checkPeriod "always" re-authenticates every session.
+    {
+      "action": "check",
+      "checkPeriod": "always",
+      "src": ["group:grove-operators"],
+      "dst": ["tag:grove-broker"],
+      "users": ["grove"]
+    }
+  ]
+}

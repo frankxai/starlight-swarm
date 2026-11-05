@@ -1,0 +1,119 @@
+#cloud-config
+# Grove runtime broker VM: Ubuntu 24.04 LTS (noble), x86_64, 4 vCPU / 8 GB RAM or larger.
+#
+# Before you paste this into your provider's "user data" box, replace __TS_AUTHKEY__ with a
+# Tailscale auth key that is ONE-OFF, pre-approved, tagged tag:grove-broker and expires in 1 day.
+# A copy of user data stays in your provider's metadata and in cloud-init's cache. Tailscale
+# revokes a one-off key after its first use, so that copy cannot enroll anything afterwards.
+# Nothing else in this file is secret.
+#
+# Also attach a provider firewall that denies all inbound traffic, so the VM is closed even
+# before the host firewall below comes up. Your provider's web console is the fallback.
+
+package_update: true
+packages:
+  - ufw
+  - curl
+  - ca-certificates
+  - jq
+
+users:
+  - default
+  - name: grove
+    gecos: Grove runtime broker
+    shell: /bin/bash
+    lock_passwd: true
+
+write_files:
+  - path: /etc/grove/versions.env
+    permissions: '0644'
+    content: |
+      SCION_TAG=nightly-20261021
+      SCION_SHA256=d18882a6c3564349dff6dfabe60421dbdf9489310ab6f34f1331574f66b9d7a8
+      TAILSCALE_VERSION=1.104.1
+      GROVE_REPO=https://github.com/frankxai/starlight-swarm.git
+      GROVE_REF=main
+      BROKER_HOSTNAME=grove-broker-1
+  - path: /run/grove/ts-authkey
+    permissions: '0600'
+    content: __TS_AUTHKEY__
+  - path: /etc/sysctl.d/99-scion-inotify.conf
+    permissions: '0644'
+    content: |
+      fs.inotify.max_user_instances=8192
+      fs.inotify.max_user_watches=524288
+  - path: /usr/local/sbin/grove-provision
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # One script, fail fast: any failed step stops provisioning and cloud-init reports an error.
+      set -eu
+      . /etc/grove/versions.env
+      log() { echo "grove-provision: $*"; }
+      export DEBIAN_FRONTEND=noninteractive
+
+      log "1/8 host firewall: deny inbound except Tailscale"
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow in on tailscale0
+      ufw allow 41641/udp
+      ufw --force enable
+
+      log "2/8 upgrade and base packages"
+      apt-get update
+      apt-get -y upgrade
+      apt-get install -y podman uidmap passt slirp4netns fuse-overlayfs dbus-user-session \
+        unattended-upgrades software-properties-common
+
+      log "3/8 git >= 2.48 (noble ships 2.43)"
+      add-apt-repository -y ppa:git-core/ppa
+      apt-get update
+      apt-get install -y git
+
+      log "4/8 Tailscale $TAILSCALE_VERSION from its signed apt repository"
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+        -o /etc/apt/sources.list.d/tailscale.list
+      apt-get update
+      apt-get install -y "tailscale=$TAILSCALE_VERSION"
+      tailscale up --auth-key=file:/run/grove/ts-authkey --hostname="$BROKER_HOSTNAME" \
+        --advertise-tags=tag:grove-broker --ssh
+      rm -f /run/grove/ts-authkey
+
+      log "5/8 Scion $SCION_TAG, checked against GitHub's SHA-256 digest"
+      tmp="$(mktemp -d)"
+      curl -fsSL -o "$tmp/scion.tgz" \
+        "https://github.com/GoogleCloudPlatform/scion/releases/download/$SCION_TAG/scion-linux-amd64.tar.gz"
+      echo "$SCION_SHA256  $tmp/scion.tgz" | sha256sum -c -
+      tar -xzf "$tmp/scion.tgz" -C "$tmp"
+      bin="$(find "$tmp" -type f -name scion | head -n 1)"
+      test -n "$bin"
+      install -m 0755 "$bin" /usr/local/bin/scion
+      rm -rf "$tmp"
+
+      log "6/8 kernel limits and rootless Podman prerequisites"
+      sysctl --system >/dev/null
+      grep -q '^grove:' /etc/subuid || usermod --add-subuids 200000-265535 grove
+      grep -q '^grove:' /etc/subgid || usermod --add-subgids 200000-265535 grove
+      loginctl enable-linger grove
+
+      log "7/8 Grove scripts from $GROVE_REPO@$GROVE_REF"
+      rm -rf /opt/starlight-swarm
+      git clone --depth 1 --branch "$GROVE_REF" "$GROVE_REPO" /opt/starlight-swarm
+      install -d -o grove -g grove /home/grove/.config /home/grove/.config/systemd \
+        /home/grove/.config/systemd/user /home/grove/bin
+      install -o grove -g grove -m 0644 /opt/starlight-swarm/grove/broker/scion-broker.service \
+        /home/grove/.config/systemd/user/scion-broker.service
+      install -o grove -g grove -m 0755 /opt/starlight-swarm/grove/broker/bootstrap-broker.sh \
+        /home/grove/bin/grove-bootstrap
+      install -o grove -g grove -m 0755 /opt/starlight-swarm/grove/smoke/smoke-test.sh \
+        /home/grove/bin/grove-smoke
+
+      log "8/8 done"
+      touch /var/lib/grove-provisioned
+
+runcmd:
+  - [/usr/local/sbin/grove-provision]
+
+final_message: "Grove broker provisioned after $UPTIME seconds. Check: cloud-init status --long. Next: tailscale ssh grove@grove-broker-1, then grove-bootstrap."
