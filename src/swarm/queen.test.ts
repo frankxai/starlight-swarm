@@ -167,3 +167,78 @@ test('task with an unknown worker hint falls back to the first worker (no throw)
   const result = await queen.stepLoop([task], { vault: fakeVault() });
   assert.equal(result.decisions[0].worker, 'mandate-verifier'); // first worker
 });
+
+/* ------------------------------------------------------------------ *
+ * Payments governance: audit-first, verify-only, tighten-only.
+ * ------------------------------------------------------------------ */
+
+import type { PaymentsMcp } from './integrations';
+
+function fakePayments(over: Partial<{ auditOk: boolean; valid: boolean; withinCap: boolean }> = {}) {
+  const calls: string[] = [];
+  const cfg = { auditOk: true, valid: true, withinCap: true, ...over };
+  const mcp: PaymentsMcp = {
+    async verify_mandate() { calls.push('verify_mandate'); return { valid: cfg.valid, reason: cfg.valid ? 'ok' : 'unsigned' }; },
+    async check_spend_cap() { calls.push('check_spend_cap'); return { withinCap: cfg.withinCap, cap: 100 }; },
+    async record_audit_entry() { calls.push('record_audit_entry'); return { ok: cfg.auditOk }; },
+    async require_human_approval() { calls.push('require_human_approval'); return { pending: true }; },
+  };
+  return { mcp, calls };
+}
+
+const inCap = (): Task => ({
+  id: 'pay-in',
+  worker: 'mandate-verifier',
+  description: 'settle within cap',
+  proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
+});
+
+test('audit entry is written FIRST; a failed audit write fails the action (human gate)', async () => {
+  const queen = new Queen(paymentsSpec());
+  const { mcp, calls } = fakePayments({ auditOk: false });
+  const result = await queen.stepLoop([inCap()], { vault: fakeVault(), payments: mcp });
+  const d = result.decisions[0];
+  assert.equal(calls[0], 'record_audit_entry');
+  assert.ok(!calls.includes('verify_mandate'), 'no verification without a prior audit entry');
+  assert.equal(d.verdict, 'human');
+  assert.equal(d.effective, 'human-gate');
+  assert.equal(d.governance?.audit, 'failed');
+  assert.equal(d.governance?.downgradedFrom, 'act');
+  assert.ok(calls.includes('require_human_approval'));
+});
+
+test('an invalid mandate takes act away: in-cap payment is downgraded to escalate', async () => {
+  const queen = new Queen(paymentsSpec());
+  const { mcp, calls } = fakePayments({ valid: false });
+  const d = (await queen.stepLoop([inCap()], { vault: fakeVault(), payments: mcp })).decisions[0];
+  assert.equal(d.verdict, 'escalate');
+  assert.equal(d.effective, 'founder-board');
+  assert.equal(d.governance?.mandate, 'invalid');
+  assert.match(d.governance?.reason ?? '', /mandate not verified/);
+  assert.deepEqual(calls, ['record_audit_entry', 'verify_mandate', 'check_spend_cap', 'require_human_approval']);
+});
+
+test('an over-cap answer from the MCP takes act away even when the proposal said in-cap', async () => {
+  const queen = new Queen(paymentsSpec());
+  const { mcp } = fakePayments({ withinCap: false });
+  const d = (await queen.stepLoop([inCap()], { vault: fakeVault(), payments: mcp })).decisions[0];
+  assert.equal(d.verdict, 'escalate');
+  assert.equal(d.governance?.cap, 'over');
+});
+
+test('governance never loosens: audit ok + valid + within cap leaves act as act, and nothing is approved for a human', async () => {
+  const queen = new Queen(paymentsSpec());
+  const { mcp, calls } = fakePayments();
+  const d = (await queen.stepLoop([inCap()], { vault: fakeVault(), payments: mcp })).decisions[0];
+  assert.equal(d.verdict, 'act');
+  assert.equal(d.governance?.downgradedFrom, undefined);
+  assert.ok(!calls.includes('require_human_approval'));
+});
+
+test('a charter refusal never touches the Payments MCP', async () => {
+  const queen = new Queen(paymentsSpec(), () => {}, { claims: [{ statement: 'Fully autonomous revenue', backedBy: [] }] });
+  const { mcp, calls } = fakePayments();
+  const d = (await queen.stepLoop([inCap()], { vault: fakeVault(), payments: mcp })).decisions[0];
+  assert.equal(d.verdict, 'refuse');
+  assert.deepEqual(calls, []);
+});

@@ -73,7 +73,7 @@ A `StreamSpec` in [`streams.ts`](../src/swarm/streams.ts) — the Queen's seat, 
   purpose: 'Client engagements — scoping, delivery, retro.',
   queen: {
     name: 'Advisory Queen',
-    harness: ['queen-coordinator', 'hierarchical-coordinator'],
+    harness: ['starlight-queen', 'hierarchical'],
     selfImprovingLoop: ['intake', 'scope', 'deliver', 'debrief', 'retro'],
   },
   workers: [

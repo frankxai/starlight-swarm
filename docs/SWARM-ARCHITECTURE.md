@@ -43,7 +43,7 @@ Decided 2026-06-14 (`agentic-ops-hub/docs/AGENT-STACK.md`). Three tiers:
   irreversible action, resolves conflicts between queens. Holds the
   `/starlight-board` gate. Never does the per-stream work.
 - **Stream Queens (Tier 2)** — four queens, one per income stream. Each reuses the
-  `queen-coordinator` + `hierarchical-coordinator` harness patterns, runs a
+  Starlight Queen seat under one governance mode (`generals.ts`), runs a
   self-improving loop, and acts autonomously **within its scope and below its
   caps**. The moment an action crosses a stream boundary, exceeds a cap, or
   becomes irreversible, the queen escalates.
@@ -128,22 +128,32 @@ none exists, by design.
 
 ---
 
-## The claude-flow harness backbone
+## The Queen kernel
 
-The runtime models the coordination patterns from **claude-flow**:
+The runtime's coordination model is its own, not borrowed from an external
+orchestrator. One Starlight Queen per stream; Domain Generals (architect,
+weaver, sentinel, sage, hermes — `generals.ts`, vendored from the Starlight
+Intelligence System with the source commit recorded) lead Specialists, who
+dispatch stateless Workers. Dispatch flows down only.
 
-- **`hierarchical-coordinator` / queen-coordinator`** — each queen is the sovereign
-  of a hierarchical hive: centralized decision, decentralized (mesh) worker
-  execution. This is the `Queen` class in `src/swarm/queen.ts` (`stepLoop()` +
-  `decide()`).
-- **mesh within a stream** — workers are peers inside their stream; the queen
-  aggregates and gates.
-- The founder layer maps to the top-level orchestrator that routes between hives
-  but never executes hive work itself.
+Five modules make that enforceable rather than descriptive:
 
-In v0.1 these patterns are expressed as typed TypeScript (config + class + pure
-classifier). Live wiring to the claude-flow MCP + SIS + Payments servers lands in
-a later version.
+| Module | What it fixes in place |
+|---|---|
+| `brief.ts` | Nothing is dispatched without a complete Brief: objective, acceptance, output contract, tool allowlist, boundaries, micro-USD + wall-time budget, maker, and an **independent** verifier (Maker ≠ Checker by id and by model). |
+| `router.ts` | `ModelRouter` v0 reads the model matrix as data and writes `usedModel` / `wasFallback` / `reason` onto every result. Critical lanes (council tier, high-risk, or flagged) never fall back silently — they refuse and escalate to the founder board. |
+| `verify-contract.ts` | Completion credit comes only from checks the verifier re-runs: exact-match `allowedChecks`, no globs, no shell metacharacters, evidence re-digested and fresh, a commit named for code. Ported from the private Queen runtime's verifier contract. |
+| `receipts.ts` + `run-receipt.ts` | One signed `starlight.run-receipt.v1` per dispatch (DSSE v1, in-toto Statement v1, Ed25519), byte-identical to the estate's issuer and public verifier. PASS is refused without evidence. |
+| `escalation.ts` | The same ladder, now readable in the SIS risk-tier vocabulary (`riskTierOf` / `decisionFromRiskTier`; a round trip can only tighten). |
+
+The `Queen` class (`queen.ts`) consults the verify-only Payments MCP
+**audit-first**: `record_audit_entry` runs before anything else and a failed
+write fails the action; an invalid mandate or an over-cap answer takes `act`
+away. Governance can tighten a verdict and never loosen one.
+
+The `starlight-queen` bin (`bin/starlight-queen.mjs` → `src/swarm/queen-cli.ts`)
+exposes `brief check`, `route`, `classify`, `receipt verify`, `keygen`, `init`.
+It runs nothing; dispatch belongs to the hooks pack and the private controller.
 
 ---
 

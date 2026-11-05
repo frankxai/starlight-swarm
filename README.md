@@ -256,17 +256,63 @@ src/swarm/
   escalation.ts    classify(action) → autonomous | queen-gate | founder-board | human-gate
   charter.ts       checkCharter(action, ctx) → the six benevolence clauses, raise-only
   integrations.ts  MCP integration: SIS sis_* stubs + REAL payments-MCP adapter (verify-only, fail-closed)
-  index.ts         the dry-run: prints the tree + escalation path + charter reads + a real payments-MCP round-trip
+  generals.ts      role contract: Queen → Domain Generals → Specialists → Workers; model matrix; governance modes (data)
+  brief.ts         the unit of dispatch: complete or refused; verifier independence (Maker ≠ Checker)
+  router.ts        ModelRouter v0: usedModel / wasFallback / reason on every result; critical lanes never fall back silently
+  verify-contract.ts  completion credit only from re-run checks: exact-match allowlist, evidence re-digested, commit for code
+  receipts.ts      one signed starlight.run-receipt.v1 per dispatch; JSONL ledger; verifyLedger()
+  run-receipt.ts   the receipt format, vendored byte-identical from the Starlight Intelligence System
+  queen-cli.ts     the `starlight-queen` command (bin/starlight-queen.mjs)
+  index.ts         the dry-run: tree + escalation path + charter reads + kernel walk-through + a real payments-MCP round-trip
   escalation.test.ts    full-branch tests for the safety spine (incl. fail-closed)
   queen.test.ts         worker-guard + act-vs-escalate routing tests
   charter.test.ts       monotonicity + fail-closed + ledger refusals + actionability
   integrations.test.ts  payments-MCP adapter wire shape + fail-closed + queen↔adapter tests
+  generals/brief/router/verify-contract/receipts.test.ts   the kernel invariants, one file each
 src/pages/
   swarm.tsx        cockpit page rendering the stream → queen → worker tree + legend
 docs/SWARM-ARCHITECTURE.md   the architecture narrative
 docs/QUEEN-CHARTER.md        how to spawn a Queen for a vertical, business, or team
 local-cockpit.html           static operator console (now includes the swarm tree)
 ```
+
+---
+
+<a id="queen-kernel"></a>
+
+## 👑 The Queen kernel
+
+The package is `@starlight-intelligence/queen`: the open, MIT kernel of the
+Starlight Queen. It decides, verifies and records. It runs nothing on its own.
+
+| Invariant | Where | What it means in practice |
+|---|---|---|
+| **Brief or refuse** | `brief.ts` | A dispatch needs an objective, checkable acceptance, an output contract, a tool allowlist, boundaries, a micro-USD + wall-time budget, a maker and a verifier. `briefProblems()` lists every gap; an empty list is the only green. |
+| **Maker ≠ Checker** | `brief.ts` | The verifier is a different actor by id, and a different model when both are models. A brief that credits itself is not a brief. |
+| **Routing is reported** | `router.ts` | Every route carries `usedModel`, `wasFallback`, `reason`. Council-tier, high-risk and flagged lanes never fall back silently: they refuse and escalate to the founder board. |
+| **A receipt is a claim** | `verify-contract.ts` | Credit comes only from checks the verifier re-runs: exact-match `allowedChecks` (no globs, no shell metacharacters), evidence re-digested and fresh, a commit named for code. |
+| **One receipt per dispatch** | `receipts.ts`, `run-receipt.ts` | `starlight.run-receipt.v1`, DSSE + in-toto + Ed25519, the same bytes the estate's public verifier reads. PASS without evidence is refused at issue time. |
+| **Audit first** | `queen.ts` | On the payments stream `record_audit_entry` runs before verification; a failed write fails the action. An invalid mandate or an over-cap answer takes `act` away. Governance tightens, never loosens. |
+
+Roles are data in `generals.ts`: the five Domain Generals (architect, weaver,
+sentinel, sage, hermes — vendored from the Starlight Intelligence System with the
+source commit recorded), the three-tier model matrix, three governance modes
+(emergency is entered only through the human gate), and the default budget split.
+The C-suite Generals compiled elsewhere in the estate are lenses, not seats.
+
+```bash
+npm run queen -- init                                  # writes .starlight/queen/brief.example.json
+npm run queen -- brief check .starlight/queen/brief.example.json
+npm run queen -- route --general starlight-sentinel --unavailable claude-opus-4-6   # exit 2: refused, escalate
+npm run queen -- classify --kind payment --stream payments --moves-money --amount 40 --cap 100
+npm run queen -- keygen .starlight/queen/keys && npm run queen -- receipt verify ledger.jsonl --key .starlight/queen/keys/public.pem
+```
+
+The bin is named `starlight-queen` so the Starlight CLI's extension dispatch can
+reach it. That CLI currently reserves `queen` as a built-in, so until the built-in
+delegates, call `starlight-queen` directly. What is *not* here: `run`, `watch`, a
+queue, a scheduler, or any spend authority. Those belong to the hooks pack and the
+private runtime, which consume these contracts rather than redefine them.
 
 ---
 
@@ -278,7 +324,7 @@ local-cockpit.html           static operator console (now includes the swarm tre
 npm install
 npm run swarm:dry-run    # founder→queen→worker tree + escalation ladder + per-queen loop step + real payments-MCP round-trip
 npm run typecheck        # tsc --noEmit
-npm test                 # tsc --noEmit && node --test --import tsx src/swarm/*.test.ts
+npm test                 # tsc --noEmit && node --test --import tsx src/swarm/*.test.ts && orchestration tests
 npm run build            # next build (cockpit)
 npm run dev              # next dev -p 3007  →  http://localhost:3007/swarm
 ```

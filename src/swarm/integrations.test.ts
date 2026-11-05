@@ -156,6 +156,7 @@ test('require_human_approval always returns pending (never approved)', async () 
 
 test('Payments Queen drives verify_mandate + check_spend_cap through the adapter', async () => {
   const { client, calls } = mockClient({
+    record_audit_entry: { structuredContent: { recorded: true } },
     verify_mandate: { structuredContent: { verdict: 'verified', reason: 'ok' } },
     check_spend_cap: { structuredContent: { verdict: 'within-cap' } },
   });
@@ -172,8 +173,32 @@ test('Payments Queen drives verify_mandate + check_spend_cap through the adapter
   await queen.stepLoop([task], { vault: fakeVault(), payments });
 
   const toolNames = calls.map((c) => c.name);
+  assert.equal(toolNames[0], 'record_audit_entry', 'audit entry is written before any verification');
   assert.ok(toolNames.includes('verify_mandate'), 'queen must call verify_mandate through the adapter');
   assert.ok(toolNames.includes('check_spend_cap'), 'queen must call check_spend_cap through the adapter');
+});
+
+test('Payments Queen fails the action when the adapter cannot record the audit entry', async () => {
+  // No record_audit_entry response mocked → adapter answers ok:false → nothing is verified, a human is asked.
+  const { client, calls } = mockClient({
+    verify_mandate: { structuredContent: { verdict: 'verified', reason: 'ok' } },
+    check_spend_cap: { structuredContent: { verdict: 'within-cap' } },
+  });
+  const queen = new Queen(paymentsSpec());
+  const task: Task = {
+    id: 'pay-2',
+    worker: 'mandate-verifier',
+    description: 'settle within cap',
+    proposes: action('payments', { kind: 'payment', movesMoney: true, amount: 40, cap: 100 }),
+  };
+  const result = await queen.stepLoop([task], { vault: fakeVault(), payments: paymentsMcpFromClient(client) });
+  // Nothing was verified: the adapter's human hand-off writes its own audit line, but
+  // verify_mandate and check_spend_cap never ran after the failed audit write.
+  const toolNames = calls.map((c) => c.name);
+  assert.equal(toolNames[0], 'record_audit_entry');
+  assert.ok(!toolNames.includes('verify_mandate') && !toolNames.includes('check_spend_cap'), toolNames.join(','));
+  assert.equal(result.decisions[0].verdict, 'human');
+  assert.equal(result.decisions[0].governance?.audit, 'failed');
 });
 
 /* ---------------------------------------------------------------- *
