@@ -15,11 +15,9 @@ import {
   REMOTE_STOP_REFUSAL_ROUTINE,
 } from './remote-stop-authority-routines';
 export {
-  USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT,
   USAGE_EVIDENCE_DATABASE_ROLE_CONTRACT_SHA256,
 } from './usage-authority-routines';
 export {
-  REMOTE_STOP_DATABASE_ROLE_CONTRACT,
   REMOTE_STOP_DATABASE_ROLE_CONTRACT_SHA256,
 } from './remote-stop-authority-routines';
 
@@ -28,7 +26,7 @@ export interface RoleContractSqlClient {
   query(sql: string, values?: unknown[]): Promise<QueryResult>;
 }
 
-export const BROKER_DATABASE_ROLE_CONTRACT = Object.freeze({
+const BROKER_DATABASE_ROLE_CONTRACT = Object.freeze({
   schema_version: 'starlight.broker_database_role.v1' as const,
   schema: 'public',
   database_grants: ['CONNECT', 'TEMPORARY'],
