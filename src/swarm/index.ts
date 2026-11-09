@@ -22,6 +22,13 @@ import { classify } from './escalation';
 import { BENEVOLENCE_CHARTER, checkCharter, explain, raiseTo } from './charter';
 import type { CharterContext } from './charter';
 import { makeDryRunVault, makeDryRunPayments, connectRealPayments } from './integrations';
+import { briefProblems, withBriefDefaults } from './brief';
+import { ModelRouter } from './router';
+import { verifyClaim } from './verify-contract';
+import { draftDispatchReceipt, issueDispatchReceipt, sha256Of } from './receipts';
+import { receiptProblems, verifyRunReceipt } from './run-receipt';
+import { GENERALS_SOURCE } from './generals';
+import { generateKeyPairSync } from 'node:crypto';
 import { resolve } from 'node:path';
 
 const out = (m = '') => console.log(m);
@@ -218,11 +225,83 @@ async function demoRealPaymentsMcp(): Promise<void> {
   out('');
 }
 
+
+/**
+ * Walk the Queen kernel once: a Brief is checked, routed, verified and
+ * receipted. Ephemeral key, fake runner, in-memory evidence — nothing runs.
+ */
+async function demoKernel(): Promise<void> {
+  out('───────────────────────────────────────────────────────────────');
+  out('  QUEEN KERNEL (brief → route → verify → receipt — dry-run)');
+  out('───────────────────────────────────────────────────────────────');
+  out(`  generals vendored from ${GENERALS_SOURCE.repo}@${GENERALS_SOURCE.commit.slice(0, 12)}`);
+
+  const brief = withBriefDefaults({
+    id: 'dry-run-brief',
+    objective: 'Survey the model routers in this repository and name the one to keep.',
+    acceptance: ['Every router is named by file path.', 'The recommendation cites one measured number.'],
+    output: { format: 'markdown', maxBytes: 20_000 },
+    tools: ['Read', 'Grep'],
+    boundaries: ['No edits outside docs/.', 'No network.'],
+    budget: { microUsd: 2_000_000, wallTimeMs: 600_000 },
+    maker: { id: 'general:starlight-hermes', model: 'gemini-2.5-flash' },
+    verifier: { id: 'checker:starlight-sentinel', model: 'claude-opus-4-6' },
+    allowedChecks: ['npm test'],
+    general: 'starlight-hermes',
+  });
+  const problems = briefProblems(brief);
+  out(`  ▸ brief ${brief.id}: ${problems.length === 0 ? 'complete' : 'REFUSED — ' + problems.join('; ')}`);
+  const selfCredit = briefProblems({ ...brief, verifier: { ...brief.maker } });
+  out(`  ▸ same brief with verifier = maker: ${selfCredit.find((p) => /independent/.test(p)) ?? 'accepted (BUG)'}`);
+
+  const route = new ModelRouter().route({ general: brief.general });
+  out(`  ▸ route: ${route.tier} → ${route.usedModel}${route.wasFallback ? ' [fallback]' : ''} (${route.reason})`);
+  const refused = new ModelRouter({ availability: (m) => m !== 'claude-opus-4-6' }).route({ general: 'starlight-sentinel' });
+  out(`  ▸ council lane without its primary: refused=${refused.refused} escalate=${refused.escalate}`);
+
+  const artifact = '# routers\n';
+  const evidenceSha = sha256Of(artifact);
+  const now = Date.now();
+  const verdict = await verifyClaim(
+    { briefId: brief.id, kind: 'research', checksClaimed: ['npm test'], evidence: [{ ref: 'out/routers.md', sha256: evidenceSha, producedAt: new Date(now - 1000).toISOString() }] },
+    { allowedChecks: brief.allowedChecks, maxEvidenceAgeMs: 3_600_000 },
+    { async run(command) { return { command, exitCode: 0 }; } },
+    async () => evidenceSha,
+    now,
+  );
+  out(`  ▸ verify: credited=${verdict.credited} (re-ran ${verdict.reruns.map((r) => r.command).join(', ')})`);
+  const unlisted = await verifyClaim(
+    { briefId: brief.id, kind: 'research', checksClaimed: ['npm run *'], evidence: [] },
+    { allowedChecks: brief.allowedChecks, maxEvidenceAgeMs: 3_600_000 },
+    { async run(command) { return { command, exitCode: 0 }; } },
+    async () => null,
+    now,
+  );
+  out(`  ▸ verify a glob check: credited=${unlisted.credited} — ${unlisted.reasons[0]}`);
+
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const startedAt = new Date(now - 5000).toISOString();
+  const endedAt = new Date(now).toISOString();
+  const record = {
+    brief, route, host: 'dry-run', startedAt, endedAt, issuer: 'starlight-queen',
+    subject: { name: 'out/routers.md', sha256: evidenceSha },
+    stages: [{ name: 'work', status: 'ok' as const, model: route.usedModel, costEur: 0, latencyMs: 4200 }],
+    evidence: [{ kind: 'source', ref: 'out/routers.md', sha256: evidenceSha }],
+  };
+  const { envelope, receipt } = issueDispatchReceipt(record, privateKey.export({ type: 'pkcs8', format: 'pem' }).toString());
+  const check = verifyRunReceipt(envelope, [publicKey.export({ type: 'spki', format: 'pem' }).toString()]);
+  out(`  ▸ receipt ${receipt.receiptId}: verdict=${receipt.verdict} signed=${check.ok} stages=${receipt.stages.map((s) => s.name).join('→')}`);
+  const noEvidence = receiptProblems(draftDispatchReceipt({ ...record, evidence: [] }));
+  out(`  ▸ same receipt without evidence: ${noEvidence[0] ?? 'accepted (BUG)'}`);
+  out('');
+}
+
 async function main(): Promise<void> {
   printTree();
   demoEscalationLadder();
   demoCharter();
   await runLoopSteps();
+  await demoKernel();
   await demoRealPaymentsMcp();
 
   out('═══════════════════════════════════════════════════════════════');

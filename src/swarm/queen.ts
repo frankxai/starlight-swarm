@@ -1,17 +1,18 @@
 /**
- * queen.ts — Stream Queen tier (Tier 2 of the agent stack).
+ * queen.ts — the Starlight Queen's stream seat (Tier 2 of the agent stack).
  *
- * Each queen reuses the `queen-coordinator` + `hierarchical-coordinator` harness
- * patterns (claude-flow), scoped to ONE income stream. A queen:
+ * One Queen per stream, one governance mode (generals.ts), one worker mesh.
+ * A queen:
  *   - owns a mesh of stateless workers,
  *   - runs a self-improving loop step,
  *   - decides act-vs-escalate for every proposed action via classify(),
  *   - NEVER commands across streams (coordinates through the founder),
  *   - NEVER moves money autonomously.
  *
- * v0.1 scaffold: stepLoop() drives workers to PROPOSE actions, then classifies
- * each proposal. It executes nothing gated. Money + irreversibility always route
- * up the escalation ladder. No real side effects.
+ * stepLoop() drives workers to PROPOSE actions, then classifies each
+ * proposal. It executes nothing gated. Money + irreversibility always route
+ * up the escalation ladder. On the payments stream the verify-only MCP is
+ * consulted audit-first, and its answers can only tighten a verdict.
  */
 
 import { classify } from './escalation';
@@ -43,6 +44,24 @@ export interface QueenDecision {
    * the classification. Always >= classification.decision in severity.
    */
   effective: Decision;
+  /**
+   * What the verify-only payments governance said, when it ran. Each answer
+   * can only tighten the verdict: a failed audit write fails the action, an
+   * invalid mandate or an over-cap answer takes 'act' away. Absent on streams
+   * that never touch the Payments MCP.
+   */
+  governance?: PaymentsGovernance;
+}
+
+/** The verify-only payments read, recorded per decision. */
+export interface PaymentsGovernance {
+  /** record_audit_entry ran FIRST. 'failed' means the action failed with it. */
+  audit: 'ok' | 'failed';
+  mandate: 'valid' | 'invalid' | 'skipped';
+  cap: 'within' | 'over' | 'skipped';
+  /** The verdict before governance tightened it, when it did. */
+  downgradedFrom?: QueenDecision['verdict'];
+  reason?: string;
 }
 
 /** Outcome of one queen loop step. */
@@ -162,6 +181,12 @@ export class Queen {
       }
       const report = await chosen.run(task, mcp.vault);
       const decision = this.decide(report);
+
+      // Payments governance runs BEFORE the decision is recorded, so what the
+      // ledger sees is the verdict after verification, never before it.
+      if (decision.verdict !== 'refuse' && this.stream === 'payments' && mcp.payments && report.proposed.movesMoney) {
+        await this.governPayment(decision, report, task, mcp.payments);
+      }
       decisions.push(decision);
 
       this.log(
@@ -172,26 +197,65 @@ export class Queen {
       for (const b of decision.charter.breaches) {
         this.log(`      ↳ charter [${b.clause}] ${b.reason} FIX: ${b.remedy}`);
       }
-
-      // A charter refusal stops here: no MCP touch, no gate, no further work on
-      // this proposal until the underlying ledger defect is fixed.
-      if (decision.verdict === 'refuse') continue;
-
-      // Demonstrate the verify-only Payments MCP touch WITHOUT moving money.
-      if (this.stream === 'payments' && mcp.payments && report.proposed.movesMoney) {
-        this.log('    ↳ Payments Queen runs verify-only governance (fail-closed):');
-        await mcp.payments.verify_mandate({
-          signature: 'dry-run',
-          amount: report.proposed.amount ?? 0,
-          purpose: task.description,
-        });
-        await mcp.payments.check_spend_cap(this.stream, report.proposed.amount ?? 0);
-        if (decision.verdict !== 'act') {
-          await mcp.payments.require_human_approval(decision.classification.reason);
-        }
+      if (decision.governance?.downgradedFrom) {
+        this.log(`      ↳ governance tightened ${decision.governance.downgradedFrom} → ${decision.verdict}: ${decision.governance.reason}`);
       }
     }
 
     return { queen: this.name, stream: this.stream, loopStep, decisions };
+  }
+
+  /**
+   * governPayment() — the verify-only Payments MCP touch, WITHOUT moving money.
+   *
+   * Order is the contract:
+   *   1. record_audit_entry FIRST. If the audit write fails, the action fails:
+   *      verdict → 'human', effective → 'human-gate'. No money action exists
+   *      without a prior audit entry (L1), so there is nothing to approve yet.
+   *   2. verify_mandate + check_spend_cap. An invalid mandate or an over-cap
+   *      answer takes 'act' away: verdict → 'escalate', effective raised to
+   *      'founder-board'. Governance can only tighten; it never loosens.
+   *   3. Anything that is not 'act' after that is handed to the human gate.
+   */
+  private async governPayment(decision: QueenDecision, report: WorkerReport, task: Task, payments: PaymentsMcp): Promise<void> {
+    const amount = report.proposed.amount ?? 0;
+    const governance: PaymentsGovernance = { audit: 'ok', mandate: 'skipped', cap: 'skipped' };
+    decision.governance = governance;
+    this.log('    ↳ Payments Queen runs verify-only governance (audit-first, fail-closed):');
+
+    const audit = await payments.record_audit_entry({
+      agent: this.name,
+      stream: this.stream,
+      task: task.id,
+      note: `proposed ${report.proposed.kind} amount=${amount} verdict=${decision.verdict}`,
+      timestamp: new Date().toISOString(),
+    });
+    if (!audit.ok) {
+      governance.audit = 'failed';
+      governance.downgradedFrom = decision.verdict;
+      governance.reason = 'audit entry could not be written; no money action without a prior audit entry';
+      decision.verdict = 'human';
+      decision.effective = raiseTo(decision.effective, 'human-gate');
+      await payments.require_human_approval(governance.reason);
+      return;
+    }
+
+    const mandate = await payments.verify_mandate({ signature: 'dry-run', amount, purpose: task.description });
+    governance.mandate = mandate.valid ? 'valid' : 'invalid';
+    const cap = await payments.check_spend_cap(this.stream, amount);
+    governance.cap = cap.withinCap ? 'within' : 'over';
+
+    if (decision.verdict === 'act' && (!mandate.valid || !cap.withinCap)) {
+      governance.downgradedFrom = 'act';
+      governance.reason = !mandate.valid
+        ? `mandate not verified: ${mandate.reason}`
+        : `spend cap exceeded (amount=${amount} cap=${cap.cap})`;
+      decision.verdict = 'escalate';
+      decision.effective = raiseTo(decision.effective, 'founder-board');
+    }
+
+    if (decision.verdict !== 'act') {
+      await payments.require_human_approval(governance.reason ?? decision.classification.reason);
+    }
   }
 }
