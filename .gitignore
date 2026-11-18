@@ -56,3 +56,6 @@ link-checker-report.txt
 # estate-guard pack — per-machine files, never tracked
 .claude/settings.local.json
 .claude/ci/estate-guard/last-scan.json
+.gpu-export/
+.claude/skills/**/__pycache__/
+.claude/agents.replaced/
